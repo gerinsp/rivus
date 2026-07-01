@@ -1,0 +1,690 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Rivus Job Monitor</title>
+  <link rel="icon" type="image/png" href="rivus-logo.png?v=2" />
+  <link rel="shortcut icon" href="rivus-logo.png?v=2" />
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&amp;family=IBM+Plex+Sans:wght@400;500;600;700&amp;display=swap"
+    rel="stylesheet"
+  />
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <link rel="stylesheet" href="styles.css?v=1" />
+</head>
+
+<body class="min-h-screen text-slate-900">
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="sidebar-brand">
+        <div class="flex items-center gap-3">
+          <span class="flink-mark" aria-hidden="true">
+            <img src="rivus-logo.png?v=2" alt="" />
+          </span>
+          <div class="min-w-0">
+            <div class="brand-wordmark text-lg font-semibold">Rivus Dashboard</div>
+            <div class="mt-0.5 text-xs text-slate-300">JobManager UI</div>
+          </div>
+        </div>
+      </div>
+
+      <nav class="sidebar-nav pb-5" aria-label="Primary">
+        <div class="nav-section-title">Cluster</div>
+        <a class="nav-static" href="#overview">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
+            <rect x="3" y="3" width="7" height="7" rx="1.5"></rect>
+            <rect x="14" y="3" width="7" height="7" rx="1.5"></rect>
+            <rect x="3" y="14" width="7" height="7" rx="1.5"></rect>
+            <rect x="14" y="14" width="7" height="7" rx="1.5"></rect>
+          </svg>
+          Overview
+        </a>
+
+        <div class="nav-section-title">Jobs</div>
+        <button
+          id="tabDorisJobs"
+          onclick="switchTab('doris')"
+          class="tab-button"
+        >
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
+            <ellipse cx="12" cy="5" rx="7" ry="3"></ellipse>
+            <path d="M5 5v7c0 1.7 3.1 3 7 3s7-1.3 7-3V5"></path>
+            <path d="M5 12v7c0 1.7 3.1 3 7 3s7-1.3 7-3v-7"></path>
+          </svg>
+          Doris Jobs
+        </button>
+        <button
+          id="tabIcebergJobs"
+          onclick="switchTab('iceberg')"
+          class="tab-button"
+        >
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
+            <path d="M12 3 3 8l9 5 9-5-9-5Z"></path>
+            <path d="m3 13 9 5 9-5"></path>
+            <path d="m3 18 9 5 9-5"></path>
+          </svg>
+          Iceberg Jobs
+        </button>
+        <button
+          id="tabLogs"
+          onclick="switchTab('logs')"
+          class="tab-button"
+        >
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
+            <path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"></path>
+            <path d="M14 2v6h6"></path>
+            <path d="M8 13h8"></path>
+            <path d="M8 17h5"></path>
+          </svg>
+          Logs
+        </button>
+
+        <div class="nav-section-title">Operations</div>
+        <button class="tab-button" onclick="openSubmitModal()">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
+            <path d="M12 3v12"></path>
+            <path d="m7 8 5-5 5 5"></path>
+            <path d="M5 15v4a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-4"></path>
+          </svg>
+          Submit New Job
+        </button>
+        <button class="tab-button" data-refresh-button onclick="refreshDashboard()">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
+            <path d="M20 11a8.1 8.1 0 0 0-15.5-2M4 5v4h4"></path>
+            <path d="M4 13a8.1 8.1 0 0 0 15.5 2M20 19v-4h-4"></path>
+          </svg>
+          Refresh
+        </button>
+      </nav>
+
+      <div class="sidebar-meta mx-4 mt-auto border-t border-white/10 py-4 text-xs text-slate-400">
+        <div>REST dashboard</div>
+        <div class="mono mt-1">Version <span id="appVersion">dev</span></div>
+        <div class="mono mt-1" data-bind="sync-stamp">Waiting for first sync</div>
+      </div>
+    </aside>
+
+    <div class="app-main">
+      <header class="topbar">
+        <div class="flex flex-col gap-3 px-4 py-3 lg:flex-row lg:items-center lg:justify-between lg:px-6">
+          <div class="min-w-0">
+            <div class="flex flex-wrap items-center gap-3">
+              <span id="healthDot" class="brand-dot h-2.5 w-2.5 rounded-full"></span>
+              <h1 class="text-lg font-semibold text-slate-900">Rivus Monitor</h1>
+              <span id="healthBadge" class="brand-badge inline-flex items-center rounded-md px-2.5 py-1 text-xs font-medium">
+                Connected
+              </span>
+            </div>
+          </div>
+
+          <div class="flex flex-wrap items-center gap-2">
+            <div class="kbd-chip text-xs font-medium text-slate-600">
+              PID: <span id="m_pid" class="mono text-slate-800">-</span>
+            </div>
+            <div class="kbd-chip text-xs font-medium text-slate-600">
+              CPU: <span id="m_cpu" class="text-slate-800">-</span>
+            </div>
+            <div class="kbd-chip text-xs font-medium text-slate-600">
+              MEM: <span id="m_mem" class="text-slate-800">-</span>
+            </div>
+            <div id="profileMenu" class="profile-menu hidden">
+              <button
+                id="profileButton"
+                type="button"
+                class="profile-trigger"
+                aria-haspopup="menu"
+                aria-expanded="false"
+                onclick="toggleProfileMenu()"
+              >
+                <span id="profileInitials" class="profile-avatar" aria-hidden="true">U</span>
+                <span id="profileName">User</span>
+                <svg class="profile-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
+                  <path d="m6 9 6 6 6-6"></path>
+                </svg>
+              </button>
+              <div id="profileDropdown" class="profile-dropdown hidden" role="menu">
+                <button id="logoutButton" type="button" onclick="logout()" role="menuitem">
+                  Logout
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <section id="overview" class="panel overview-panel">
+          <div class="border-b border-slate-200 bg-white px-5 py-4 sm:px-6">
+            <div class="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+              <div>
+                <h2 class="text-xl font-semibold text-slate-900">Cluster Overview</h2>
+                <div class="mt-1 text-sm text-slate-500">
+                  Last refresh <span data-bind="sync-stamp" class="mono text-slate-700">Waiting for first sync</span>
+                </div>
+              </div>
+              <div class="text-sm text-slate-500">Auto refresh every 5 seconds</div>
+            </div>
+
+            <div id="jobsNotice" class="mt-4 hidden rounded-lg border px-4 py-3 text-sm"></div>
+          </div>
+
+          <div class="grid gap-3 bg-slate-50 px-5 py-4 sm:grid-cols-2 xl:grid-cols-4 sm:px-6">
+            <div class="stat-card">
+              <div class="stat-label">Jobs Total</div>
+              <div data-bind="total-count" class="mt-2 text-2xl font-semibold text-slate-900">0</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">Running Doris</div>
+              <div data-bind="active-doris-count" class="mt-2 text-2xl font-semibold text-blue-700">0</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">Running Iceberg</div>
+              <div data-bind="active-iceberg-count" class="mt-2 text-2xl font-semibold text-blue-700">0</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">Finished / Archive</div>
+              <div data-bind="archive-count" class="mt-2 text-2xl font-semibold text-slate-900">0</div>
+            </div>
+          </div>
+        </section>
+
+    <section id="jobsView" class="mt-6 space-y-5">
+      <div id="dorisJobsView" class="space-y-5">
+        <div class="panel overflow-hidden rounded-[20px]">
+          <div class="flex flex-col gap-3 border-b border-slate-200 px-5 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-6">
+            <div>
+              <h2 class="text-lg font-semibold text-slate-900">Active Jobs</h2>
+              <p class="mt-1 text-sm text-slate-500">QUEUED, RUNNING, PAUSING, and PENDING with <span class="mono text-slate-600">doris</span> sink</p>
+            </div>
+            <div class="rounded-full border border-sky-200 bg-sky-50 px-3 py-1.5 text-xs font-medium text-sky-800">
+              Total <span data-bind="active-doris-count" class="mono">0</span>
+            </div>
+          </div>
+
+          <div class="table-fade overflow-hidden">
+            <div class="overflow-x-auto">
+              <table class="responsive-table desktop-table min-w-full text-sm">
+                <thead class="bg-slate-50 text-slate-600">
+                  <tr class="border-b border-slate-200">
+                    <th class="w-52 px-6 py-4 text-left text-xs font-semibold uppercase tracking-[0.16em]">ID</th>
+                    <th class="w-[22rem] px-6 py-4 text-left text-xs font-semibold uppercase tracking-[0.16em]">Job</th>
+                    <th class="w-40 px-6 py-4 text-left text-xs font-semibold uppercase tracking-[0.16em]">Status</th>
+                    <th class="w-44 px-6 py-4 text-left text-xs font-semibold uppercase tracking-[0.16em]">Created</th>
+                    <th class="w-44 px-6 py-4 text-left text-xs font-semibold uppercase tracking-[0.16em]">Updated</th>
+                    <th class="w-[20rem] px-6 py-4 text-right text-xs font-semibold uppercase tracking-[0.16em]">Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="dorisActiveBody" class="divide-y divide-slate-200"></tbody>
+              </table>
+            </div>
+
+            <div id="dorisActiveEmpty" class="hidden px-6 py-8">
+              <div class="rounded-xl border border-dashed border-slate-300 bg-slate-50 p-5">
+                <div class="text-sm font-semibold text-slate-800">No active Doris jobs.</div>
+                <div class="mt-1 text-sm text-slate-600">Running Doris-backed jobs will appear here.</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel overflow-hidden rounded-[20px]">
+          <div class="flex flex-col gap-3 border-b border-slate-200 px-5 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-6">
+            <div>
+              <h2 class="text-lg font-semibold text-slate-900">Archive</h2>
+              <p class="mt-1 text-sm text-slate-500">PAUSED, FAILED, STOPPED, and DONE with <span class="mono text-slate-600">doris</span> sink</p>
+            </div>
+            <div class="flex flex-wrap items-center gap-2">
+              <button
+                id="bulkDeleteDorisArchive"
+                type="button"
+                class="rounded-md border border-rose-200 bg-white px-3 py-2 text-xs font-semibold text-rose-700 transition hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-50"
+                data-bulk-delete-archive="doris"
+                disabled
+              >
+                Delete archive
+              </button>
+              <div class="rounded-full border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs font-medium text-slate-600">
+                Terminal states
+              </div>
+            </div>
+          </div>
+
+          <div class="table-fade overflow-hidden">
+            <div class="overflow-x-auto">
+              <table class="responsive-table desktop-table min-w-full text-sm">
+                <thead class="bg-slate-50 text-slate-600">
+                  <tr class="border-b border-slate-200">
+                    <th class="w-52 px-6 py-4 text-left text-xs font-semibold uppercase tracking-[0.16em]">ID</th>
+                    <th class="w-[22rem] px-6 py-4 text-left text-xs font-semibold uppercase tracking-[0.16em]">Job</th>
+                    <th class="w-40 px-6 py-4 text-left text-xs font-semibold uppercase tracking-[0.16em]">Status</th>
+                    <th class="w-44 px-6 py-4 text-left text-xs font-semibold uppercase tracking-[0.16em]">Created</th>
+                    <th class="w-44 px-6 py-4 text-left text-xs font-semibold uppercase tracking-[0.16em]">Updated</th>
+                    <th class="w-[24rem] px-6 py-4 text-right text-xs font-semibold uppercase tracking-[0.16em]">Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="dorisArchiveBody" class="divide-y divide-slate-200"></tbody>
+              </table>
+            </div>
+
+            <div id="dorisArchiveEmpty" class="hidden px-6 py-8">
+              <div class="rounded-xl border border-dashed border-slate-300 bg-slate-50 p-5">
+                <div class="text-sm font-semibold text-slate-800">Archive is empty.</div>
+                <div class="mt-1 text-sm text-slate-600">Completed Doris jobs will appear here.</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="icebergJobsView" class="hidden space-y-5">
+        <div class="panel overflow-hidden rounded-[20px]">
+          <div class="flex flex-col gap-3 border-b border-slate-200 px-5 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-6">
+            <div>
+              <h2 class="text-lg font-semibold text-slate-900">Active Jobs</h2>
+              <p class="mt-1 text-sm text-slate-500">QUEUED, RUNNING, PAUSING, and PENDING with <span class="mono text-slate-600">iceberg_*</span> sink</p>
+            </div>
+            <div class="rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-xs font-medium text-emerald-800">
+              Total <span data-bind="active-iceberg-count" class="mono">0</span>
+            </div>
+          </div>
+
+          <div class="table-fade overflow-hidden">
+            <div class="overflow-x-auto">
+              <table class="responsive-table desktop-table min-w-full text-sm">
+                <thead class="bg-slate-50 text-slate-600">
+                  <tr class="border-b border-slate-200">
+                    <th class="w-52 px-6 py-4 text-left text-xs font-semibold uppercase tracking-[0.16em]">ID</th>
+                    <th class="w-[22rem] px-6 py-4 text-left text-xs font-semibold uppercase tracking-[0.16em]">Job</th>
+                    <th class="w-40 px-6 py-4 text-left text-xs font-semibold uppercase tracking-[0.16em]">Status</th>
+                    <th class="w-44 px-6 py-4 text-left text-xs font-semibold uppercase tracking-[0.16em]">Created</th>
+                    <th class="w-44 px-6 py-4 text-left text-xs font-semibold uppercase tracking-[0.16em]">Updated</th>
+                    <th class="w-[20rem] px-6 py-4 text-right text-xs font-semibold uppercase tracking-[0.16em]">Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="icebergActiveBody" class="divide-y divide-slate-200"></tbody>
+              </table>
+            </div>
+
+            <div id="icebergActiveEmpty" class="hidden px-6 py-8">
+              <div class="rounded-xl border border-dashed border-slate-300 bg-slate-50 p-5">
+                <div class="text-sm font-semibold text-slate-800">No active Iceberg jobs.</div>
+                <div class="mt-1 text-sm text-slate-600">Running Iceberg-backed jobs will appear here.</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel overflow-hidden rounded-[20px]">
+          <div class="flex flex-col gap-3 border-b border-slate-200 px-5 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-6">
+            <div>
+              <h2 class="text-lg font-semibold text-slate-900">Archive</h2>
+              <p class="mt-1 text-sm text-slate-500">PAUSED, FAILED, STOPPED, and DONE with <span class="mono text-slate-600">iceberg_*</span> sink</p>
+            </div>
+            <div class="flex flex-wrap items-center gap-2">
+              <button
+                id="bulkDeleteIcebergArchive"
+                type="button"
+                class="rounded-md border border-rose-200 bg-white px-3 py-2 text-xs font-semibold text-rose-700 transition hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-50"
+                data-bulk-delete-archive="iceberg"
+                disabled
+              >
+                Delete archive
+              </button>
+              <div class="rounded-full border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs font-medium text-slate-600">
+                Terminal states
+              </div>
+            </div>
+          </div>
+
+          <div class="table-fade overflow-hidden">
+            <div class="overflow-x-auto">
+              <table class="responsive-table desktop-table min-w-full text-sm">
+                <thead class="bg-slate-50 text-slate-600">
+                  <tr class="border-b border-slate-200">
+                    <th class="w-52 px-6 py-4 text-left text-xs font-semibold uppercase tracking-[0.16em]">ID</th>
+                    <th class="w-[22rem] px-6 py-4 text-left text-xs font-semibold uppercase tracking-[0.16em]">Job</th>
+                    <th class="w-40 px-6 py-4 text-left text-xs font-semibold uppercase tracking-[0.16em]">Status</th>
+                    <th class="w-44 px-6 py-4 text-left text-xs font-semibold uppercase tracking-[0.16em]">Created</th>
+                    <th class="w-44 px-6 py-4 text-left text-xs font-semibold uppercase tracking-[0.16em]">Updated</th>
+                    <th class="w-[24rem] px-6 py-4 text-right text-xs font-semibold uppercase tracking-[0.16em]">Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="icebergArchiveBody" class="divide-y divide-slate-200"></tbody>
+              </table>
+            </div>
+
+            <div id="icebergArchiveEmpty" class="hidden px-6 py-8">
+              <div class="rounded-xl border border-dashed border-slate-300 bg-slate-50 p-5">
+                <div class="text-sm font-semibold text-slate-800">Archive is empty.</div>
+                <div class="mt-1 text-sm text-slate-600">Completed Iceberg jobs will appear here.</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="otherStandardJobsNotice" class="hidden rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900"></div>
+    </section>
+
+    <section id="jobDetailView" class="mt-6 hidden space-y-5">
+      <div class="panel overflow-hidden rounded-[20px]">
+        <div class="border-b border-slate-200 px-5 py-3 sm:px-6">
+          <div class="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+            <div class="min-w-0">
+              <button
+                type="button"
+                class="mb-3 inline-flex items-center rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-600 transition hover:bg-slate-50"
+                onclick="backToJobs()"
+              >
+                Back to jobs
+              </button>
+              <div class="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">Job Detail</div>
+              <h2 id="jobDetailTitle" class="mt-1.5 text-lg font-semibold tracking-tight text-slate-900">-</h2>
+              <div id="jobDetailSubtitle" class="mt-1 max-w-5xl text-xs leading-5 text-slate-500 break-words"></div>
+              <div class="mt-1.5 flex flex-wrap items-center gap-2 text-xs text-slate-500">
+                <span>Job ID:</span>
+                <span id="jobDetailId" class="mono font-medium text-slate-700">-</span>
+              </div>
+            </div>
+
+            <div class="flex flex-wrap items-center gap-2">
+              <div id="graphMeta" class="rounded-full border border-slate-200 bg-white px-3 py-1.5 text-[11px] font-semibold text-slate-600">
+                Waiting for graph
+              </div>
+              <div class="rounded-full border border-slate-200 bg-white px-3 py-1.5 text-[11px] font-semibold text-slate-600">
+                Status:
+                <span id="graphStatus" class="mono ml-2 text-slate-900">-</span>
+              </div>
+              <button
+                type="button"
+                class="brand-outline-btn rounded-md px-2.5 py-1.5 text-xs font-semibold"
+                onclick="refreshGraph()"
+              >
+                Refresh
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="grid gap-3 bg-slate-50 px-5 py-4 sm:grid-cols-2 xl:grid-cols-4 sm:px-6">
+          <div class="stat-card">
+            <div class="stat-label">Sink</div>
+            <div id="jobDetailSink" class="mono mt-2 text-sm font-semibold text-slate-900">-</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Created</div>
+            <div id="jobDetailCreated" class="mono mt-2 text-xs font-semibold text-slate-900">-</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Updated</div>
+            <div id="jobDetailUpdated" class="mono mt-2 text-xs font-semibold text-slate-900">-</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Errors</div>
+            <div id="jobDetailErrors" class="mt-2 text-sm font-semibold text-slate-900">-</div>
+          </div>
+        </div>
+      </div>
+
+      <div
+        id="graphCanvas"
+        class="panel rounded-[20px] bg-slate-50/80 p-5"
+      >
+        <div class="text-sm text-slate-500">(loading...)</div>
+      </div>
+
+      <div
+        id="checkpointPanel"
+        class="panel rounded-[20px] bg-white p-5"
+      >
+        <div class="text-sm text-slate-500">Loading checkpoint...</div>
+      </div>
+
+      <details class="panel rounded-[20px] bg-white/80 p-4">
+        <summary class="cursor-pointer text-sm font-medium text-slate-600">Raw Graph JSON</summary>
+        <pre id="graphRaw" class="mono mt-4 whitespace-pre-wrap text-xs leading-6 text-slate-600"></pre>
+      </details>
+    </section>
+
+    <section id="logsView" class="mt-6 hidden space-y-5">
+      <div class="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        <div class="rounded-xl border border-slate-200 bg-white px-4 py-3">
+          <div class="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">Selected File</div>
+          <div id="logCurrentFile" class="mono mt-2 truncate text-sm font-semibold text-slate-900">-</div>
+        </div>
+        <div class="rounded-xl border border-slate-200 bg-white px-4 py-3">
+          <div class="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">File Size</div>
+          <div id="logCurrentSize" class="mt-2 text-sm font-semibold text-slate-900">-</div>
+        </div>
+        <div class="rounded-xl border border-slate-200 bg-white px-4 py-3">
+          <div class="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">Visible Lines</div>
+          <div class="mt-2 text-sm font-semibold text-slate-900">
+            <span id="logVisibleLines" class="mono">0</span>
+            <span class="text-slate-400">/</span>
+            <span id="logTotalLines" class="mono">0</span>
+          </div>
+        </div>
+        <div class="rounded-xl border border-slate-200 bg-white px-4 py-3">
+          <div class="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">Updated</div>
+          <div id="logCurrentUpdated" class="mono mt-2 text-xs font-semibold text-slate-900">-</div>
+        </div>
+      </div>
+
+      <div class="panel overflow-hidden rounded-[20px]">
+        <div class="flex flex-col gap-4 border-b border-slate-200 px-5 py-4 sm:px-6">
+          <div class="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+            <div>
+              <h2 class="text-lg font-semibold text-slate-900">Logs</h2>
+              <p class="mt-1 text-sm text-slate-500">JobManager-style tail view for Rivus runtime logs.</p>
+            </div>
+            <div class="flex flex-wrap gap-2">
+              <button
+                type="button"
+                class="brand-outline-btn rounded-md px-3 py-2 text-sm font-semibold"
+                onclick="loadLogs()"
+              >
+                Refresh
+              </button>
+              <button
+                type="button"
+                class="brand-solid-btn rounded-md px-3 py-2 text-sm font-semibold"
+                onclick="downloadSelectedLog()"
+              >
+                Download
+              </button>
+            </div>
+          </div>
+
+          <div class="grid gap-3 lg:grid-cols-[minmax(14rem,1.2fr)_minmax(8rem,0.5fr)_minmax(14rem,1fr)_auto] lg:items-end">
+            <label class="block">
+              <span class="mb-1 block text-xs font-semibold text-slate-500">Log file</span>
+              <select
+                id="logFileSelect"
+                class="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800"
+                onchange="selectLogFile(this.value)"
+              ></select>
+            </label>
+            <label class="block">
+              <span class="mb-1 block text-xs font-semibold text-slate-500">Tail lines</span>
+              <select
+                id="logLineSelect"
+                class="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800"
+                onchange="changeLogLineLimit(this.value)"
+              >
+                <option value="200">200</option>
+                <option value="500" selected>500</option>
+                <option value="1000">1,000</option>
+                <option value="2000">2,000</option>
+                <option value="5000">5,000</option>
+              </select>
+            </label>
+            <label class="block">
+              <span class="mb-1 block text-xs font-semibold text-slate-500">Filter</span>
+              <input
+                id="logFilter"
+                type="search"
+                class="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800"
+                placeholder="job id, trace id, table, error..."
+                oninput="renderLogOutput()"
+              />
+            </label>
+            <label class="inline-flex items-center gap-2 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-semibold text-slate-700">
+              <input id="logAutoRefresh" type="checkbox" class="h-4 w-4 rounded border-slate-300" checked onchange="changeLogFollowLatest(this.checked)" />
+              Follow latest
+            </label>
+          </div>
+
+          <div id="logsNotice" class="hidden rounded-xl border px-4 py-3 text-sm"></div>
+        </div>
+
+        <div class="grid min-h-[34rem] lg:grid-cols-[20rem_minmax(0,1fr)]">
+          <div class="border-b border-slate-200 bg-slate-50 lg:border-b-0 lg:border-r">
+            <div class="border-b border-slate-200 px-4 py-3">
+              <div class="text-sm font-semibold text-slate-900">Log Files</div>
+              <div class="mt-1 text-xs text-slate-500">Rotated files from <span class="mono">RIVUS_LOG_DIR</span></div>
+            </div>
+            <div class="max-h-[34rem] overflow-auto">
+              <table class="min-w-full text-sm">
+                <thead>
+                  <tr class="border-b border-slate-200">
+                    <th class="px-4 py-3 text-left text-xs font-semibold uppercase tracking-[0.16em]">File</th>
+                    <th class="px-4 py-3 text-right text-xs font-semibold uppercase tracking-[0.16em]">Size</th>
+                  </tr>
+                </thead>
+                <tbody id="logsFileBody" class="divide-y divide-slate-200"></tbody>
+              </table>
+            </div>
+            <div id="logsFileEmpty" class="hidden px-4 py-6 text-sm text-slate-500">No log files available.</div>
+          </div>
+
+          <div class="min-w-0 bg-slate-950">
+            <div class="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 px-4 py-3 text-xs text-slate-300">
+              <div class="mono truncate">
+                <span id="logConsoleTitle">-</span>
+              </div>
+              <div id="logTruncatedBadge" class="hidden rounded-md border border-amber-300/40 bg-amber-400/10 px-2 py-1 text-amber-200">
+                Tail truncated
+              </div>
+            </div>
+            <pre id="logOutput" class="log-console mono px-4 py-4 text-xs leading-5 text-slate-100"></pre>
+          </div>
+        </div>
+      </div>
+    </section>
+      </main>
+    </div>
+  </div>
+
+  <div id="submitModal" class="fixed inset-0 z-50 hidden">
+    <div class="absolute inset-0 bg-slate-950/45 backdrop-blur-sm" onclick="closeSubmitModal()"></div>
+    <div class="absolute inset-0 overflow-y-auto">
+      <div class="flex min-h-full items-end justify-center p-0 sm:items-center sm:p-6">
+        <div class="panel mobile-sheet mobile-safe w-full max-w-4xl overflow-hidden border border-slate-200 sm:rounded-[20px]">
+          <div class="border-b border-slate-200 bg-slate-50 px-6 py-4 sm:px-7">
+            <div class="flex items-start justify-between gap-4">
+              <div>
+                <h2 class="text-xl font-semibold text-slate-900">Submit Job YAML</h2>
+                <p class="mt-1 text-sm text-slate-500">Paste YAML or upload a multi-job file separated with ---.</p>
+              </div>
+              <button
+                class="rounded-lg border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-600 transition hover:bg-slate-50"
+                onclick="closeSubmitModal()"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+
+          <div class="px-6 py-6 sm:px-7">
+            <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <label for="yamlInput" class="block text-sm font-medium text-slate-600">Job YAML</label>
+              <label class="inline-flex cursor-pointer items-center justify-center rounded-lg border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-600 transition hover:bg-slate-50">
+                Upload Jobs File
+                <input id="yamlFileInput" type="file" accept=".yaml,.yml,text/yaml,application/x-yaml" class="hidden" onchange="loadYamlFile(event)">
+              </label>
+            </div>
+            <textarea
+              id="yamlInput"
+              required
+              class="mono mt-3 h-80 w-full rounded-[16px] border border-slate-200 bg-slate-50/90 p-4 text-sm leading-6 text-slate-800 outline-none transition focus:border-slate-400 focus:bg-white"
+              placeholder="name: sample-job&#10;source: ...&#10;transform: ...&#10;sink: ..."
+            ></textarea>
+
+            <div class="mt-5 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+              <div id="submitStatus" class="text-sm text-slate-500">Ready for a new YAML definition.</div>
+              <div class="flex flex-wrap gap-2">
+                <button
+                  class="rounded-lg border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-600 transition hover:bg-slate-50"
+                  onclick="clearYaml()"
+                >
+                  Clear
+                </button>
+                <button
+                  id="submitButton"
+                  class="brand-solid-btn rounded-lg px-5 py-2.5 text-sm font-semibold transition"
+                  onclick="submitJob()"
+                >
+                  Submit Job
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="errorsModal" class="fixed inset-0 z-50 hidden">
+    <div class="absolute inset-0 bg-slate-950/45 backdrop-blur-sm" onclick="closeErrorsModal()"></div>
+    <div class="absolute inset-0 overflow-y-auto">
+      <div class="flex min-h-full items-end justify-center p-0 sm:items-center sm:p-6">
+        <div class="panel mobile-sheet mobile-safe w-full max-w-5xl overflow-hidden border border-slate-200 sm:rounded-[24px]">
+          <div class="border-b border-slate-200/80 px-6 py-5 sm:px-8">
+            <div class="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+              <div>
+                <div class="inline-flex items-center rounded-full bg-slate-100 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-700">
+                  Errors
+                </div>
+                <h2 class="mt-3 text-2xl font-semibold tracking-tight text-slate-900">Job Errors</h2>
+                <div class="mt-2 text-sm text-slate-500">
+                  Job ID:
+                  <span id="errorsJobId" class="mono font-medium text-slate-700"></span>
+                </div>
+              </div>
+
+              <div class="flex flex-wrap items-center gap-2">
+                <div id="errorsMeta" class="rounded-full border border-slate-200 bg-white px-4 py-2 text-xs font-semibold text-slate-600">
+                  Waiting for data
+                </div>
+                <button
+                  class="rounded-full border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-600 transition hover:bg-slate-50"
+                  onclick="refreshErrors()"
+                >
+                  Refresh
+                </button>
+                <button
+                  class="brand-solid-btn rounded-full px-4 py-2 text-sm font-semibold transition"
+                  onclick="closeErrorsModal()"
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div class="max-h-[calc(100dvh-148px)] overflow-y-auto px-6 py-6 sm:max-h-[70vh] sm:px-8">
+            <div id="errorsList" class="flex flex-col gap-4"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js?v=5"></script>
+</body>
+</html>

@@ -1,0 +1,39 @@
+id: example-mysql-to-iceberg
+name: Example MySQL to Iceberg
+mode: initial
+
+source:
+  type: mysql
+  config:
+    addr: "mysql:3306"
+    user: "${MYSQL_SOURCE_USER}"
+    password: "${MYSQL_SOURCE_PASSWORD}"
+    tables:
+      - app.orders
+      - app.customers
+    snapshot_batch_size: 10000
+
+sink:
+  type: iceberg_native
+  config:
+    rest_uri: "${ICEBERG_REST_URI}"
+    warehouse: "${ICEBERG_WAREHOUSE}"
+    s3_endpoint: "${ICEBERG_S3_ENDPOINT}"
+    s3_path_style: "${ICEBERG_S3_PATH_STYLE}"
+    default_namespace: analytics
+    skip_snapshot_tables_without_primary_key: true
+    snapshot_write_mode: auto
+    cdc_delete_executor: equality
+    batch_size: 5000
+    max_batch_bytes: 128MB
+    flush_seconds: 2
+
+retry:
+  max_attempts: 10
+  base_backoff: 1s
+  max_backoff: 30s
+
+buffer_size: 10000
+
+meta:
+  mysql_dsn: "${RIVUS_META_MYSQL_DSN}"

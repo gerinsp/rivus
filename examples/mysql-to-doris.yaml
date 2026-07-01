@@ -1,0 +1,35 @@
+id: example-mysql-to-doris
+name: Example MySQL to Doris
+mode: initial
+
+source:
+  type: mysql
+  config:
+    addr: "mysql:3306"
+    user: "${MYSQL_SOURCE_USER}"
+    password: "${MYSQL_SOURCE_PASSWORD}"
+    tables:
+      - app.orders
+      - app.customers
+    chunk_size: 1000
+
+sink:
+  type: doris
+  config:
+    http_host: "http://doris-fe:8030"
+    mysql_port: 9030
+    user: "${DORIS_USER}"
+    password: "${DORIS_PASSWORD}"
+    default_database: analytics
+    batch_size: 5000
+    flush_seconds: 2
+
+retry:
+  max_attempts: 10
+  base_backoff: 1s
+  max_backoff: 30s
+
+buffer_size: 10000
+
+meta:
+  mysql_dsn: "${RIVUS_META_MYSQL_DSN}"

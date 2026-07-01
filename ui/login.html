@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Rivus Login</title>
+
+  <link rel="icon" type="image/png" href="rivus-logo.png?v=2" />
+  <link rel="shortcut icon" href="rivus-logo.png?v=2" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&amp;family=IBM+Plex+Sans:wght@400;500;600;700&amp;display=swap"
+    rel="stylesheet"
+  />
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #eef2f6;
+      --muted: #667085;
+      --line: #d9dee8;
+      --line-strong: #c4ccd8;
+      --nav: #15243a;
+      --nav-strong: #0f1c2d;
+      --brand-600: #0b65a3;
+      --brand-700: #084f85;
+      --brand-50: #f8fafc;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+      background: var(--bg);
+    }
+
+    .panel {
+      background: #ffffff;
+      border: 1px solid var(--line);
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.05);
+      border-radius: 4px;
+      width: min(100%, 420px);
+      overflow: hidden;
+    }
+
+    button:disabled {
+      opacity: 0.72;
+      cursor: wait;
+    }
+
+    .status {
+      min-height: 20px;
+      margin-top: 12px;
+      font-size: 14px;
+      color: var(--muted);
+    }
+
+    .status.error {
+      color: #b91c1c;
+    }
+
+    .brand-wordmark {
+      color: #17202f;
+      letter-spacing: 0;
+      white-space: nowrap;
+      font-size: 18px;
+      font-weight: 700;
+      line-height: 1.2;
+      margin: 0;
+    }
+
+    .login-brand-header {
+      background: #ffffff;
+      padding: 14px 18px;
+    }
+
+    .login-brand-header > div {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .brand-wordmark + p {
+      margin: 4px 0 0;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 500;
+      line-height: 1.35;
+    }
+
+    .login-shell {
+      min-height: 100vh;
+      background: var(--bg);
+    }
+
+    .brand-mark {
+      display: grid;
+      height: 42px;
+      width: 42px;
+      place-items: center;
+      flex: 0 0 auto;
+    }
+
+    .brand-mark img {
+      display: block;
+      height: 100%;
+      width: 100%;
+      object-fit: contain;
+    }
+
+    .brand-badge {
+      display: inline-flex;
+      align-items: center;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      background: #f8fafb;
+      padding: 5px 9px;
+      color: #4a5568;
+      font-size: 12px;
+      font-weight: 700;
+      margin-left: auto;
+    }
+
+    .brand-solid-btn {
+      border: 1px solid var(--brand-700);
+      border-radius: 4px;
+      background: var(--brand-600);
+      color: #ffffff;
+    }
+
+    .brand-solid-btn:hover {
+      background: var(--brand-700);
+    }
+
+    input {
+      width: 100%;
+      border-radius: 4px !important;
+      border-color: var(--line-strong) !important;
+      background: #f8fafc !important;
+      color: #17202f !important;
+      box-sizing: border-box;
+    }
+
+    @media (max-width: 768px) {
+      .login-shell {
+        background: var(--bg);
+      }
+    }
+
+    .login-shell {
+      display: flex;
+      min-height: 100vh;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+
+    #loginForm {
+      padding: 20px 22px 22px;
+    }
+
+    #loginForm p {
+      margin: 0 0 18px;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.55;
+    }
+
+    #loginForm label {
+      display: block;
+      margin-top: 16px;
+      color: #344054;
+      font-size: 14px;
+      font-weight: 600;
+    }
+
+    #loginForm input {
+      margin-top: 8px;
+      padding: 11px 12px;
+      font-size: 14px;
+      outline: none;
+      transition: border-color 140ms ease, box-shadow 140ms ease, background 140ms ease;
+    }
+
+    #loginForm input:focus {
+      border-color: var(--brand-600) !important;
+      background: #ffffff !important;
+      box-shadow: 0 0 0 3px rgba(102, 112, 133, 0.16);
+    }
+
+    #loginButton {
+      margin-top: 20px;
+      width: 100%;
+      padding: 12px 14px;
+      font-size: 14px;
+      font-weight: 700;
+    }
+  </style>
+</head>
+<body class="min-h-screen text-slate-900">
+  <main class="login-shell flex min-h-screen items-center justify-center px-4 py-6 sm:px-6 lg:px-8">
+    <section class="panel w-full max-w-md overflow-hidden">
+      <div class="login-brand-header px-5 py-4 sm:px-6">
+        <div class="flex items-center gap-3">
+          <span class="brand-mark" aria-hidden="true">
+            <img src="rivus-logo.png?v=2" alt="" />
+          </span>
+          <div class="min-w-0">
+            <h1 class="brand-wordmark text-xl font-semibold" aria-label="Rivus">Rivus Dashboard</h1>
+            <p class="mt-1 text-sm text-slate-500">JobManager UI</p>
+          </div>
+          <span class="brand-badge ml-auto inline-flex items-center rounded-md px-2.5 py-1 text-xs font-medium">
+            Protected
+          </span>
+        </div>
+      </div>
+
+      <form id="loginForm" class="px-5 py-5 sm:px-6">
+        <p class="text-sm text-slate-600">Please enter the username and password to access the dashboard.</p>
+
+        <input type="hidden" id="nextInput" name="next" value="/" />
+
+        <label for="username" class="mt-5 block text-sm font-medium text-slate-600">Username</label>
+        <input
+          id="username"
+          name="username"
+          type="text"
+          autocomplete="username"
+          required
+          class="mt-2 w-full rounded-md border border-slate-300 bg-slate-50 px-4 py-3 text-sm text-slate-800 outline-none transition focus:border-slate-500 focus:bg-white"
+        />
+
+        <label for="password" class="mt-5 block text-sm font-medium text-slate-600">Password</label>
+        <input
+          id="password"
+          name="password"
+          type="password"
+          autocomplete="current-password"
+          required
+          class="mt-2 w-full rounded-md border border-slate-300 bg-slate-50 px-4 py-3 text-sm text-slate-800 outline-none transition focus:border-slate-500 focus:bg-white"
+        />
+
+        <button
+          id="loginButton"
+          type="submit"
+          class="brand-solid-btn mt-5 w-full rounded-md px-4 py-3 text-sm font-semibold transition"
+        >
+          Login
+        </button>
+        <div id="status" class="status mt-3 text-sm text-slate-500"></div>
+      </form>
+    </section>
+  </main>
+
+  <script>
+    const statusEl = document.getElementById('status');
+    const buttonEl = document.getElementById('loginButton');
+    const nextInputEl = document.getElementById('nextInput');
+    const params = new URLSearchParams(window.location.search);
+
+    nextInputEl.value = params.get('next') || '/';
+
+    function setStatus(message, tone = 'muted') {
+      statusEl.textContent = message;
+      statusEl.className = tone === 'error' ? 'status error' : 'status';
+    }
+
+    document.getElementById('loginForm').addEventListener('submit', async (event) => {
+      event.preventDefault();
+
+      buttonEl.disabled = true;
+      setStatus('Checking credentials...');
+
+      const payload = {
+        username: document.getElementById('username').value,
+        password: document.getElementById('password').value,
+        next: nextInputEl.value || '/',
+      };
+
+      try {
+        const res = await fetch('/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          setStatus(data.error || 'Login failed.', 'error');
+          return;
+        }
+
+        window.location.href = data.next || '/';
+      } catch (err) {
+        setStatus('Login failed. Check server connection and try again.', 'error');
+      } finally {
+        buttonEl.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

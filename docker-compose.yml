@@ -1,0 +1,57 @@
+services:
+  meta-mysql:
+    image: mysql:8.0
+    container_name: rivus-meta-mysql
+    restart: unless-stopped
+    env_file:
+      - .env
+    entrypoint:
+      - sh
+      - /bootstrap/mysql-meta-entrypoint.sh
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASS:-rivus-root-pass}
+      MYSQL_DATABASE: ${RIVUS_META_MYSQL_DATABASE:-rivus_meta}
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    ports:
+      - "${RIVUS_META_MYSQL_PORT:-43306}:3306"
+    volumes:
+      - meta-mysql-data:/var/lib/mysql
+      - ./mysql-bootstrap-user.sh:/bootstrap/mysql-bootstrap-user.sh:ro
+      - ./mysql-meta-entrypoint.sh:/bootstrap/mysql-meta-entrypoint.sh:ro
+
+  rivus:
+    build: .
+    container_name: rivus
+    restart: unless-stopped
+    depends_on:
+      meta-mysql:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-UTC}
+      RIVUS_LOG_DIR: ${RIVUS_LOG_DIR:-/app/logs}
+      RIVUS_LOG_RETENTION_DAYS: ${RIVUS_LOG_RETENTION_DAYS:-7}
+      RIVUS_LOG_MAX_SIZE_MB: ${RIVUS_LOG_MAX_SIZE_MB:-64}
+      RIVUS_LOG_MAX_TOTAL_SIZE_MB: ${RIVUS_LOG_MAX_TOTAL_SIZE_MB:-2048}
+      RIVUS_LOG_STDERR: ${RIVUS_LOG_STDERR:-true}
+      RIVUS_API_TOKEN: ${RIVUS_API_TOKEN:-}
+      RIVUS_ICEBERG_MAX_CONCURRENT_COMMITS: ${RIVUS_ICEBERG_MAX_CONCURRENT_COMMITS:-3}
+    ports:
+      - "${RIVUS_HTTP_PORT:-8080}:8080"
+    volumes:
+      - ./ui:/app/ui:ro
+      - ./logs:/app/logs
+    logging:
+      driver: json-file
+      options:
+        max-size: "64m"
+        max-file: "5"
+
+volumes:
+  meta-mysql-data:
