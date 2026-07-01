@@ -34,19 +34,14 @@ Rivus is a small streaming data engine for moving table data from MySQL into ana
 
 Prerequisites:
 
-- Go 1.25 or newer.
-- Docker, if you want to run the local metadata MySQL with Compose.
+- Docker, if you want to run Rivus from the published container image.
+- Go 1.25 or newer, if you want to develop from source.
 
-Run the test suite:
-
-```sh
-go test ./...
-```
-
-Run Rivus locally:
+Run Rivus with the published GHCR image:
 
 ```sh
-go run ./cmd/rivus -addr :8080 -ui-dir ./ui
+docker pull ghcr.io/gerinsp/rivus:latest
+docker run --rm -p 8080:8080 ghcr.io/gerinsp/rivus:latest
 ```
 
 Then open `http://localhost:8080`.
@@ -55,7 +50,21 @@ To run with a local metadata MySQL:
 
 ```sh
 cp .env.example .env
-docker compose up --build
+docker compose pull
+docker compose up -d
+```
+
+To update an existing Compose deployment:
+
+```sh
+docker compose pull rivus
+docker compose up -d rivus
+```
+
+Run from source during development:
+
+```sh
+go run ./cmd/rivus -addr :8080 -ui-dir ./ui
 ```
 
 ## Configuration
@@ -113,7 +122,30 @@ AWS_DEFAULT_REGION=us-east-1
 
 ## Docker
 
-Build an image:
+Published images are distributed through GitHub Container Registry:
+
+```sh
+docker pull ghcr.io/gerinsp/rivus:latest
+docker run --rm -p 8080:8080 ghcr.io/gerinsp/rivus:latest
+```
+
+The publish workflow pushes images on `main`, version tags such as `v1.0.0`, and manual workflow runs.
+
+Common tags:
+
+- `latest`: latest build from the default branch.
+- `main`: latest build from the `main` branch.
+- `sha-<commit>`: exact build for a commit.
+
+Run the local Compose stack from GHCR:
+
+```sh
+cp .env.example .env
+docker compose pull
+docker compose up -d
+```
+
+Build an image locally for development:
 
 ```sh
 docker build \
@@ -123,22 +155,10 @@ docker build \
   -t rivus:dev .
 ```
 
-Published images are distributed through GitHub Container Registry:
+Or use the development Compose override:
 
 ```sh
-docker pull ghcr.io/<owner>/<repo>:latest
-docker run --rm -p 8080:8080 ghcr.io/<owner>/<repo>:latest
-```
-
-The publish workflow pushes images on `main`, version tags such as `v1.0.0`, and manual workflow runs. Replace `<owner>/<repo>` with the GitHub repository path after publishing, for example `ghcr.io/acme/rivus:latest`.
-
-GitHub Container Registry packages are private when first published. After the first successful workflow run, open the package settings in GitHub and change the package visibility to public if you want anonymous pulls.
-
-Run the local Compose stack:
-
-```sh
-cp .env.example .env
-docker compose up --build
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 ```
 
 ## Development

@@ -1,0 +1,4 @@
+services:
+  rivus:
+    build: .
+    image: rivus:dev

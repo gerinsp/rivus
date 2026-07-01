@@ -1,3 +1,5 @@
+name: rivus
+
 services:
   meta-mysql:
     image: mysql:8.0
@@ -25,7 +27,7 @@ services:
       - ./mysql-meta-entrypoint.sh:/bootstrap/mysql-meta-entrypoint.sh:ro
 
   rivus:
-    build: .
+    image: ghcr.io/gerinsp/rivus:${RIVUS_IMAGE_TAG:-latest}
     container_name: rivus
     restart: unless-stopped
     depends_on:
