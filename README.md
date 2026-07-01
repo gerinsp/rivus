@@ -108,6 +108,17 @@ docker build \
   -t rivus:dev .
 ```
 
+Published images are distributed through GitHub Container Registry:
+
+```sh
+docker pull ghcr.io/<owner>/<repo>:latest
+docker run --rm -p 8080:8080 ghcr.io/<owner>/<repo>:latest
+```
+
+The publish workflow pushes images on `main`, version tags such as `v1.0.0`, and manual workflow runs. Replace `<owner>/<repo>` with the GitHub repository path after publishing, for example `ghcr.io/acme/rivus:latest`.
+
+GitHub Container Registry packages are private when first published. After the first successful workflow run, open the package settings in GitHub and change the package visibility to public if you want anonymous pulls.
+
 Run the local Compose stack:
 
 ```sh
