@@ -1,4 +1,19 @@
-# Rivus
+<p align="center">
+  <img src="ui/rivus-logo.png" alt="Rivus logo" width="96" height="96">
+</p>
+
+<h1 align="center">Rivus</h1>
+
+<p align="center">
+  A lightweight streaming data engine for MySQL snapshots, binlog CDC, Doris, and Apache Iceberg.
+</p>
+
+<p align="center">
+  <a href="https://github.com/gerinsp/rivus/actions/workflows/ci.yml"><img src="https://github.com/gerinsp/rivus/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/gerinsp/rivus/actions/workflows/publish-container.yml"><img src="https://github.com/gerinsp/rivus/actions/workflows/publish-container.yml/badge.svg" alt="Publish Container"></a>
+  <a href="https://github.com/gerinsp/rivus/blob/main/LICENSE"><img src="https://img.shields.io/github/license/gerinsp/rivus" alt="License"></a>
+  <a href="https://github.com/gerinsp/rivus/pkgs/container/rivus"><img src="https://img.shields.io/badge/ghcr.io-rivus-blue" alt="GHCR"></a>
+</p>
 
 Rivus is a small streaming data engine for moving table data from MySQL into analytical stores. It supports initial snapshots, MySQL binlog CDC, resumable job state, and a lightweight web UI for submitting and monitoring jobs.
 
