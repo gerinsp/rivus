@@ -11,5 +11,5 @@
 
 /configs/
 compose.local.yml
-rivus
+/rivus
 *.log
