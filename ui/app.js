@@ -323,21 +323,24 @@ function switchTab(tab, options = {}) {
   const dorisActive = currentTab === 'doris';
   const icebergActive = currentTab === 'iceberg';
 
-  document.getElementById('jobsView').classList.toggle('hidden', logsActive || jobActive);
-  document.getElementById('jobDetailView').classList.toggle('hidden', !jobActive);
-  document.getElementById('logsView').classList.toggle('hidden', !logsActive);
-  document.getElementById('dorisJobsView').classList.toggle('hidden', !dorisActive);
-  document.getElementById('icebergJobsView').classList.toggle('hidden', !icebergActive);
+  const toggleHidden = (id, hidden) => {
+    const el = document.getElementById(id);
+    if (el) el.classList.toggle('hidden', hidden);
+  };
+  const setTabClass = (id, active) => {
+    const el = document.getElementById(id);
+    if (el) el.className = active ? 'tab-button tab-button-active' : 'tab-button';
+  };
 
-  document.getElementById('tabDorisJobs').className = dorisActive
-    ? 'tab-button tab-button-active'
-    : 'tab-button';
-  document.getElementById('tabIcebergJobs').className = icebergActive
-    ? 'tab-button tab-button-active'
-    : 'tab-button';
-  document.getElementById('tabLogs').className = logsActive
-    ? 'tab-button tab-button-active'
-    : 'tab-button';
+  toggleHidden('jobsView', logsActive || jobActive);
+  toggleHidden('jobDetailView', !jobActive);
+  toggleHidden('logsView', !logsActive);
+  toggleHidden('dorisJobsView', !dorisActive);
+  toggleHidden('icebergJobsView', !icebergActive);
+
+  setTabClass('tabDorisJobs', dorisActive);
+  setTabClass('tabIcebergJobs', icebergActive);
+  setTabClass('tabLogs', logsActive);
 
   if (options.updateUrl !== false) {
     if (currentTab !== 'job') {
@@ -2020,8 +2023,16 @@ document.addEventListener('click', (event) => {
 
 });
 
-setFollowLatestLog(followLatestLog);
-switchTab(currentTab, { updateUrl: false, load: false });
-loadAppVersion();
-loadAuthStatus().finally(() => refreshDashboard());
-setInterval(() => refreshDashboard({ auto: true }), 5000);
+function startApp() {
+  setFollowLatestLog(followLatestLog);
+  switchTab(currentTab, { updateUrl: false, load: false });
+  loadAppVersion();
+  loadAuthStatus().finally(() => refreshDashboard());
+  setInterval(() => refreshDashboard({ auto: true }), 5000);
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', startApp, { once: true });
+} else {
+  startApp();
+}
