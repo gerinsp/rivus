@@ -73,6 +73,9 @@ func normalizeIcebergConfig(c config.IcebergConfig) config.IcebergConfig {
 	if c.FlushSeconds <= 0 {
 		c.FlushSeconds = 30
 	}
+	if c.CheckpointFlushSeconds <= 0 {
+		c.CheckpointFlushSeconds = 10
+	}
 	if c.DeleteConcurrency <= 0 {
 		c.DeleteConcurrency = 2
 	}

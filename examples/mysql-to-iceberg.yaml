@@ -27,6 +27,7 @@ sink:
     batch_size: 5000
     max_batch_bytes: 128MB
     flush_seconds: 2
+    checkpoint_flush_seconds: 10
 
 retry:
   max_attempts: 10

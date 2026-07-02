@@ -1362,7 +1362,7 @@ func (s *Sink) Run(ctx context.Context, in <-chan model.Event) error {
 func (s *Sink) handleEvent(ctx context.Context, ev model.Event) error {
 	if ev.Type == model.EventTypeCheckpoint {
 		s.rememberOffset(ev.SourceOffset)
-		return s.flushAll(ctx)
+		return s.commitPendingOffset(ctx)
 	}
 	if ev.Type == model.EventTypeSnapshotBatch {
 		return s.handleSnapshotBatch(ctx, ev)
@@ -1519,7 +1519,7 @@ func (s *Sink) shouldFlushStateLocked(st *tableState, now time.Time) bool {
 	if st == nil || len(st.pending) == 0 {
 		return false
 	}
-	flushAfter := time.Duration(s.cfg.FlushSeconds) * time.Second
+	flushAfter := s.effectiveFlushAfterLocked()
 	if flushAfter <= 0 {
 		return true
 	}
@@ -1530,6 +1530,15 @@ func (s *Sink) shouldFlushStateLocked(st *tableState, now time.Time) bool {
 		return true
 	}
 	return false
+}
+
+func (s *Sink) effectiveFlushAfterLocked() time.Duration {
+	flushAfter := time.Duration(s.cfg.FlushSeconds) * time.Second
+	checkpointFlushAfter := time.Duration(s.cfg.CheckpointFlushSeconds) * time.Second
+	if s.pendingOffset != nil && checkpointFlushAfter > 0 && (flushAfter <= 0 || flushAfter > checkpointFlushAfter) {
+		return checkpointFlushAfter
+	}
+	return flushAfter
 }
 
 func (s *Sink) flushAll(ctx context.Context) error {

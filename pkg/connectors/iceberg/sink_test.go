@@ -252,6 +252,99 @@ func TestShouldFlushStateWaitsBeforeIdleOrAgeLimit(t *testing.T) {
 	}
 }
 
+func TestShouldFlushStateCapsAgeWhenCheckpointIsWaiting(t *testing.T) {
+	now := time.Date(2026, 6, 6, 1, 30, 0, 0, time.UTC)
+	sink := &Sink{
+		cfg:           config.IcebergConfig{FlushSeconds: 300, CheckpointFlushSeconds: 10},
+		pendingOffset: &model.SourceOffset{BinlogFile: "mysql-bin.000010", BinlogPos: 42},
+	}
+	state := &tableState{
+		pending:        []model.Event{{TraceID: "event-1"}},
+		firstPendingAt: now.Add(-11 * time.Second),
+		lastEventAt:    now.Add(-1 * time.Second),
+	}
+
+	if !sink.shouldFlushStateLocked(state, now) {
+		t.Fatal("expected waiting checkpoint to cap flush age below flush_seconds")
+	}
+}
+
+func TestShouldFlushStateAllowsBriefBatchingWhenCheckpointIsWaiting(t *testing.T) {
+	now := time.Date(2026, 6, 6, 1, 30, 0, 0, time.UTC)
+	sink := &Sink{
+		cfg:           config.IcebergConfig{FlushSeconds: 300, CheckpointFlushSeconds: 10},
+		pendingOffset: &model.SourceOffset{BinlogFile: "mysql-bin.000010", BinlogPos: 42},
+	}
+	state := &tableState{
+		pending:        []model.Event{{TraceID: "event-1"}},
+		firstPendingAt: now.Add(-5 * time.Second),
+		lastEventAt:    now.Add(-1 * time.Second),
+	}
+
+	if sink.shouldFlushStateLocked(state, now) {
+		t.Fatal("did not expect waiting checkpoint to force an immediate flush")
+	}
+}
+
+func TestShouldFlushStateUsesConfiguredCheckpointFlushCap(t *testing.T) {
+	now := time.Date(2026, 6, 6, 1, 30, 0, 0, time.UTC)
+	sink := &Sink{
+		cfg:           config.IcebergConfig{FlushSeconds: 300, CheckpointFlushSeconds: 3},
+		pendingOffset: &model.SourceOffset{BinlogFile: "mysql-bin.000010", BinlogPos: 42},
+	}
+	state := &tableState{
+		pending:        []model.Event{{TraceID: "event-1"}},
+		firstPendingAt: now.Add(-4 * time.Second),
+		lastEventAt:    now.Add(-1 * time.Second),
+	}
+
+	if !sink.shouldFlushStateLocked(state, now) {
+		t.Fatal("expected custom checkpoint_flush_seconds to cap flush age")
+	}
+}
+
+func TestCheckpointDoesNotForceFlushPendingCDCEvents(t *testing.T) {
+	store := &testOffsetStore{}
+	state := &tableState{
+		sourceKey: "app.events",
+		pending: []model.Event{{
+			Type:    model.EventTypeInsert,
+			TraceID: "event-1",
+			Schema:  "app",
+			Table:   "events",
+		}},
+		pendingBytes: 512,
+	}
+	sink := &Sink{
+		jobID:     "job-1",
+		stateKey:  "rivus/v1/checkpoint-key",
+		offsetSto: store,
+		states: map[string]*tableState{
+			state.sourceKey: state,
+		},
+	}
+
+	err := sink.handleEvent(context.Background(), model.Event{
+		Type: model.EventTypeCheckpoint,
+		SourceOffset: &model.SourceOffset{
+			BinlogFile: "mysql-bin.000010",
+			BinlogPos:  42,
+		},
+	})
+	if err != nil {
+		t.Fatalf("handleEvent returned error: %v", err)
+	}
+	if len(state.pending) != 1 {
+		t.Fatalf("pending events = %d, want checkpoint to leave pending CDC batch unflushed", len(state.pending))
+	}
+	if store.savedJobID != "" || store.offset != nil {
+		t.Fatalf("checkpoint was committed with pending events: key=%q offset=%#v", store.savedJobID, store.offset)
+	}
+	if sink.pendingOffset == nil || sink.pendingOffset.BinlogFile != "mysql-bin.000010" || sink.pendingOffset.BinlogPos != 42 {
+		t.Fatalf("pending offset = %#v, want remembered checkpoint", sink.pendingOffset)
+	}
+}
+
 func TestIcebergTypeForColumnClampsDecimalPrecision(t *testing.T) {
 	precision := int64(65)
 	scale := int64(30)
@@ -486,6 +579,9 @@ func TestNormalizeIcebergConfigDefaultsSnapshotWriteMode(t *testing.T) {
 	}
 	if got, want := cfg.CDCDeleteExecutor, snapshotReplaceDeleteExecutorNative; got != want {
 		t.Fatalf("CDCDeleteExecutor = %q, want %q", got, want)
+	}
+	if got, want := cfg.CheckpointFlushSeconds, 10; got != want {
+		t.Fatalf("CheckpointFlushSeconds = %d, want %d", got, want)
 	}
 
 	cfg = normalizeIcebergConfig(config.IcebergConfig{SnapshotWriteMode: " Delete-Append "})
