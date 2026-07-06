@@ -115,6 +115,24 @@ pre.mono,
   object-fit: contain;
 }
 
+.sidebar-image-tag {
+  display: grid;
+  grid-template-columns: 48px minmax(0, 1fr);
+  align-items: baseline;
+  gap: 8px;
+}
+
+.sidebar-image-tag .mono {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-meta-label {
+  color: var(--flink-nav-muted);
+}
+
 .nav-section-title {
   margin: 18px 16px 8px;
   color: var(--flink-nav-muted);

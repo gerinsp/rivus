@@ -126,21 +126,30 @@ async function loadAuthStatus() {
 }
 
 async function loadAppVersion() {
-  const el = document.getElementById('appVersion');
-  if (!el) return;
+  const imageTagEl = document.getElementById('appImageTag');
+  const commitEl = document.getElementById('appCommitHash');
+  const metaEl = document.getElementById('appBuildMeta');
+  if (!imageTagEl && !commitEl) return;
 
   try {
     const res = await fetch('/api/version', { credentials: 'same-origin' });
     if (!res.ok) throw new Error(`version ${res.status}`);
     const data = await res.json();
     const version = data.version || 'dev';
-    const commit = data.commit ? ` ${String(data.commit).slice(0, 7)}` : '';
-    el.textContent = `${version}${commit}`;
-    if (data.build_date) {
-      el.title = `Built ${data.build_date}`;
+    const imageTag = data.image_tag || version;
+    const commit = data.commit ? String(data.commit) : 'dev';
+    if (imageTagEl) imageTagEl.textContent = imageTag;
+    if (commitEl) commitEl.textContent = commit === 'dev' ? commit : commit.slice(0, 12);
+    if (metaEl) {
+      const titleParts = [`Image rivus:${imageTag}`, `Commit ${commit}`];
+      if (data.build_date) titleParts.push(`Built ${data.build_date}`);
+      if (version) titleParts.push(`Version ${version}`);
+      metaEl.title = titleParts.join('\n');
     }
   } catch (err) {
-    el.textContent = 'dev';
+    if (imageTagEl) imageTagEl.textContent = 'dev';
+    if (commitEl) commitEl.textContent = 'dev';
+    if (metaEl) metaEl.title = 'Build metadata unavailable';
   }
 }
 

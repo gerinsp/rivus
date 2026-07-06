@@ -102,9 +102,15 @@
         </button>
       </nav>
 
-      <div class="sidebar-meta mx-4 mt-auto border-t border-white/10 py-4 text-xs text-slate-400">
-        <div>REST dashboard</div>
-        <div class="mono mt-1">Version <span id="appVersion">dev</span></div>
+      <div id="appBuildMeta" class="sidebar-meta mx-4 mt-auto border-t border-white/10 py-4 text-xs text-slate-400">
+        <div class="sidebar-image-tag">
+          <span class="sidebar-meta-label">Image</span>
+          <span class="mono text-slate-300">rivus:<span id="appImageTag">dev</span></span>
+        </div>
+        <div class="sidebar-image-tag mt-1">
+          <span class="sidebar-meta-label">Commit</span>
+          <span class="mono text-slate-300">sha:<span id="appCommitHash">dev</span></span>
+        </div>
         <div class="mono mt-1" data-bind="sync-stamp">Waiting for first sync</div>
       </div>
     </aside>

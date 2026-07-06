@@ -37,6 +37,7 @@ services:
       - .env
     environment:
       TZ: ${TZ:-UTC}
+      RIVUS_IMAGE_TAG: ${RIVUS_IMAGE_TAG:-latest}
       RIVUS_LOG_DIR: ${RIVUS_LOG_DIR:-/app/logs}
       RIVUS_LOG_RETENTION_DAYS: ${RIVUS_LOG_RETENTION_DAYS:-7}
       RIVUS_LOG_MAX_SIZE_MB: ${RIVUS_LOG_MAX_SIZE_MB:-64}
