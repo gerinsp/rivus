@@ -21,22 +21,18 @@ type emptyUnauthorizedRESTError struct{}
 func (emptyUnauthorizedRESTError) Error() string { return ": " }
 func (emptyUnauthorizedRESTError) Unwrap() error { return icerest.ErrUnauthorized }
 
-type fakeCDCEqualityDeleter struct {
-	calls      int
-	gotState   *tableState
-	gotKeys    []map[string]interface{}
-	gotDeletes []pendingDelete
-	gotPKCols  []string
-	updated    *table.Table
-	err        error
+type fakeCDCEqualityCommitter struct {
+	calls    int
+	gotState *tableState
+	gotBatch *reducedBatch
+	updated  *table.Table
+	err      error
 }
 
-func (f *fakeCDCEqualityDeleter) DeleteEquality(ctx context.Context, state *tableState, keys []map[string]interface{}, deleteRows []pendingDelete, pkCols []string) (*table.Table, error) {
+func (f *fakeCDCEqualityCommitter) CommitEqualityDelta(ctx context.Context, state *tableState, batch *reducedBatch) (*table.Table, error) {
 	f.calls++
 	f.gotState = state
-	f.gotKeys = keys
-	f.gotDeletes = deleteRows
-	f.gotPKCols = pkCols
+	f.gotBatch = batch
 	return f.updated, f.err
 }
 
@@ -699,13 +695,13 @@ func TestCDCKeyDeleteExecutorFallsBackToTrinoURI(t *testing.T) {
 	}
 }
 
-func TestApplyKeyDeleteWithEqualityDeletesUsesConfiguredDeleter(t *testing.T) {
-	deleter := &fakeCDCEqualityDeleter{}
+func TestApplyEqualityDeltaUsesConfiguredCommitter(t *testing.T) {
+	committer := &fakeCDCEqualityCommitter{}
 	sink := &Sink{
-		jobID:           "job-1",
-		cfg:             config.IcebergConfig{MaxConcurrentCommits: 1},
-		equalityDeleter: deleter,
-		states:          make(map[string]*tableState),
+		jobID:             "job-1",
+		cfg:               config.IcebergConfig{MaxConcurrentCommits: 1},
+		equalityCommitter: committer,
+		states:            make(map[string]*tableState),
 	}
 	state := &tableState{
 		sourceKey:       "app.orders",
@@ -719,30 +715,37 @@ func TestApplyKeyDeleteWithEqualityDeletesUsesConfiguredDeleter(t *testing.T) {
 		deleteKeys:  []map[string]interface{}{key},
 		deleteRows:  []pendingDelete{deleteRow},
 		pkCols:      []string{"id"},
+		rows:        []map[string]interface{}{{"id": int64(10), "status": "updated"}},
 		deleteCount: 1,
 	}
 
-	if err := sink.applyKeyDeleteWithEqualityDeletes(context.Background(), state, batch, "delete-equality"); err != nil {
-		t.Fatalf("applyKeyDeleteWithEqualityDeletes returned error: %v", err)
+	if err := sink.applyEqualityDelta(context.Background(), state, batch, "delete-append-equality"); err != nil {
+		t.Fatalf("applyEqualityDelta returned error: %v", err)
 	}
 
-	if got, want := deleter.calls, 1; got != want {
-		t.Fatalf("deleter calls = %d, want %d", got, want)
+	if got, want := committer.calls, 1; got != want {
+		t.Fatalf("committer calls = %d, want %d", got, want)
 	}
-	if deleter.gotState != state {
-		t.Fatal("deleter received different table state")
+	if committer.gotState != state {
+		t.Fatal("committer received different table state")
 	}
-	if got, want := len(deleter.gotKeys), 1; got != want {
-		t.Fatalf("deleter keys length = %d, want %d", got, want)
+	if committer.gotBatch != batch {
+		t.Fatal("committer received different reduced batch")
 	}
-	if got := deleter.gotKeys[0]["id"]; got != int64(10) {
-		t.Fatalf("deleter key id = %v, want 10", got)
+	if got, want := len(committer.gotBatch.deleteKeys), 1; got != want {
+		t.Fatalf("committer keys length = %d, want %d", got, want)
 	}
-	if got, want := len(deleter.gotDeletes), 1; got != want {
-		t.Fatalf("deleter delete rows length = %d, want %d", got, want)
+	if got := committer.gotBatch.deleteKeys[0]["id"]; got != int64(10) {
+		t.Fatalf("committer key id = %v, want 10", got)
 	}
-	if got, want := deleter.gotPKCols, []string{"id"}; len(got) != len(want) || got[0] != want[0] {
-		t.Fatalf("deleter pk cols = %v, want %v", got, want)
+	if got, want := len(committer.gotBatch.deleteRows), 1; got != want {
+		t.Fatalf("committer delete rows length = %d, want %d", got, want)
+	}
+	if got, want := committer.gotBatch.pkCols, []string{"id"}; len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("committer pk cols = %v, want %v", got, want)
+	}
+	if got, want := len(committer.gotBatch.rows), 1; got != want {
+		t.Fatalf("committer rows length = %d, want %d", got, want)
 	}
 }
 

@@ -2,14 +2,11 @@ package iceberg
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
-	"math/big"
+	"log"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -27,20 +24,21 @@ import (
 )
 
 type countingWriteCloser struct {
-	w io.WriteCloser
-	n int64
+	w      io.WriteCloser
+	n      int64
+	closed bool
 }
 
-type cdcEqualityDeleter interface {
-	DeleteEquality(ctx context.Context, state *tableState, keys []map[string]interface{}, deleteRows []pendingDelete, pkCols []string) (*icetable.Table, error)
+type cdcEqualityCommitter interface {
+	CommitEqualityDelta(ctx context.Context, state *tableState, batch *reducedBatch) (*icetable.Table, error)
 }
 
-type rivusEqualityDeleter struct {
+type rivusEqualityCommitter struct {
 	sink *Sink
 }
 
-func (d rivusEqualityDeleter) DeleteEquality(ctx context.Context, state *tableState, keys []map[string]interface{}, deleteRows []pendingDelete, pkCols []string) (*icetable.Table, error) {
-	return d.sink.commitEqualityDelete(ctx, state, keys, deleteRows, pkCols)
+func (c rivusEqualityCommitter) CommitEqualityDelta(ctx context.Context, state *tableState, batch *reducedBatch) (*icetable.Table, error) {
+	return c.sink.commitEqualityDelta(ctx, state, batch)
 }
 
 func (w *countingWriteCloser) Write(p []byte) (int, error) {
@@ -50,10 +48,14 @@ func (w *countingWriteCloser) Write(p []byte) (int, error) {
 }
 
 func (w *countingWriteCloser) Close() error {
+	if w.closed {
+		return nil
+	}
+	w.closed = true
 	return w.w.Close()
 }
 
-func (s *Sink) applyKeyDeleteWithEqualityDeletes(ctx context.Context, state *tableState, batch *reducedBatch, operation string) error {
+func (s *Sink) applyEqualityDelta(ctx context.Context, state *tableState, batch *reducedBatch, operation string) error {
 	if batch == nil || len(batch.deleteKeys) == 0 {
 		return nil
 	}
@@ -79,11 +81,11 @@ func (s *Sink) applyKeyDeleteWithEqualityDeletes(ctx context.Context, state *tab
 	}, func() error {
 		startedAt = time.Now()
 		var err error
-		deleter := s.equalityDeleter
-		if deleter == nil {
-			deleter = rivusEqualityDeleter{sink: s}
+		committer := s.equalityCommitter
+		if committer == nil {
+			committer = rivusEqualityCommitter{sink: s}
 		}
-		updated, err = deleter.DeleteEquality(ctx, state, batch.deleteKeys, batch.deleteRows, batch.pkCols)
+		updated, err = committer.CommitEqualityDelta(ctx, state, batch)
 		duration = time.Since(startedAt)
 		return err
 	})
@@ -96,10 +98,17 @@ func (s *Sink) applyKeyDeleteWithEqualityDeletes(ctx context.Context, state *tab
 	return nil
 }
 
-func (s *Sink) commitEqualityDelete(ctx context.Context, state *tableState, keys []map[string]interface{}, deleteRows []pendingDelete, pkCols []string) (*icetable.Table, error) {
+func (s *Sink) commitEqualityDelta(ctx context.Context, state *tableState, batch *reducedBatch) (*icetable.Table, error) {
 	if state == nil || state.table == nil {
-		return nil, fmt.Errorf("table handle is nil for equality delete")
+		return nil, fmt.Errorf("table handle is nil for equality delta")
 	}
+	if batch == nil || len(batch.deleteKeys) == 0 {
+		return nil, fmt.Errorf("equality delta requires at least one delete key")
+	}
+	if len(batch.pkCols) == 0 {
+		return nil, fmt.Errorf("equality delta requires primary key columns for %s", state.sourceKey)
+	}
+
 	tbl := state.table
 	meta := tbl.Metadata()
 	if meta.Version() < 2 {
@@ -115,100 +124,74 @@ func (s *Sink) commitEqualityDelete(ctx context.Context, state *tableState, keys
 		return nil, fmt.Errorf("iceberg filesystem does not support writes for equality delete")
 	}
 
-	deleteFiles, err := writeEqualityDeleteFiles(ctx, tbl, writeFS, keys, deleteRows, pkCols)
+	stagedFiles := make([]iceberglib.DataFile, 0, len(batch.rows)+len(batch.deleteKeys))
+	cleanupStaged := true
+	defer func() {
+		if !cleanupStaged {
+			return
+		}
+		removeStagedIcebergFiles(writeFS, stagedFiles)
+	}()
+
+	deleteFiles, err := writeEqualityDeleteFiles(ctx, tbl, writeFS, batch.deleteKeys, batch.deleteRows, batch.pkCols)
 	if err != nil {
 		return nil, err
 	}
 	if len(deleteFiles) == 0 {
 		return nil, fmt.Errorf("equality delete built no delete files for %s", state.sourceKey)
 	}
+	stagedFiles = append(stagedFiles, deleteFiles...)
 
-	snapshotID, err := newIcebergSnapshotID(meta)
-	if err != nil {
-		return nil, err
-	}
-	sequenceNumber := meta.LastSequenceNumber() + 1
-	parentSnapshotID := (*int64)(nil)
-	currentSnapshotID := (*int64)(nil)
-	if current := tbl.CurrentSnapshot(); current != nil {
-		parent := current.SnapshotID
-		parentSnapshotID = &parent
-		currentID := current.SnapshotID
-		currentSnapshotID = &currentID
-	}
-
-	locProvider, err := tbl.LocationProvider()
-	if err != nil {
-		return nil, err
-	}
-	commitUUID := uuid.NewString()
-	manifestPath := locProvider.NewMetadataLocation(fmt.Sprintf("%s-m0.avro", commitUUID))
-	manifest, err := writeEqualityDeleteManifest(writeFS, manifestPath, meta.Version(), tbl.Spec(), tbl.Schema(), snapshotID, deleteFiles)
-	if err != nil {
-		return nil, err
-	}
-
-	manifests := []iceberglib.ManifestFile{manifest}
-	if current := tbl.CurrentSnapshot(); current != nil {
-		parentManifests, err := current.Manifests(fs)
+	dataFiles := make([]iceberglib.DataFile, 0, 1)
+	if len(batch.rows) > 0 {
+		reader, release, err := buildRecordReader(tbl.Schema(), batch.rows)
 		if err != nil {
-			return nil, fmt.Errorf("read current snapshot manifests before equality delete commit: %w", err)
+			return nil, err
 		}
-		manifests = append(parentManifests, manifest)
+		defer release()
+
+		for dataFile, writeErr := range icetable.WriteRecords(ctx, tbl, reader.Schema(), array.IterFromReader(reader)) {
+			if writeErr != nil {
+				return nil, writeErr
+			}
+			dataFiles = append(dataFiles, dataFile)
+			stagedFiles = append(stagedFiles, dataFile)
+		}
+		if len(dataFiles) == 0 {
+			return nil, fmt.Errorf("equality delta built no data files for %s", state.sourceKey)
+		}
 	}
 
-	firstRowID := int64(0)
-	if meta.Version() == 3 {
-		firstRowID = meta.NextRowID()
+	txn := tbl.NewTransaction()
+	delta := txn.NewRowDelta(s.snapshotProps(state))
+	delta.AddDeletes(deleteFiles...)
+	if len(dataFiles) > 0 {
+		delta.AddRows(dataFiles...)
 	}
-	manifestListPath := locProvider.NewMetadataLocation(fmt.Sprintf("snap-%d-0-%s.avro", snapshotID, commitUUID))
-	if err := writeEqualityDeleteManifestList(writeFS, manifestListPath, meta.Version(), snapshotID, parentSnapshotID, sequenceNumber, firstRowID, manifests); err != nil {
+	if err := delta.Commit(ctx); err != nil {
 		return nil, err
 	}
 
-	summary := equalityDeleteSummary(tbl.CurrentSnapshot(), deleteFiles, s.snapshotProps(state))
-	snapshot := icetable.Snapshot{
-		SnapshotID:       snapshotID,
-		ParentSnapshotID: parentSnapshotID,
-		SequenceNumber:   sequenceNumber,
-		ManifestList:     manifestListPath,
-		Summary:          &summary,
-		SchemaID:         &tbl.Schema().ID,
-		TimestampMs:      time.Now().UnixMilli(),
-	}
-	if meta.Version() == 3 {
-		addedRows := int64(0)
-		snapshot.FirstRowID = &firstRowID
-		snapshot.AddedRows = &addedRows
-	}
-	maxRefAgeMs, maxSnapshotAgeMs, minSnapshotsToKeep := snapshotRefRetention(meta.Ref())
-
-	updates := []icetable.Update{
-		icetable.NewAddSnapshotUpdate(&snapshot),
-		icetable.NewSetSnapshotRefUpdate(icetable.MainBranch, snapshotID, icetable.BranchRef, maxRefAgeMs, maxSnapshotAgeMs, minSnapshotsToKeep),
-	}
-	requirements := []icetable.Requirement{
-		icetable.AssertRefSnapshotID(icetable.MainBranch, currentSnapshotID),
-	}
-
-	newMeta, newLoc, err := s.catalog.CommitTable(ctx, tbl.Identifier(), requirements, updates)
+	// Once the catalog commit starts its outcome may be unknown on transport
+	// failure. Leave staged files for orphan cleanup rather than risk deleting
+	// files that an accepted commit references.
+	cleanupStaged = false
+	updated, err := txn.Commit(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return icetable.New(tbl.Identifier(), newMeta, newLoc, tbl.FS, s.catalog), nil
+	return updated, nil
 }
 
-func snapshotRefRetention(ref icetable.SnapshotRef) (maxRefAgeMs, maxSnapshotAgeMs int64, minSnapshotsToKeep int) {
-	if ref.MaxRefAgeMs != nil && *ref.MaxRefAgeMs > 0 {
-		maxRefAgeMs = *ref.MaxRefAgeMs
+func removeStagedIcebergFiles(fs iceio.WriteFileIO, files []iceberglib.DataFile) {
+	for _, file := range files {
+		if file == nil || strings.TrimSpace(file.FilePath()) == "" {
+			continue
+		}
+		if err := fs.Remove(file.FilePath()); err != nil {
+			log.Printf("[iceberg] failed to remove staged equality-delta file=%q: %v", file.FilePath(), err)
+		}
 	}
-	if ref.MaxSnapshotAgeMs != nil && *ref.MaxSnapshotAgeMs > 0 {
-		maxSnapshotAgeMs = *ref.MaxSnapshotAgeMs
-	}
-	if ref.MinSnapshotsToKeep != nil && *ref.MinSnapshotsToKeep > 0 {
-		minSnapshotsToKeep = *ref.MinSnapshotsToKeep
-	}
-	return maxRefAgeMs, maxSnapshotAgeMs, minSnapshotsToKeep
 }
 
 func writeEqualityDeleteFiles(ctx context.Context, tbl *icetable.Table, fs iceio.WriteFileIO, keys []map[string]interface{}, deleteRows []pendingDelete, pkCols []string) ([]iceberglib.DataFile, error) {
@@ -225,6 +208,12 @@ func writeEqualityDeleteFiles(ctx context.Context, tbl *icetable.Table, fs iceio
 		return nil, err
 	}
 	deleteFiles := make([]iceberglib.DataFile, 0, len(groups))
+	complete := false
+	defer func() {
+		if !complete {
+			removeStagedIcebergFiles(fs, deleteFiles)
+		}
+	}()
 	for _, group := range groups {
 		deleteFile, err := writeEqualityDeleteFile(ctx, tbl, fs, group.keys, pkCols, group.partitionData)
 		if err != nil {
@@ -232,6 +221,7 @@ func writeEqualityDeleteFiles(ctx context.Context, tbl *icetable.Table, fs iceio
 		}
 		deleteFiles = append(deleteFiles, deleteFile)
 	}
+	complete = true
 	return deleteFiles, nil
 }
 
@@ -433,6 +423,14 @@ func writeEqualityDeleteFile(ctx context.Context, tbl *icetable.Table, fs iceio.
 	if err != nil {
 		return nil, err
 	}
+	complete := false
+	defer func() {
+		if !complete {
+			if removeErr := fs.Remove(filePath); removeErr != nil {
+				log.Printf("[iceberg] failed to remove incomplete equality-delete file=%q: %v", filePath, removeErr)
+			}
+		}
+	}()
 	counter := &countingWriteCloser{w: out}
 	if err := pqarrow.WriteTable(arrowTable, counter, arrowTable.NumRows(), parquet.NewWriterProperties(parquet.WithStats(true)), pqarrow.DefaultWriterProps()); err != nil {
 		_ = counter.Close()
@@ -446,7 +444,9 @@ func writeEqualityDeleteFile(ctx context.Context, tbl *icetable.Table, fs iceio.
 	if err != nil {
 		return nil, err
 	}
-	return builder.EqualityFieldIDs(equalityFieldIDs).Build(), nil
+	deleteFile := builder.EqualityFieldIDs(equalityFieldIDs).Build()
+	complete = true
+	return deleteFile, nil
 }
 
 func equalityDeleteSchema(schema *iceberglib.Schema, pkCols []string) (*iceberglib.Schema, []int, error) {
@@ -489,103 +489,4 @@ func buildEqualityDeleteRecord(schema *iceberglib.Schema, keys []map[string]inte
 		batch.Release()
 		release()
 	}, nil
-}
-
-func writeEqualityDeleteManifest(fs iceio.WriteFileIO, path string, formatVersion int, spec iceberglib.PartitionSpec, schema *iceberglib.Schema, snapshotID int64, deleteFiles []iceberglib.DataFile) (iceberglib.ManifestFile, error) {
-	out, err := fs.Create(path)
-	if err != nil {
-		return nil, err
-	}
-	counter := &countingWriteCloser{w: out}
-	writer, err := iceberglib.NewManifestWriter(formatVersion, counter, spec, schema, snapshotID, iceberglib.WithManifestWriterContent(iceberglib.ManifestContentDeletes))
-	if err != nil {
-		_ = counter.Close()
-		return nil, err
-	}
-	for _, deleteFile := range deleteFiles {
-		entry := iceberglib.NewManifestEntry(iceberglib.EntryStatusADDED, &snapshotID, nil, nil, deleteFile)
-		if err := writer.Add(entry); err != nil {
-			_ = writer.Close()
-			_ = counter.Close()
-			return nil, err
-		}
-	}
-	if err := writer.Close(); err != nil {
-		_ = counter.Close()
-		return nil, err
-	}
-	if err := counter.Close(); err != nil {
-		return nil, err
-	}
-	return writer.ToManifestFile(path, counter.n, iceberglib.WithManifestFileContent(iceberglib.ManifestContentDeletes))
-}
-
-func writeEqualityDeleteManifestList(fs iceio.WriteFileIO, path string, formatVersion int, snapshotID int64, parentSnapshotID *int64, sequenceNumber int64, firstRowID int64, manifests []iceberglib.ManifestFile) error {
-	out, err := fs.Create(path)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-	return iceberglib.WriteManifestList(formatVersion, out, snapshotID, parentSnapshotID, &sequenceNumber, firstRowID, manifests)
-}
-
-func equalityDeleteSummary(previous *icetable.Snapshot, deleteFiles []iceberglib.DataFile, props iceberglib.Properties) icetable.Summary {
-	summaryProps := iceberglib.Properties{}
-	if previous != nil && previous.Summary != nil {
-		for key, value := range previous.Summary.Properties {
-			if len(key) >= len("total-") && key[:len("total-")] == "total-" {
-				summaryProps[key] = value
-			}
-		}
-	}
-	var addedDeletes int64
-	var addedFileSize int64
-	for _, deleteFile := range deleteFiles {
-		addedDeletes += deleteFile.Count()
-		addedFileSize += deleteFile.FileSizeBytes()
-	}
-	addedFiles := int64(len(deleteFiles))
-	setSummaryInt(summaryProps, "added-delete-files", addedFiles)
-	setSummaryInt(summaryProps, "added-equality-delete-files", addedFiles)
-	setSummaryInt(summaryProps, "added-equality-deletes", addedDeletes)
-	setSummaryInt(summaryProps, "added-files-size", addedFileSize)
-	setSummaryInt(summaryProps, "total-delete-files", summaryInt(summaryProps, "total-delete-files")+addedFiles)
-	setSummaryInt(summaryProps, "total-equality-deletes", summaryInt(summaryProps, "total-equality-deletes")+addedDeletes)
-	setSummaryInt(summaryProps, "total-files-size", summaryInt(summaryProps, "total-files-size")+addedFileSize)
-	if _, ok := summaryProps["total-data-files"]; !ok {
-		setSummaryInt(summaryProps, "total-data-files", 0)
-	}
-	if _, ok := summaryProps["total-records"]; !ok {
-		setSummaryInt(summaryProps, "total-records", 0)
-	}
-	if _, ok := summaryProps["total-position-deletes"]; !ok {
-		setSummaryInt(summaryProps, "total-position-deletes", 0)
-	}
-	for key, value := range props {
-		summaryProps[key] = value
-	}
-	return icetable.Summary{Operation: icetable.OpDelete, Properties: summaryProps}
-}
-
-func summaryInt(props iceberglib.Properties, key string) int64 {
-	value, _ := strconv.ParseInt(props[key], 10, 64)
-	return value
-}
-
-func setSummaryInt(props iceberglib.Properties, key string, value int64) {
-	props[key] = strconv.FormatInt(value, 10)
-}
-
-func newIcebergSnapshotID(meta icetable.Metadata) (int64, error) {
-	for attempts := 0; attempts < 10; attempts++ {
-		n, err := rand.Int(rand.Reader, big.NewInt(math.MaxInt64))
-		if err != nil {
-			return 0, err
-		}
-		id := n.Int64() + 1
-		if meta.SnapshotByID(id) == nil {
-			return id, nil
-		}
-	}
-	return 0, fmt.Errorf("could not generate unique iceberg snapshot id")
 }

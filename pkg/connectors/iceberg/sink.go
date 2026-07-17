@@ -48,7 +48,7 @@ type Sink struct {
 	progress  connector.ProgressReporter
 	catalog   icecatalog.Catalog
 
-	equalityDeleter cdcEqualityDeleter
+	equalityCommitter cdcEqualityCommitter
 
 	mu                         sync.Mutex
 	sourceSchemas              map[string]*model.TableSchema
@@ -260,7 +260,7 @@ func NewSink(jobID, stateKey, jobName string, cfg config.IcebergConfig, retry co
 		sourceSchemas: make(map[string]*model.TableSchema),
 		states:        make(map[string]*tableState),
 	}
-	sink.equalityDeleter = rivusEqualityDeleter{sink: sink}
+	sink.equalityCommitter = rivusEqualityCommitter{sink: sink}
 	return sink, nil
 }
 
@@ -2719,48 +2719,15 @@ func (s *Sink) flushReducedBatchWithEqualityDeleteOnce(ctx context.Context, stat
 	}
 	if len(batch.rows) == 0 {
 		result.operation = "delete-equality"
-		if err := s.applyKeyDeleteWithEqualityDeletes(ctx, state, batch, result.operation); err != nil {
+		if err := s.applyEqualityDelta(ctx, state, batch, result.operation); err != nil {
 			return flushResult{}, err
 		}
 		return result, nil
 	}
 
-	if err := s.applyKeyDeleteWithEqualityDeletes(ctx, state, batch, "delete-equality"); err != nil {
+	if err := s.applyEqualityDelta(ctx, state, batch, result.operation); err != nil {
 		return flushResult{}, err
 	}
-
-	reader, release, err := buildRecordReader(state.table.Schema(), batch.rows)
-	if err != nil {
-		return flushResult{}, util.Permanent(err)
-	}
-	defer release()
-
-	props := s.snapshotProps(state)
-	var updated *icetable.Table
-	var writeStartedAt time.Time
-	var writeCallDuration time.Duration
-	err = s.withCommitSlot(ctx, commitProgress{
-		operation:       "append-after-delete-equality",
-		sourceKey:       state.sourceKey,
-		targetNamespace: state.targetNamespace,
-		targetTable:     state.targetTable,
-		rowCount:        result.rowCount,
-		deleteCount:     result.deleteCount,
-	}, func() error {
-		writeStartedAt = time.Now()
-		var commitErr error
-		updated, commitErr = state.table.Append(ctx, reader, props)
-		writeCallDuration = time.Since(writeStartedAt)
-		return commitErr
-	})
-	appendResult := result
-	appendResult.operation = "append-after-delete-equality"
-	s.logWriteTiming(state, appendResult, err, writeStartedAt, writeCallDuration)
-	if err != nil {
-		return flushResult{}, s.stateOperationError(result.operation, state, err)
-	}
-
-	s.updateStateTableAfterWrite(state, updated)
 	return result, nil
 }
 
