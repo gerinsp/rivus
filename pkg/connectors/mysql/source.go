@@ -378,6 +378,7 @@ type cdcHandler struct {
 	lastProgressAt    time.Time
 	lastProgressFile  string
 	lastProgressPos   uint32
+	lastCheckpointLog time.Time
 	schemaFetcher     func(context.Context, string, string) (*model.TableSchema, error)
 
 	out chan<- model.Event
@@ -826,8 +827,6 @@ func (h *cdcHandler) OnPosSynced(header *replication.EventHeader, pos gomysql.Po
 	if header != nil {
 		eventType = header.EventType.String()
 	}
-	log.Printf("[mysql][job %s] CDC checkpoint queued pos=%s:%d event=%s force=%t",
-		h.jobID, pos.Name, pos.Pos, eventType, force)
 
 	ev := model.Event{
 		Type:      model.EventTypeCheckpoint,
@@ -842,7 +841,12 @@ func (h *cdcHandler) OnPosSynced(header *replication.EventHeader, pos gomysql.Po
 	if err := h.emit(ev); err != nil {
 		return err
 	}
-	log.Printf("[mysql][job %s] CDC checkpoint emitted trace_id=%s pos=%s:%d", h.jobID, ev.TraceID, pos.Name, pos.Pos)
+	now := time.Now()
+	if force || h.lastCheckpointLog.IsZero() || now.Sub(h.lastCheckpointLog) >= 30*time.Second {
+		log.Printf("[mysql][job %s] CDC checkpoint emitted trace_id=%s pos=%s:%d event=%s force=%t",
+			h.jobID, ev.TraceID, pos.Name, pos.Pos, eventType, force)
+		h.lastCheckpointLog = now
+	}
 	return nil
 }
 

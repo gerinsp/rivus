@@ -564,11 +564,15 @@ func showBinaryLogs(ctx context.Context, db *sql.DB) (string, string, int, error
 }
 
 func queryMySQLServerTime(ctx context.Context, db *sql.DB) (time.Time, error) {
-	var serverTime time.Time
-	if err := db.QueryRowContext(ctx, "SELECT NOW(6)").Scan(&serverTime); err != nil {
+	var unixMicros int64
+	if err := db.QueryRowContext(ctx, "SELECT CAST(UNIX_TIMESTAMP(NOW(6)) * 1000000 AS SIGNED)").Scan(&unixMicros); err != nil {
 		return time.Time{}, err
 	}
-	return serverTime, nil
+	return mysqlServerTimeFromUnixMicros(unixMicros), nil
+}
+
+func mysqlServerTimeFromUnixMicros(unixMicros int64) time.Time {
+	return time.UnixMicro(unixMicros)
 }
 
 func binlogFileInRange(file, first, last string) bool {

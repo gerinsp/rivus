@@ -2,12 +2,58 @@ package doris
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"net/url"
 	"testing"
 
 	"github.com/gerinsp/rivus/pkg/config"
+	"github.com/gerinsp/rivus/pkg/meta"
 	"github.com/gerinsp/rivus/pkg/model"
 )
+
+type recordingOffsetStore struct {
+	savedJobIDs []string
+	saved       []meta.Offset
+}
+
+func (s *recordingOffsetStore) GetOffset(context.Context, string) (*meta.Offset, error) {
+	return nil, nil
+}
+
+func (s *recordingOffsetStore) SaveOffset(_ context.Context, jobID string, offset meta.Offset) error {
+	s.savedJobIDs = append(s.savedJobIDs, jobID)
+	s.saved = append(s.saved, offset)
+	return nil
+}
+
+func (s *recordingOffsetStore) GetSnapshotState(context.Context, string) (*meta.SnapshotState, error) {
+	return nil, nil
+}
+
+func (s *recordingOffsetStore) SaveSnapshotStart(context.Context, string, meta.Offset) error {
+	return nil
+}
+
+func (s *recordingOffsetStore) MarkSnapshotDone(context.Context, string) error {
+	return nil
+}
+
+func (s *recordingOffsetStore) GetSnapshotProgress(context.Context, string) (*meta.SnapshotProgress, error) {
+	return nil, nil
+}
+
+func (s *recordingOffsetStore) SaveSnapshotProgress(context.Context, string, string, int64, string) error {
+	return nil
+}
+
+func (s *recordingOffsetStore) ClearSnapshotProgress(context.Context, string) error {
+	return nil
+}
+
+func (s *recordingOffsetStore) DeleteJobState(context.Context, string) error {
+	return nil
+}
 
 func TestBuildColumnsHeaderQuotesReservedKeywords(t *testing.T) {
 	got := buildColumnsHeader([]string{"Pri", "IsCharter", "ShowManifest", "Group"})
@@ -229,5 +275,152 @@ func TestCheckpointKeyUsesInternalStateKey(t *testing.T) {
 	sink := &Sink{jobID: "visible-job", stateKey: "rivus/v1/checkpoint-key"}
 	if got := sink.checkpointKey(); got != "rivus/v1/checkpoint-key" {
 		t.Fatalf("checkpointKey() = %q, want internal state key", got)
+	}
+}
+
+func TestCheckpointWaitsForNormalFlushBoundary(t *testing.T) {
+	store := &recordingOffsetStore{}
+	var loaded [][]model.Event
+	sink := &Sink{
+		jobID:     "job-1",
+		stateKey:  "rivus/v1/job-1",
+		offsetSto: store,
+		cfg: config.DorisConfig{
+			BatchSize: 500,
+		},
+		sendBatchOverride: func(_ context.Context, db, table string, batch []model.Event) error {
+			if db != "source_db" || table != "orders" {
+				t.Fatalf("target = %s.%s, want source_db.orders", db, table)
+			}
+			loaded = append(loaded, append([]model.Event(nil), batch...))
+			return nil
+		},
+	}
+	state := newDorisRunState(sink)
+
+	row := model.Event{
+		Type:   model.EventTypeInsert,
+		Schema: "source_db",
+		Table:  "orders",
+		Data:   map[string]interface{}{"id": 1},
+	}
+	checkpoint := model.Event{
+		Type:    model.EventTypeCheckpoint,
+		TraceID: "mysql-bin.000184:456:checkpoint",
+		SourceOffset: &model.SourceOffset{
+			BinlogFile: "mysql-bin.000184",
+			BinlogPos:  456,
+		},
+	}
+
+	if err := state.handleEvent(context.Background(), row); err != nil {
+		t.Fatalf("handle row: %v", err)
+	}
+	if err := state.handleEvent(context.Background(), checkpoint); err != nil {
+		t.Fatalf("handle checkpoint: %v", err)
+	}
+	if len(loaded) != 0 {
+		t.Fatalf("checkpoint triggered %d Stream Loads, want none", len(loaded))
+	}
+	if len(store.saved) != 0 {
+		t.Fatalf("checkpoint triggered %d offset saves, want none", len(store.saved))
+	}
+
+	if err := state.flushAll(context.Background()); err != nil {
+		t.Fatalf("flushAll: %v", err)
+	}
+	if len(loaded) != 1 || len(loaded[0]) != 1 {
+		t.Fatalf("loaded batches = %#v, want one batch containing one row", loaded)
+	}
+	if len(store.saved) != 1 {
+		t.Fatalf("saved offsets = %d, want 1", len(store.saved))
+	}
+	if store.savedJobIDs[0] != "rivus/v1/job-1" {
+		t.Fatalf("saved job id = %q, want internal state key", store.savedJobIDs[0])
+	}
+	if got := store.saved[0]; got.BinlogFile != "mysql-bin.000184" || got.BinlogPos != 456 {
+		t.Fatalf("saved offset = %#v, want mysql-bin.000184:456", got)
+	}
+}
+
+func TestCheckpointsCoalesceToLatestOffset(t *testing.T) {
+	store := &recordingOffsetStore{}
+	sink := &Sink{
+		jobID:     "job-1",
+		offsetSto: store,
+		cfg: config.DorisConfig{
+			BatchSize: 500,
+		},
+	}
+	state := newDorisRunState(sink)
+
+	for _, pos := range []uint32{100, 200, 300} {
+		err := state.handleEvent(context.Background(), model.Event{
+			Type: model.EventTypeCheckpoint,
+			SourceOffset: &model.SourceOffset{
+				BinlogFile: "mysql-bin.000184",
+				BinlogPos:  pos,
+			},
+		})
+		if err != nil {
+			t.Fatalf("handle checkpoint %d: %v", pos, err)
+		}
+	}
+	if len(store.saved) != 0 {
+		t.Fatalf("saved offsets before flush = %d, want 0", len(store.saved))
+	}
+
+	if err := state.flushAll(context.Background()); err != nil {
+		t.Fatalf("flushAll: %v", err)
+	}
+	if len(store.saved) != 1 {
+		t.Fatalf("saved offsets = %d, want 1", len(store.saved))
+	}
+	if got := store.saved[0].BinlogPos; got != 300 {
+		t.Fatalf("saved position = %d, want latest position 300", got)
+	}
+}
+
+func TestFailedStreamLoadDoesNotCommitCheckpoint(t *testing.T) {
+	store := &recordingOffsetStore{}
+	loadErr := errors.New("stream load failed")
+	sink := &Sink{
+		jobID:     "job-1",
+		offsetSto: store,
+		cfg: config.DorisConfig{
+			BatchSize: 500,
+		},
+		sendBatchOverride: func(context.Context, string, string, []model.Event) error {
+			return loadErr
+		},
+	}
+	state := newDorisRunState(sink)
+
+	if err := state.handleEvent(context.Background(), model.Event{
+		Type:   model.EventTypeInsert,
+		Schema: "source_db",
+		Table:  "orders",
+	}); err != nil {
+		t.Fatalf("handle row: %v", err)
+	}
+	if err := state.handleEvent(context.Background(), model.Event{
+		Type: model.EventTypeCheckpoint,
+		SourceOffset: &model.SourceOffset{
+			BinlogFile: "mysql-bin.000184",
+			BinlogPos:  456,
+		},
+	}); err != nil {
+		t.Fatalf("handle checkpoint: %v", err)
+	}
+
+	err := state.flushAll(context.Background())
+	if !errors.Is(err, loadErr) {
+		t.Fatalf("flushAll error = %v, want %v", err, loadErr)
+	}
+	if len(store.saved) != 0 {
+		t.Fatalf("saved offsets after failed load = %d, want 0", len(store.saved))
+	}
+	if state.allBatchesEmpty() {
+		t.Fatal("failed batch was discarded")
 	}
 }

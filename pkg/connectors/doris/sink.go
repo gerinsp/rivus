@@ -74,6 +74,8 @@ type Sink struct {
 
 	maxLen   map[string]map[string]int  // "db.table" -> col -> max chars (varchar/char)
 	isString map[string]map[string]bool // "db.table" -> col -> string-ish
+
+	sendBatchOverride func(context.Context, string, string, []model.Event) error
 }
 
 type loadStatus struct {
@@ -889,109 +891,128 @@ func (s *Sink) recordDorisSinkFlush(batch []model.Event, targetTable string, dur
 	}
 }
 
+func (s *Sink) sendBatchForRun(ctx context.Context, targetDB, targetTable string, batch []model.Event) error {
+	if s.sendBatchOverride != nil {
+		return s.sendBatchOverride(ctx, targetDB, targetTable, batch)
+	}
+	return s.sendBatch(ctx, targetDB, targetTable, batch)
+}
+
+type dorisRunState struct {
+	sink                 *Sink
+	batches              map[string][]model.Event
+	pendingOffset        *model.SourceOffset
+	pendingOffsetTraceID string
+}
+
+func newDorisRunState(sink *Sink) *dorisRunState {
+	return &dorisRunState{
+		sink:    sink,
+		batches: make(map[string][]model.Event),
+	}
+}
+
+func (state *dorisRunState) rememberOffset(off *model.SourceOffset, traceID string) {
+	if !off.Valid() {
+		return
+	}
+	cp := *off
+	state.pendingOffset = &cp
+	state.pendingOffsetTraceID = traceID
+}
+
+func (state *dorisRunState) allBatchesEmpty() bool {
+	for _, batch := range state.batches {
+		if len(batch) > 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func (state *dorisRunState) commitPendingOffset(commitCtx context.Context) error {
+	if state.pendingOffset == nil || state.sink.offsetSto == nil || !state.allBatchesEmpty() {
+		return nil
+	}
+
+	saveCtx, cancel := context.WithTimeout(commitCtx, 2*time.Second)
+	defer cancel()
+
+	if err := connector.SaveSourceOffset(saveCtx, state.sink.offsetSto, state.sink.checkpointKey(), state.pendingOffset); err != nil {
+		log.Printf("[doris][job %s] save offset error pos=%s:%d: %v", state.sink.jobID, state.pendingOffset.BinlogFile, state.pendingOffset.BinlogPos, err)
+		return nil
+	}
+	log.Printf("[doris][job %s] committed offset trace_id=%s pos=%s:%d", state.sink.jobID, state.pendingOffsetTraceID, state.pendingOffset.BinlogFile, state.pendingOffset.BinlogPos)
+	state.pendingOffset = nil
+	state.pendingOffsetTraceID = ""
+	return nil
+}
+
+func (state *dorisRunState) flushAll(flushCtx context.Context) error {
+	for key, batch := range state.batches {
+		if len(batch) == 0 {
+			continue
+		}
+		db, table, ok := splitDBTable(key)
+		if !ok {
+			continue
+		}
+		if err := state.sink.sendBatchForRun(flushCtx, db, table, batch); err != nil {
+			return err
+		}
+		log.Printf("[doris][job %s] flushed target=%s rows=%d traces=%s", state.sink.jobID, key, len(batch), batchTraceSummary(batch))
+		state.batches[key] = resetBatch(batch)
+	}
+	return state.commitPendingOffset(flushCtx)
+}
+
+func (state *dorisRunState) handleEvent(procCtx context.Context, ev model.Event) error {
+	if ev.Type == model.EventTypeCheckpoint {
+		// Checkpoints can arrive after every binlog event. Coalesce them and
+		// persist only at a normal flush boundary so they do not turn each row
+		// into a separate Doris Stream Load.
+		state.rememberOffset(ev.SourceOffset, eventTraceID(ev))
+		return nil
+	}
+
+	targetDB, targetTable := state.sink.resolveTarget(ev.Schema, ev.Table)
+	targetKey := strings.ToLower(targetDB + "." + targetTable)
+
+	if ev.Type == model.EventTypeDDL {
+		if err := state.flushAll(procCtx); err != nil {
+			return err
+		}
+		if err := state.sink.applyDDL(procCtx, targetDB, targetTable, ev.DDL); err != nil {
+			log.Printf("[doris] DDL error: %v", err)
+			return err
+		}
+		return nil
+	}
+
+	batch := append(state.batches[targetKey], ev)
+	state.batches[targetKey] = batch
+	log.Printf("[doris][job %s] buffered trace_id=%s action=%s source=%s.%s target=%s batch_rows=%d source_pos=%s",
+		state.sink.jobID, eventTraceID(ev), ev.Type, ev.Schema, ev.Table, targetKey, len(batch), eventSourceOffsetText(ev))
+
+	if len(batch) >= state.sink.cfg.BatchSize {
+		db, table, _ := splitDBTable(targetKey)
+		if err := state.sink.sendBatchForRun(procCtx, db, table, batch); err != nil {
+			log.Printf("[doris] flush error: %v", err)
+			return err
+		}
+		log.Printf("[doris][job %s] flushed target=%s rows=%d traces=%s", state.sink.jobID, targetKey, len(batch), batchTraceSummary(batch))
+		state.batches[targetKey] = resetBatch(batch)
+		if err := state.commitPendingOffset(procCtx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Sink) Run(ctx context.Context, in <-chan model.Event) error {
-	batches := make(map[string][]model.Event) // key "db.table"
-	var pendingOffset *model.SourceOffset
-	pendingOffsetTraceID := ""
+	state := newDorisRunState(s)
 	flushTicker := time.NewTicker(time.Duration(s.cfg.FlushSeconds) * time.Second)
 	defer flushTicker.Stop()
-
-	rememberOffset := func(off *model.SourceOffset, traceID string) {
-		if !off.Valid() {
-			return
-		}
-		cp := *off
-		pendingOffset = &cp
-		pendingOffsetTraceID = traceID
-	}
-
-	allBatchesEmpty := func() bool {
-		for _, b := range batches {
-			if len(b) > 0 {
-				return false
-			}
-		}
-		return true
-	}
-
-	commitPendingOffset := func(commitCtx context.Context) error {
-		if pendingOffset == nil || s.offsetSto == nil || !allBatchesEmpty() {
-			return nil
-		}
-
-		saveCtx, cancel := context.WithTimeout(commitCtx, 2*time.Second)
-		defer cancel()
-
-		if err := connector.SaveSourceOffset(saveCtx, s.offsetSto, s.checkpointKey(), pendingOffset); err != nil {
-			log.Printf("[doris][job %s] save offset error pos=%s:%d: %v", s.jobID, pendingOffset.BinlogFile, pendingOffset.BinlogPos, err)
-			return nil
-		}
-		log.Printf("[doris][job %s] committed offset trace_id=%s pos=%s:%d", s.jobID, pendingOffsetTraceID, pendingOffset.BinlogFile, pendingOffset.BinlogPos)
-		pendingOffset = nil
-		pendingOffsetTraceID = ""
-		return nil
-	}
-
-	flushAll := func(flushCtx context.Context) error {
-		for key, b := range batches {
-			if len(b) == 0 {
-				continue
-			}
-			db, tbl, ok := splitDBTable(key)
-			if !ok {
-				continue
-			}
-			if err := s.sendBatch(flushCtx, db, tbl, b); err != nil {
-				return err
-			}
-			log.Printf("[doris][job %s] flushed target=%s rows=%d traces=%s", s.jobID, key, len(b), batchTraceSummary(b))
-			batches[key] = resetBatch(b)
-		}
-		return commitPendingOffset(flushCtx)
-	}
-
-	handleEvent := func(procCtx context.Context, ev model.Event) error {
-		if ev.Type == model.EventTypeCheckpoint {
-			log.Printf("[doris][job %s] checkpoint received trace_id=%s pos=%s batches_empty=%t",
-				s.jobID, eventTraceID(ev), eventSourceOffsetText(ev), allBatchesEmpty())
-			rememberOffset(ev.SourceOffset, eventTraceID(ev))
-			return flushAll(procCtx)
-		}
-
-		targetDB, targetTable := s.resolveTarget(ev.Schema, ev.Table)
-		targetKey := strings.ToLower(targetDB + "." + targetTable)
-
-		if ev.Type == model.EventTypeDDL {
-			if err := flushAll(procCtx); err != nil {
-				return err
-			}
-			if err := s.applyDDL(procCtx, targetDB, targetTable, ev.DDL); err != nil {
-				log.Printf("[doris] DDL error: %v", err)
-				return err
-			}
-			return nil
-		}
-
-		b := batches[targetKey]
-		b = append(b, ev)
-		batches[targetKey] = b
-		log.Printf("[doris][job %s] buffered trace_id=%s action=%s source=%s.%s target=%s batch_rows=%d source_pos=%s",
-			s.jobID, eventTraceID(ev), ev.Type, ev.Schema, ev.Table, targetKey, len(b), eventSourceOffsetText(ev))
-
-		if len(b) >= s.cfg.BatchSize {
-			db, tbl, _ := splitDBTable(targetKey)
-			if err := s.sendBatch(procCtx, db, tbl, b); err != nil {
-				log.Printf("[doris] flush error: %v", err)
-				return err
-			}
-			log.Printf("[doris][job %s] flushed target=%s rows=%d traces=%s", s.jobID, targetKey, len(b), batchTraceSummary(b))
-			batches[targetKey] = resetBatch(b)
-			if err := commitPendingOffset(procCtx); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
 
 	drainAfterCancel := func() error {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -1004,9 +1025,9 @@ func (s *Sink) Run(ctx context.Context, in <-chan model.Event) error {
 				return shutdownCtx.Err()
 			case ev, ok := <-in:
 				if !ok {
-					return flushAll(shutdownCtx)
+					return state.flushAll(shutdownCtx)
 				}
-				if err := handleEvent(shutdownCtx, ev); err != nil {
+				if err := state.handleEvent(shutdownCtx, ev); err != nil {
 					return err
 				}
 			}
@@ -1022,19 +1043,19 @@ func (s *Sink) Run(ctx context.Context, in <-chan model.Event) error {
 			return ctx.Err()
 
 		case <-flushTicker.C:
-			if err := flushAll(ctx); err != nil {
+			if err := state.flushAll(ctx); err != nil {
 				log.Printf("[doris] flush error: %v", err)
 				return err
 			}
 
 		case ev, ok := <-in:
 			if !ok {
-				if err := flushAll(ctx); err != nil {
+				if err := state.flushAll(ctx); err != nil {
 					return err
 				}
 				return nil
 			}
-			if err := handleEvent(ctx, ev); err != nil {
+			if err := state.handleEvent(ctx, ev); err != nil {
 				return err
 			}
 		}
