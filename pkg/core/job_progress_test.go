@@ -52,3 +52,37 @@ func TestSinkRuntimeProgressKeepsSourcePhase(t *testing.T) {
 		t.Fatalf("sink rows = %d, want %d", got, want)
 	}
 }
+
+func TestCDCHealthProgressDoesNotReplaceStreamingProgress(t *testing.T) {
+	job := NewJob(&config.JobConfig{ID: "job-1"}, nil)
+	job.updateProgress(connector.ProgressInfo{
+		Phase:          "streaming",
+		Summary:        "CDC streaming",
+		Detail:         "CDC current mysql-bin.000183:100",
+		CDCCurrentFile: "mysql-bin.000183",
+		CDCCurrentPos:  100,
+	})
+
+	job.updateProgress(connector.ProgressInfo{
+		Phase:             "cdc_health",
+		CDCCheckpointFile: "mysql-bin.000181",
+		CDCCheckpointPos:  50,
+		CDCLatestFile:     "mysql-bin.000184",
+		CDCLatestPos:      900,
+		CDCLagFiles:       3,
+	})
+
+	progress := job.Progress()
+	if progress == nil {
+		t.Fatal("progress is nil")
+	}
+	if progress.Phase != "streaming" || progress.Summary != "CDC streaming" {
+		t.Fatalf("streaming progress was replaced: %+v", progress)
+	}
+	if progress.CDCCurrentFile != "mysql-bin.000183" || progress.CDCCurrentPos != 100 {
+		t.Fatalf("live CDC position changed: %s:%d", progress.CDCCurrentFile, progress.CDCCurrentPos)
+	}
+	if progress.CDCLagFiles != 3 || progress.CDCLatestFile != "mysql-bin.000184" {
+		t.Fatalf("health fields were not merged: %+v", progress)
+	}
+}

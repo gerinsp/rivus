@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -41,7 +42,7 @@ const (
 	telegramSnippetTruncateLabel = " ... [see dashboard]"
 )
 
-func newTelegramJobFailureNotifier(client *http.Client) jobFailureNotifier {
+func newTelegramJobFailureNotifier(client *http.Client) *telegramJobFailureNotifier {
 	if client == nil {
 		client = &http.Client{Timeout: 10 * time.Second}
 	}
@@ -280,13 +281,19 @@ func telegramFailureConfigFromEnv() config.TelegramNotificationConfig {
 	if !ok {
 		notifyFailed = enabled
 	}
+	notifyCDCLag, _ := lookupEnvBool("RIVUS_TELEGRAM_NOTIFY_CDC_LAG")
+	notifyBackpressure, _ := lookupEnvBool("RIVUS_TELEGRAM_NOTIFY_BACKPRESSURE")
 
 	return config.TelegramNotificationConfig{
-		Enabled:         enabled,
-		BotToken:        strings.TrimSpace(os.Getenv("TELEGRAM_BOT_TOKEN")),
-		ChatID:          strings.TrimSpace(os.Getenv("TELEGRAM_CHAT_ID")),
-		UIBaseURL:       strings.TrimRight(strings.TrimSpace(os.Getenv("RIVUS_UI_BASE_URL")), "/"),
-		NotifyJobFailed: notifyFailed,
+		Enabled:              enabled,
+		BotToken:             strings.TrimSpace(os.Getenv("TELEGRAM_BOT_TOKEN")),
+		ChatID:               strings.TrimSpace(os.Getenv("TELEGRAM_CHAT_ID")),
+		UIBaseURL:            strings.TrimRight(strings.TrimSpace(os.Getenv("RIVUS_UI_BASE_URL")), "/"),
+		NotifyJobFailed:      notifyFailed,
+		NotifyCDCLag:         notifyCDCLag,
+		NotifyBackpressure:   notifyBackpressure,
+		CDCLagFilesThreshold: lookupEnvPositiveInt("RIVUS_CDC_LAG_FILES_THRESHOLD"),
+		AlertCooldownSeconds: lookupEnvPositiveInt("RIVUS_ALERT_COOLDOWN_SECONDS"),
 	}
 }
 
@@ -304,6 +311,14 @@ func mergeTelegramNotificationConfig(base, override config.TelegramNotificationC
 	}
 	out.Enabled = out.Enabled || override.Enabled
 	out.NotifyJobFailed = out.NotifyJobFailed || override.NotifyJobFailed
+	out.NotifyCDCLag = out.NotifyCDCLag || override.NotifyCDCLag
+	out.NotifyBackpressure = out.NotifyBackpressure || override.NotifyBackpressure
+	if override.CDCLagFilesThreshold > 0 {
+		out.CDCLagFilesThreshold = override.CDCLagFilesThreshold
+	}
+	if override.AlertCooldownSeconds > 0 {
+		out.AlertCooldownSeconds = override.AlertCooldownSeconds
+	}
 
 	return out
 }
@@ -361,6 +376,18 @@ func lookupEnvBool(key string) (bool, bool) {
 		return false, false
 	}
 	return parseEnvBoolLocal(raw), true
+}
+
+func lookupEnvPositiveInt(key string) int {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return 0
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value <= 0 {
+		return 0
+	}
+	return value
 }
 
 func parseEnvBoolLocal(raw string) bool {

@@ -275,11 +275,15 @@ type JobNotificationsConfig struct {
 }
 
 type TelegramNotificationConfig struct {
-	Enabled         bool   `yaml:"enabled" json:"enabled"`
-	BotToken        string `yaml:"bot_token" json:"bot_token"`
-	ChatID          string `yaml:"chat_id" json:"chat_id"`
-	UIBaseURL       string `yaml:"ui_base_url" json:"ui_base_url"`
-	NotifyJobFailed bool   `yaml:"notify_job_failed" json:"notify_job_failed"`
+	Enabled              bool   `yaml:"enabled" json:"enabled"`
+	BotToken             string `yaml:"bot_token" json:"bot_token"`
+	ChatID               string `yaml:"chat_id" json:"chat_id"`
+	UIBaseURL            string `yaml:"ui_base_url" json:"ui_base_url"`
+	NotifyJobFailed      bool   `yaml:"notify_job_failed" json:"notify_job_failed"`
+	NotifyCDCLag         bool   `yaml:"notify_cdc_lag" json:"notify_cdc_lag"`
+	NotifyBackpressure   bool   `yaml:"notify_backpressure" json:"notify_backpressure"`
+	CDCLagFilesThreshold int    `yaml:"cdc_lag_files_threshold" json:"cdc_lag_files_threshold"`
+	AlertCooldownSeconds int    `yaml:"alert_cooldown_seconds" json:"alert_cooldown_seconds"`
 }
 
 type JobConfig struct {
@@ -333,7 +337,6 @@ func setDefaults(cfg *JobConfig) {
 	if cfg.Doris.MySQLPort <= 0 {
 		cfg.Doris.MySQLPort = 9030
 	}
-
 	normalize(cfg)
 }
 

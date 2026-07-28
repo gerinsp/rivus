@@ -105,6 +105,24 @@ RIVUS_LOG_DIR=/app/logs
 RIVUS_LOG_STDERR=true
 ```
 
+Telegram can alert when a job fails, its committed checkpoint falls behind the
+latest MySQL binlog, or the event buffer remains full for at least 10 seconds:
+
+```env
+RIVUS_TELEGRAM_ENABLED=true
+TELEGRAM_BOT_TOKEN=change-me
+TELEGRAM_CHAT_ID=change-me
+RIVUS_UI_BASE_URL=https://rivus.example.com
+RIVUS_TELEGRAM_NOTIFY_JOB_FAILED=true
+RIVUS_TELEGRAM_NOTIFY_CDC_LAG=true
+RIVUS_TELEGRAM_NOTIFY_BACKPRESSURE=true
+RIVUS_CDC_LAG_FILES_THRESHOLD=2
+RIVUS_ALERT_COOLDOWN_SECONDS=600
+```
+
+The lag monitor checks every 30 seconds. The cooldown is applied independently
+per job and alert type to avoid repeated Telegram messages during one incident.
+
 Iceberg sink integrations can also use:
 
 ```env

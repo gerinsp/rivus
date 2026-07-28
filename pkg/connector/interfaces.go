@@ -44,6 +44,11 @@ type ProgressInfo struct {
 	CDCStartPos             uint32
 	CDCCurrentFile          string
 	CDCCurrentPos           uint32
+	CDCCheckpointFile       string
+	CDCCheckpointPos        uint32
+	CDCLatestFile           string
+	CDCLatestPos            uint32
+	CDCLagFiles             int
 	CheckpointPending       bool
 	CheckpointReason        string
 	CheckpointPosition      string

@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -432,8 +433,18 @@ func (h *cdcHandler) emit(ev model.Event) error {
 
 	case <-timer.C:
 		log.Printf("[WARN][job %s] backpressure: sink slow, waiting...", h.jobID)
+		file := h.currentBinlogFile
+		pos := uint32(0)
+		if ev.SourceOffset != nil {
+			if strings.TrimSpace(ev.SourceOffset.BinlogFile) != "" {
+				file = ev.SourceOffset.BinlogFile
+			}
+			pos = ev.SourceOffset.BinlogPos
+		}
+		h.reportBackpressure(file, pos, "Event buffer remained full for 10 seconds; sink throughput is below source throughput")
 		select {
 		case h.out <- ev:
+			h.reportLivePosition(file, pos, true)
 			return nil
 		case <-h.ctx.Done():
 			return h.ctx.Err()
@@ -442,6 +453,23 @@ func (h *cdcHandler) emit(ev model.Event) error {
 	case <-h.ctx.Done():
 		return h.ctx.Err()
 	}
+}
+
+func (h *cdcHandler) reportBackpressure(file string, pos uint32, detail string) {
+	if h.progress == nil {
+		return
+	}
+	h.progress(connector.ProgressInfo{
+		Phase:           "streaming",
+		Summary:         "Waiting for sink flush",
+		Detail:          detail,
+		CompletedTables: h.totalTables,
+		TotalTables:     h.totalTables,
+		CDCStartFile:    h.startBinlogFile,
+		CDCStartPos:     h.startBinlogPos,
+		CDCCurrentFile:  file,
+		CDCCurrentPos:   pos,
+	})
 }
 
 func affectedRowsCount(e *canal.RowsEvent) int {
@@ -796,8 +824,14 @@ func (h *cdcHandler) OnDDL(header *replication.EventHeader, nextPos gomysql.Posi
 
 	case <-timer.C:
 		log.Printf("[WARN][job %s] backpressure on DDL, waiting... %s.%s", h.jobID, db, tbl)
+		file := strings.TrimSpace(nextPos.Name)
+		if file == "" {
+			file = h.currentBinlogFile
+		}
+		h.reportBackpressure(file, nextPos.Pos, fmt.Sprintf("DDL event buffer remained full for 10 seconds while applying %s.%s", db, tbl))
 		select {
 		case h.out <- ddlEvent:
+			h.reportLivePosition(file, nextPos.Pos, true)
 			return nil
 		case <-h.ctx.Done():
 			return h.ctx.Err()
@@ -2116,8 +2150,112 @@ func (v snapshotCursorValue) decode() (interface{}, error) {
 
 // ---------------- CDC runner ----------------
 
+const cdcLagMonitorInterval = 30 * time.Second
+
+func (s *Source) monitorCDCLag(ctx context.Context) {
+	if s.offsetSto == nil || s.progress == nil {
+		return
+	}
+
+	report := func() {
+		if err := s.reportCDCLag(ctx); err != nil && ctx.Err() == nil {
+			log.Printf("[mysql][job %s] CDC lag monitor error: %v", s.jobID, err)
+		}
+	}
+	report()
+
+	ticker := time.NewTicker(cdcLagMonitorInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			report()
+		}
+	}
+}
+
+func (s *Source) reportCDCLag(ctx context.Context) error {
+	checkpoint, err := s.offsetSto.GetOffset(ctx, s.checkpointKey())
+	if err != nil {
+		return fmt.Errorf("get checkpoint: %w", err)
+	}
+	if checkpoint == nil && s.checkpointKey() != s.jobID {
+		checkpoint, err = s.offsetSto.GetOffset(ctx, s.jobID)
+		if err != nil {
+			return fmt.Errorf("get legacy checkpoint: %w", err)
+		}
+	}
+	if checkpoint == nil || strings.TrimSpace(checkpoint.BinlogFile) == "" || checkpoint.BinlogPos == 0 {
+		return nil
+	}
+
+	latest, err := s.getMasterPos(ctx)
+	if err != nil {
+		return fmt.Errorf("get latest binlog position: %w", err)
+	}
+	if latest == nil {
+		return nil
+	}
+
+	lagFiles, ok := binlogFileLag(checkpoint.BinlogFile, latest.Name)
+	if !ok {
+		return fmt.Errorf("cannot compare checkpoint file %q with latest file %q", checkpoint.BinlogFile, latest.Name)
+	}
+
+	s.reportProgress(connector.ProgressInfo{
+		Phase:             "cdc_health",
+		CDCCheckpointFile: checkpoint.BinlogFile,
+		CDCCheckpointPos:  checkpoint.BinlogPos,
+		CDCLatestFile:     latest.Name,
+		CDCLatestPos:      latest.Pos,
+		CDCLagFiles:       lagFiles,
+	})
+	return nil
+}
+
+func binlogFileLag(checkpointFile, latestFile string) (int, bool) {
+	checkpointPrefix, checkpointNumber, ok := splitBinlogFileNumber(checkpointFile)
+	if !ok {
+		return 0, false
+	}
+	latestPrefix, latestNumber, ok := splitBinlogFileNumber(latestFile)
+	if !ok || checkpointPrefix != latestPrefix {
+		return 0, false
+	}
+	if latestNumber <= checkpointNumber {
+		return 0, true
+	}
+	return latestNumber - checkpointNumber, true
+}
+
+func splitBinlogFileNumber(file string) (string, int, bool) {
+	file = strings.TrimSpace(file)
+	end := len(file)
+	start := end
+	for start > 0 {
+		ch := file[start-1]
+		if ch < '0' || ch > '9' {
+			break
+		}
+		start--
+	}
+	if start == end {
+		return "", 0, false
+	}
+	number, err := strconv.Atoi(file[start:end])
+	if err != nil {
+		return "", 0, false
+	}
+	return file[:start], number, true
+}
+
 func (s *Source) runBinlogCanal(ctx context.Context, out chan<- model.Event, startFrom *gomysql.Position) error {
 	s.reportStreamingProgress(startFrom)
+	lagMonitorCtx, stopLagMonitor := context.WithCancel(ctx)
+	defer stopLagMonitor()
+	go s.monitorCDCLag(lagMonitorCtx)
 
 	cCfg := canal.NewDefaultConfig()
 	cCfg.Addr = s.cfg.Addr

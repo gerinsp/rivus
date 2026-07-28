@@ -362,6 +362,57 @@ func TestCDCHandlerOnPosSyncedEmitsCheckpoint(t *testing.T) {
 	}
 }
 
+func TestBinlogFileLag(t *testing.T) {
+	tests := []struct {
+		name       string
+		checkpoint string
+		latest     string
+		want       int
+		wantOK     bool
+	}{
+		{name: "same file", checkpoint: "mysql-bin.000184", latest: "mysql-bin.000184", want: 0, wantOK: true},
+		{name: "three files behind", checkpoint: "mysql-bin.000181", latest: "mysql-bin.000184", want: 3, wantOK: true},
+		{name: "checkpoint ahead", checkpoint: "mysql-bin.000185", latest: "mysql-bin.000184", want: 0, wantOK: true},
+		{name: "different prefix", checkpoint: "mysql-bin.000184", latest: "relay-bin.000185", wantOK: false},
+		{name: "missing suffix", checkpoint: "mysql-bin", latest: "mysql-bin.000185", wantOK: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := binlogFileLag(tt.checkpoint, tt.latest)
+			if ok != tt.wantOK || got != tt.want {
+				t.Fatalf("binlogFileLag(%q, %q) = (%d, %t), want (%d, %t)",
+					tt.checkpoint, tt.latest, got, ok, tt.want, tt.wantOK)
+			}
+		})
+	}
+}
+
+func TestCDCHandlerReportsBackpressure(t *testing.T) {
+	var got connector.ProgressInfo
+	handler := &cdcHandler{
+		jobID:           "job-1",
+		startBinlogFile: "mysql-bin.000180",
+		startBinlogPos:  4,
+		totalTables:     3,
+		progress: func(info connector.ProgressInfo) {
+			got = info
+		},
+	}
+
+	handler.reportBackpressure("mysql-bin.000184", 456, "buffer full")
+
+	if got.Summary != "Waiting for sink flush" {
+		t.Fatalf("summary = %q, want backpressure summary", got.Summary)
+	}
+	if got.Detail != "buffer full" {
+		t.Fatalf("detail = %q, want buffer detail", got.Detail)
+	}
+	if got.CDCCurrentFile != "mysql-bin.000184" || got.CDCCurrentPos != 456 {
+		t.Fatalf("current position = %s:%d, want mysql-bin.000184:456", got.CDCCurrentFile, got.CDCCurrentPos)
+	}
+}
+
 func TestCDCHandlerOnRowEmitsTraceIDAndSourceOffset(t *testing.T) {
 	out := make(chan model.Event, 1)
 	handler := &cdcHandler{

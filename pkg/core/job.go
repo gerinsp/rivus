@@ -41,6 +41,11 @@ type JobProgress struct {
 	CDCStartPos             uint32 `json:"cdc_start_pos,omitempty"`
 	CDCCurrentFile          string `json:"cdc_current_file,omitempty"`
 	CDCCurrentPos           uint32 `json:"cdc_current_pos,omitempty"`
+	CDCCheckpointFile       string `json:"cdc_checkpoint_file,omitempty"`
+	CDCCheckpointPos        uint32 `json:"cdc_checkpoint_pos,omitempty"`
+	CDCLatestFile           string `json:"cdc_latest_file,omitempty"`
+	CDCLatestPos            uint32 `json:"cdc_latest_pos,omitempty"`
+	CDCLagFiles             int    `json:"cdc_lag_files,omitempty"`
 	CheckpointPending       bool   `json:"checkpoint_pending,omitempty"`
 	CheckpointReason        string `json:"checkpoint_reason,omitempty"`
 	CheckpointPosition      string `json:"checkpoint_position,omitempty"`
@@ -702,6 +707,11 @@ func (j *Job) updateProgress(info connector.ProgressInfo) {
 		CDCStartPos:             info.CDCStartPos,
 		CDCCurrentFile:          strings.TrimSpace(info.CDCCurrentFile),
 		CDCCurrentPos:           info.CDCCurrentPos,
+		CDCCheckpointFile:       strings.TrimSpace(info.CDCCheckpointFile),
+		CDCCheckpointPos:        info.CDCCheckpointPos,
+		CDCLatestFile:           strings.TrimSpace(info.CDCLatestFile),
+		CDCLatestPos:            info.CDCLatestPos,
+		CDCLagFiles:             info.CDCLagFiles,
 		CheckpointPending:       info.CheckpointPending,
 		CheckpointReason:        strings.TrimSpace(info.CheckpointReason),
 		CheckpointPosition:      strings.TrimSpace(info.CheckpointPosition),
@@ -713,7 +723,9 @@ func (j *Job) updateProgress(info connector.ProgressInfo) {
 	if j.progress != nil {
 		previousPhase = j.progress.Phase
 	}
-	if isSinkRuntimeProgress(progress.Phase) && j.progress != nil {
+	if isCDCHealthRuntimeProgress(progress.Phase) && j.progress != nil {
+		progress = mergeCDCHealthProgress(*j.progress, *progress)
+	} else if isSinkRuntimeProgress(progress.Phase) && j.progress != nil {
 		progress = mergeSinkRuntimeProgress(*j.progress, *progress)
 	} else if j.progress != nil {
 		progress = mergeSourceRuntimeProgress(*j.progress, *progress)
@@ -733,6 +745,20 @@ func (j *Job) updateProgress(info connector.ProgressInfo) {
 	if listener != nil {
 		listener(progress)
 	}
+}
+
+func isCDCHealthRuntimeProgress(phase string) bool {
+	return strings.EqualFold(strings.TrimSpace(phase), "cdc_health")
+}
+
+func mergeCDCHealthProgress(previous, incoming JobProgress) *JobProgress {
+	merged := previous
+	merged.CDCCheckpointFile = incoming.CDCCheckpointFile
+	merged.CDCCheckpointPos = incoming.CDCCheckpointPos
+	merged.CDCLatestFile = incoming.CDCLatestFile
+	merged.CDCLatestPos = incoming.CDCLatestPos
+	merged.CDCLagFiles = incoming.CDCLagFiles
+	return &merged
 }
 
 func isSinkRuntimeProgress(phase string) bool {
@@ -777,6 +803,15 @@ func mergeSourceRuntimeProgress(previous, incoming JobProgress) *JobProgress {
 	merged.CheckpointReason = previous.CheckpointReason
 	merged.CheckpointPosition = previous.CheckpointPosition
 	merged.CheckpointPendingTables = previous.CheckpointPendingTables
+	if strings.TrimSpace(incoming.CDCCheckpointFile) == "" {
+		merged.CDCCheckpointFile = previous.CDCCheckpointFile
+		merged.CDCCheckpointPos = previous.CDCCheckpointPos
+	}
+	if strings.TrimSpace(incoming.CDCLatestFile) == "" {
+		merged.CDCLatestFile = previous.CDCLatestFile
+		merged.CDCLatestPos = previous.CDCLatestPos
+		merged.CDCLagFiles = previous.CDCLagFiles
+	}
 	return &merged
 }
 

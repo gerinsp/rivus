@@ -43,6 +43,10 @@ type JobManager struct {
 	jobs            map[string]*Job
 	reg             *connector.Registry
 	failureNotifier jobFailureNotifier
+	healthNotifier  jobHealthNotifier
+
+	healthAlertMu       sync.Mutex
+	healthAlertLastSent map[string]time.Time
 
 	jobStore          meta.JobStore
 	defaultMetaMySQL  string
@@ -81,11 +85,20 @@ func withJobFailureNotifier(notifier jobFailureNotifier) JobManagerOption {
 	}
 }
 
+func withJobHealthNotifier(notifier jobHealthNotifier) JobManagerOption {
+	return func(m *JobManager) {
+		m.healthNotifier = notifier
+	}
+}
+
 func NewJobManager(reg *connector.Registry, opts ...JobManagerOption) *JobManager {
+	telegramNotifier := newTelegramJobFailureNotifier(nil)
 	m := &JobManager{
 		jobs:                      make(map[string]*Job),
 		reg:                       reg,
-		failureNotifier:           newTelegramJobFailureNotifier(nil),
+		failureNotifier:           telegramNotifier,
+		healthNotifier:            telegramNotifier,
+		healthAlertLastSent:       make(map[string]time.Time),
 		maxConcurrentSnapshotJobs: snapshotJobLimitFromEnv(),
 		snapshotQueueModes:        make(map[string]config.JobMode),
 		startingSnapshotJobs:      make(map[string]struct{}),
@@ -441,7 +454,61 @@ func (m *JobManager) attachStatusListener(job *Job, notifyFailures bool) {
 		if snapshotProgressReleasesSlot(progress) {
 			m.startQueuedSnapshotJobsAsync()
 		}
+		m.maybeNotifyJobHealth(job, progress)
 	})
+}
+
+func (m *JobManager) maybeNotifyJobHealth(job *Job, progress *JobProgress) {
+	if m.healthNotifier == nil || job == nil || job.GetStatus() != JobStatusRunning || progress == nil {
+		return
+	}
+	tg, ok := jobHealthTelegramConfig(job.Config)
+	if !ok {
+		return
+	}
+
+	if tg.NotifyCDCLag &&
+		strings.TrimSpace(progress.CDCLatestFile) != "" &&
+		progress.CDCLagFiles >= tg.CDCLagFilesThreshold {
+		if payload, ok := buildJobHealthNotification(job, progress, jobHealthAlertCDCLag); ok {
+			m.dispatchJobHealthNotification(payload)
+		}
+	}
+
+	if tg.NotifyBackpressure && isBackpressureProgress(progress) {
+		if payload, ok := buildJobHealthNotification(job, progress, jobHealthAlertBackpressure); ok {
+			m.dispatchJobHealthNotification(payload)
+		}
+	}
+}
+
+func (m *JobManager) dispatchJobHealthNotification(payload jobHealthNotification) {
+	cooldown := time.Duration(payload.Telegram.AlertCooldownSeconds) * time.Second
+	if cooldown <= 0 {
+		cooldown = 10 * time.Minute
+	}
+	key := payload.JobID + ":" + string(payload.AlertType)
+	now := time.Now()
+
+	m.healthAlertMu.Lock()
+	if last := m.healthAlertLastSent[key]; !last.IsZero() && now.Sub(last) < cooldown {
+		m.healthAlertMu.Unlock()
+		return
+	}
+	m.healthAlertLastSent[key] = now
+	m.healthAlertMu.Unlock()
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := m.healthNotifier.NotifyJobHealth(ctx, payload); err != nil {
+			log.Printf("[job-manager] health notification delivery failed job=%s alert=%s channel=telegram: %v",
+				payload.JobID, payload.AlertType, err)
+			return
+		}
+		log.Printf("[job-manager] health notification sent job=%s alert=%s channel=telegram",
+			payload.JobID, payload.AlertType)
+	}()
 }
 
 func (m *JobManager) restoreJobSnapshot(job *Job, record meta.PersistedJob, resumeOnBoot bool) {
