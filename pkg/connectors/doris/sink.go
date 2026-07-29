@@ -264,6 +264,7 @@ func (s *Sink) EnsureTable(ctx context.Context, targetDB, targetTable string, sc
 	if len(schema.Columns) == 0 {
 		return fmt.Errorf("empty schema for %s.%s", schema.SchemaName, schema.TableName)
 	}
+	desiredColumns := desiredDorisColumns(schema)
 	sourceKey := dorisTableKey(schema.SchemaName, schema.TableName)
 	targetKey := dorisTableKey(targetDB, targetTable)
 	if sourceKey != "" {
@@ -388,10 +389,18 @@ func (s *Sink) EnsureTable(ctx context.Context, targetDB, targetTable string, sc
 	s.columnBindings[key] = bindings
 	s.mu.Unlock()
 
-	return util.RetryWithBackoff(ctx, s.retry, func() error {
+	if err := util.RetryWithBackoff(ctx, s.retry, func() error {
 		_, err := s.sqlDB.ExecContext(ctx, ddl)
 		return err
-	})
+	}); err != nil {
+		return err
+	}
+
+	if err := s.reconcileTableSchemaOnce(ctx, targetDB, targetTable, desiredColumns); err != nil {
+		return err
+	}
+	log.Printf("[doris][job %s] startup schema reconciled target=%s.%s", s.jobID, targetDB, targetTable)
+	return nil
 }
 
 func (s *Sink) CountTargetRows(ctx context.Context, targetDB, targetTable string) (int64, error) {
@@ -1175,33 +1184,13 @@ func (s *Sink) getColumnBindingsForTarget(ctx context.Context, targetDB, targetT
 }
 
 func (s *Sink) fetchColumnsFromDoris(ctx context.Context, db, table string) ([]string, error) {
-	// Doris MySQL protocol: "DESC db.table" atau "SHOW COLUMNS FROM db.table"
-	q := fmt.Sprintf("DESC `%s`.`%s`", db, table)
-
-	rows, err := s.sqlDB.QueryContext(ctx, q)
+	tableColumns, err := s.fetchDorisTableColumns(ctx, db, table)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	cols := make([]string, 0, 64)
-
-	// DESC di MySQL biasanya: Field, Type, Null, Key, Default, Extra
-	// Doris mirip, jadi kita scan minimal Field saja, sisanya buang.
-	for rows.Next() {
-		var field string
-		var t, nullStr, key, def, extra sql.NullString
-		if err := rows.Scan(&field, &t, &nullStr, &key, &def, &extra); err != nil {
-			// beberapa versi bisa beda jumlah kolom -> fallback scan fleksibel
-			// coba scan cuma 1 kolom (field) kalau driver mengizinkan? biasanya tidak.
-			return nil, err
-		}
-		if field != "" {
-			cols = append(cols, field)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
+	cols := make([]string, 0, len(tableColumns))
+	for _, col := range tableColumns {
+		cols = append(cols, col.Name)
 	}
 	return cols, nil
 }

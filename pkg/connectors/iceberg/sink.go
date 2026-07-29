@@ -1499,20 +1499,55 @@ func splitRowsByLimits(rows []map[string]interface{}, maxRows int, maxBytes int6
 
 func (s *Sink) flushDue(ctx context.Context, now time.Time) error {
 	s.mu.Lock()
-	states := make([]*tableState, 0, len(s.states))
-	for _, st := range s.states {
-		if s.shouldFlushStateLocked(st, now) {
-			states = append(states, st)
-		}
-	}
+	states, checkpointBarrier, checkpointOffset := s.flushStatesDueLocked(now)
 	s.mu.Unlock()
 
+	if checkpointBarrier {
+		log.Printf(
+			"[iceberg][job %s] checkpoint barrier flushing pending tables=%d pos=%s",
+			s.jobID,
+			len(states),
+			checkpointOffsetText(checkpointOffset),
+		)
+	}
 	for _, st := range states {
 		if err := s.flushState(ctx, st); err != nil {
 			return err
 		}
 	}
 	return s.commitPendingOffset(ctx)
+}
+
+func (s *Sink) flushStatesDueLocked(now time.Time) ([]*tableState, bool, *model.SourceOffset) {
+	due := make([]*tableState, 0, len(s.states))
+	pending := make([]*tableState, 0, len(s.states))
+	for _, st := range s.states {
+		if st == nil || len(st.pending) == 0 {
+			continue
+		}
+		pending = append(pending, st)
+		if s.shouldFlushStateLocked(st, now) {
+			due = append(due, st)
+		}
+	}
+
+	checkpointBarrier := s.pendingOffset != nil && len(due) > 0
+	if checkpointBarrier {
+		// The run loop is single-threaded, so selecting every pending table
+		// here creates one barrier: no later event is handled until all of
+		// these writes finish and the pending offset can be committed.
+		due = pending
+	}
+	sort.Slice(due, func(i, j int) bool {
+		return due[i].sourceKey < due[j].sourceKey
+	})
+
+	var checkpointOffset *model.SourceOffset
+	if checkpointBarrier {
+		offsetCopy := *s.pendingOffset
+		checkpointOffset = &offsetCopy
+	}
+	return due, checkpointBarrier, checkpointOffset
 }
 
 func (s *Sink) shouldFlushStateLocked(st *tableState, now time.Time) bool {

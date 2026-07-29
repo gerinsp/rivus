@@ -299,6 +299,84 @@ func TestShouldFlushStateUsesConfiguredCheckpointFlushCap(t *testing.T) {
 	}
 }
 
+func TestFlushStatesDueCoordinatesAllTablesForWaitingCheckpoint(t *testing.T) {
+	now := time.Date(2026, 7, 29, 16, 30, 0, 0, time.UTC)
+	customer := &tableState{
+		sourceKey:      "tiketux_new.customer",
+		pending:        []model.Event{{TraceID: "customer-event"}},
+		firstPendingAt: now.Add(-301 * time.Second),
+		lastEventAt:    now.Add(-1 * time.Second),
+	}
+	reservasi := &tableState{
+		sourceKey:      "tiketux_new.reservasi",
+		pending:        []model.Event{{TraceID: "reservasi-event"}},
+		firstPendingAt: now.Add(-60 * time.Second),
+		lastEventAt:    now.Add(-1 * time.Second),
+	}
+	sink := &Sink{
+		cfg: config.IcebergConfig{
+			FlushSeconds:           300,
+			CheckpointFlushSeconds: 300,
+		},
+		pendingOffset: &model.SourceOffset{
+			BinlogFile: "mysql-bin.000260",
+			BinlogPos:  12345,
+		},
+		states: map[string]*tableState{
+			customer.sourceKey:  customer,
+			reservasi.sourceKey: reservasi,
+		},
+	}
+
+	states, checkpointBarrier, checkpointOffset := sink.flushStatesDueLocked(now)
+	if !checkpointBarrier {
+		t.Fatal("checkpoint barrier = false, want true when one pending table reaches the deadline")
+	}
+	if len(states) != 2 {
+		t.Fatalf("states = %d, want every pending table selected", len(states))
+	}
+	if states[0] != customer || states[1] != reservasi {
+		t.Fatalf("states = [%s, %s], want deterministic all-table barrier order", states[0].sourceKey, states[1].sourceKey)
+	}
+	if checkpointOffset == nil || checkpointOffset.BinlogFile != "mysql-bin.000260" || checkpointOffset.BinlogPos != 12345 {
+		t.Fatalf("checkpoint offset = %#v, want captured waiting checkpoint", checkpointOffset)
+	}
+}
+
+func TestFlushStatesDueKeepsNormalFlushPerTableWithoutCheckpoint(t *testing.T) {
+	now := time.Date(2026, 7, 29, 16, 30, 0, 0, time.UTC)
+	due := &tableState{
+		sourceKey:      "app.due",
+		pending:        []model.Event{{TraceID: "due-event"}},
+		firstPendingAt: now.Add(-301 * time.Second),
+		lastEventAt:    now.Add(-1 * time.Second),
+	}
+	notDue := &tableState{
+		sourceKey:      "app.not_due",
+		pending:        []model.Event{{TraceID: "not-due-event"}},
+		firstPendingAt: now.Add(-60 * time.Second),
+		lastEventAt:    now.Add(-1 * time.Second),
+	}
+	sink := &Sink{
+		cfg: config.IcebergConfig{FlushSeconds: 300},
+		states: map[string]*tableState{
+			due.sourceKey:    due,
+			notDue.sourceKey: notDue,
+		},
+	}
+
+	states, checkpointBarrier, checkpointOffset := sink.flushStatesDueLocked(now)
+	if checkpointBarrier {
+		t.Fatal("checkpoint barrier = true without a waiting checkpoint")
+	}
+	if len(states) != 1 || states[0] != due {
+		t.Fatalf("states = %#v, want only the independently due table", states)
+	}
+	if checkpointOffset != nil {
+		t.Fatalf("checkpoint offset = %#v, want nil", checkpointOffset)
+	}
+}
+
 func TestCheckpointDoesNotForceFlushPendingCDCEvents(t *testing.T) {
 	store := &testOffsetStore{}
 	state := &tableState{
@@ -420,6 +498,84 @@ func TestShouldUpdateIcebergTypeSkipsExistingWiderType(t *testing.T) {
 	}
 	if !shouldUpdateIcebergType(iceberglib.PrimitiveTypes.Int64, iceberglib.PrimitiveTypes.Int32, true) {
 		t.Fatal("unsafe type changes should preserve explicit narrowing requests")
+	}
+}
+
+func TestSyncSchemaAddsMissingColumnAndWidensExistingType(t *testing.T) {
+	current := iceberglib.NewSchema(1,
+		iceberglib.NestedField{
+			ID:       1,
+			Name:     "IdConnecting",
+			Type:     iceberglib.PrimitiveTypes.Int32,
+			Required: true,
+		},
+	)
+	meta, err := table.NewMetadata(
+		current,
+		iceberglib.UnpartitionedSpec,
+		table.UnsortedSortOrder,
+		"s3://warehouse-test/asmat_daytrans/tbl_md_rute_connecting",
+		iceberglib.Properties{},
+	)
+	if err != nil {
+		t.Fatalf("NewMetadata returned error: %v", err)
+	}
+	tbl := table.New(
+		table.Identifier{"catalog", "asmat_daytrans", "tbl_md_rute_connecting"},
+		meta,
+		"",
+		nil,
+		nil,
+	)
+	updater := tbl.NewTransaction().UpdateSchema(false, false)
+	source := &model.TableSchema{
+		SchemaName: "asmat_daytrans",
+		TableName:  "tbl_md_rute_connecting",
+		Columns: []model.TableColumn{
+			{
+				Name:       "IdConnecting",
+				DataType:   "bigint",
+				ColumnType: "bigint(20)",
+			},
+			{
+				Name:       "ListJadwal",
+				DataType:   "text",
+				ColumnType: "text",
+				IsNullable: true,
+			},
+		},
+	}
+
+	changed, err := syncSchema(updater, current, source, nil, config.IcebergConfig{})
+	if err != nil {
+		t.Fatalf("syncSchema returned error: %v", err)
+	}
+	if !changed {
+		t.Fatal("syncSchema changed = false, want true")
+	}
+
+	updated, err := updater.Apply()
+	if err != nil {
+		t.Fatalf("Apply returned error: %v", err)
+	}
+
+	id, ok := updated.FindFieldByNameCaseInsensitive("IdConnecting")
+	if !ok {
+		t.Fatal("IdConnecting field not found")
+	}
+	if !id.Type.Equals(iceberglib.PrimitiveTypes.Int64) {
+		t.Fatalf("IdConnecting type = %s, want long", id.Type)
+	}
+
+	listJadwal, ok := updated.FindFieldByNameCaseInsensitive("ListJadwal")
+	if !ok {
+		t.Fatal("ListJadwal field not found")
+	}
+	if !listJadwal.Type.Equals(iceberglib.PrimitiveTypes.String) {
+		t.Fatalf("ListJadwal type = %s, want string", listJadwal.Type)
+	}
+	if listJadwal.Required {
+		t.Fatal("new ListJadwal field should be optional for an existing table")
 	}
 }
 
