@@ -2,6 +2,7 @@ package iceberg
 
 import (
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 
@@ -120,7 +121,15 @@ func syncSchema(updater *icetable.UpdateSchema, current *iceberglib.Schema, sour
 		}
 
 		update := icetable.ColumnUpdate{}
-		if shouldUpdateIcebergType(field.Type, desiredType, cfg.AllowUnsafeTypeChanges) {
+		if isLegacyLongToUnsignedBigintDecimal(field.Type, desiredType) {
+			log.Printf(
+				"[iceberg] preserving legacy long column source=%s.%s column=%s desired=%s; rebuild table to migrate existing data files",
+				sourceSchema.SchemaName,
+				sourceSchema.TableName,
+				field.Name,
+				desiredType,
+			)
+		} else if shouldUpdateIcebergType(field.Type, desiredType, cfg.AllowUnsafeTypeChanges) {
 			update.FieldType = iceberglib.Optional[iceberglib.Type]{Val: desiredType, Valid: true}
 		}
 		if cfg.AllowUnsafeTypeChanges && field.Required != !sourceCol.IsNullable {
@@ -139,10 +148,24 @@ func shouldUpdateIcebergType(current, desired iceberglib.Type, allowUnsafe bool)
 	if current.Equals(desired) {
 		return false
 	}
+	// Iceberg cannot promote existing long data files to decimal in place.
+	// Preserve the legacy column and let the writer validate that values remain
+	// within the signed 64-bit range. Newly created tables still use decimal.
+	if isLegacyLongToUnsignedBigintDecimal(current, desired) {
+		return false
+	}
 	if allowUnsafe {
 		return true
 	}
 	return !icebergTypeCanRepresent(current, desired)
+}
+
+func isLegacyLongToUnsignedBigintDecimal(current, desired iceberglib.Type) bool {
+	if _, ok := current.(iceberglib.Int64Type); !ok {
+		return false
+	}
+	desiredDecimal, ok := desired.(iceberglib.DecimalType)
+	return ok && desiredDecimal.Scale() == 0 && desiredDecimal.Precision() == 20
 }
 
 func icebergTypeCanRepresent(current, desired iceberglib.Type) bool {
