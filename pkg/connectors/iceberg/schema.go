@@ -162,10 +162,15 @@ func icebergTypeCanRepresent(current, desired iceberglib.Type) bool {
 			return true
 		}
 	case iceberglib.DecimalType:
-		desiredType, ok := desired.(iceberglib.DecimalType)
-		return ok &&
-			currentType.Scale() == desiredType.Scale() &&
-			currentType.Precision() >= desiredType.Precision()
+		switch desiredType := desired.(type) {
+		case iceberglib.Int32Type:
+			return currentType.Scale() == 0 && currentType.Precision() >= 10
+		case iceberglib.Int64Type:
+			return currentType.Scale() == 0 && currentType.Precision() >= 19
+		case iceberglib.DecimalType:
+			return currentType.Scale() == desiredType.Scale() &&
+				currentType.Precision() >= desiredType.Precision()
+		}
 	}
 	return false
 }
@@ -183,10 +188,21 @@ func findSourceColumn(sourceSchema *model.TableSchema, name string) (model.Table
 }
 
 func icebergTypeForColumn(col model.TableColumn) (iceberglib.Type, error) {
-	switch strings.ToLower(strings.TrimSpace(col.DataType)) {
-	case "tinyint", "smallint", "mediumint", "int", "integer":
+	dataType := strings.ToLower(strings.TrimSpace(col.DataType))
+	unsigned := strings.Contains(strings.ToLower(col.ColumnType), "unsigned")
+
+	switch dataType {
+	case "tinyint", "smallint", "mediumint":
+		return iceberglib.PrimitiveTypes.Int32, nil
+	case "int", "integer":
+		if unsigned {
+			return iceberglib.PrimitiveTypes.Int64, nil
+		}
 		return iceberglib.PrimitiveTypes.Int32, nil
 	case "bigint":
+		if unsigned {
+			return iceberglib.DecimalTypeOf(20, 0), nil
+		}
 		return iceberglib.PrimitiveTypes.Int64, nil
 	case "float":
 		return iceberglib.PrimitiveTypes.Float32, nil

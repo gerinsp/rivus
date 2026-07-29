@@ -366,9 +366,48 @@ func TestIcebergTypeForColumnClampsDecimalPrecision(t *testing.T) {
 	}
 }
 
+func TestIcebergTypeForColumnPreservesUnsignedIntegerRanges(t *testing.T) {
+	tests := []struct {
+		name string
+		col  model.TableColumn
+		want iceberglib.Type
+	}{
+		{
+			name: "unsigned int widens to long",
+			col:  model.TableColumn{DataType: "int", ColumnType: "int unsigned"},
+			want: iceberglib.PrimitiveTypes.Int64,
+		},
+		{
+			name: "unsigned bigint uses decimal",
+			col:  model.TableColumn{DataType: "bigint", ColumnType: "bigint(20) unsigned"},
+			want: iceberglib.DecimalTypeOf(20, 0),
+		},
+		{
+			name: "signed bigint remains long",
+			col:  model.TableColumn{DataType: "bigint", ColumnType: "bigint(20)"},
+			want: iceberglib.PrimitiveTypes.Int64,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := icebergTypeForColumn(tt.col)
+			if err != nil {
+				t.Fatalf("icebergTypeForColumn returned error: %v", err)
+			}
+			if !got.Equals(tt.want) {
+				t.Fatalf("type = %s, want %s", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestShouldUpdateIcebergTypeSkipsExistingWiderType(t *testing.T) {
 	if shouldUpdateIcebergType(iceberglib.PrimitiveTypes.Int64, iceberglib.PrimitiveTypes.Int32, false) {
 		t.Fatal("existing long should be kept when source narrows to int")
+	}
+	if shouldUpdateIcebergType(iceberglib.DecimalTypeOf(20, 0), iceberglib.PrimitiveTypes.Int64, false) {
+		t.Fatal("existing decimal(20,0) should be kept when it can represent long")
 	}
 	if shouldUpdateIcebergType(iceberglib.DecimalTypeOf(20, 2), iceberglib.DecimalTypeOf(10, 2), false) {
 		t.Fatal("existing wider decimal should be kept when source narrows precision")
