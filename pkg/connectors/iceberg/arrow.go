@@ -3,7 +3,6 @@ package iceberg
 import (
 	"encoding/json"
 	"fmt"
-	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -301,15 +300,15 @@ func literalForValue(typ iceberglib.Type, value interface{}) (iceberglib.Literal
 	case int64:
 		return iceberglib.NewLiteral(v).To(typ)
 	case uint:
-		return literalForUnsignedValue(uint64(v), typ)
+		return iceberglib.NewLiteral(int64(v)).To(typ)
 	case uint8:
-		return literalForUnsignedValue(uint64(v), typ)
+		return iceberglib.NewLiteral(int64(v)).To(typ)
 	case uint16:
-		return literalForUnsignedValue(uint64(v), typ)
+		return iceberglib.NewLiteral(int64(v)).To(typ)
 	case uint32:
-		return literalForUnsignedValue(uint64(v), typ)
+		return iceberglib.NewLiteral(int64(v)).To(typ)
 	case uint64:
-		return literalForUnsignedValue(v, typ)
+		return iceberglib.NewLiteral(int64(v)).To(typ)
 	case float32:
 		return iceberglib.NewLiteral(v).To(typ)
 	case float64:
@@ -328,16 +327,6 @@ func literalForValue(typ iceberglib.Type, value interface{}) (iceberglib.Literal
 	default:
 		return iceberglib.StringLiteral(fmt.Sprint(v)).To(typ)
 	}
-}
-
-func literalForUnsignedValue(value uint64, typ iceberglib.Type) (iceberglib.Literal, error) {
-	if _, ok := typ.(iceberglib.DecimalType); ok {
-		return iceberglib.StringLiteral(strconv.FormatUint(value, 10)).To(typ)
-	}
-	if value > math.MaxInt64 {
-		return nil, fmt.Errorf("unsigned integer %d exceeds Iceberg long maximum %d; rebuild the table with decimal(20,0)", value, int64(math.MaxInt64))
-	}
-	return iceberglib.NewLiteral(int64(value)).To(typ)
 }
 
 func literalForTimestampValue(value interface{}, typ iceberglib.Type) (iceberglib.Literal, error) {
@@ -473,9 +462,6 @@ func toInt64(value interface{}) (int64, error) {
 	case int64:
 		return v, nil
 	case uint:
-		if uint64(v) > math.MaxInt64 {
-			return 0, fmt.Errorf("unsigned integer %d exceeds Iceberg long maximum %d; rebuild the table with decimal(20,0)", v, int64(math.MaxInt64))
-		}
 		return int64(v), nil
 	case uint8:
 		return int64(v), nil
@@ -484,19 +470,10 @@ func toInt64(value interface{}) (int64, error) {
 	case uint32:
 		return int64(v), nil
 	case uint64:
-		if v > math.MaxInt64 {
-			return 0, fmt.Errorf("unsigned integer %d exceeds Iceberg long maximum %d; rebuild the table with decimal(20,0)", v, int64(math.MaxInt64))
-		}
 		return int64(v), nil
 	case float32:
-		if math.IsNaN(float64(v)) || float64(v) >= float64(uint64(1)<<63) || float64(v) < math.MinInt64 {
-			return 0, fmt.Errorf("numeric value %v is outside the Iceberg long range", v)
-		}
 		return int64(v), nil
 	case float64:
-		if math.IsNaN(v) || v >= float64(uint64(1)<<63) || v < math.MinInt64 {
-			return 0, fmt.Errorf("numeric value %v is outside the Iceberg long range", v)
-		}
 		return int64(v), nil
 	case string:
 		return strconv.ParseInt(strings.TrimSpace(v), 10, 64)

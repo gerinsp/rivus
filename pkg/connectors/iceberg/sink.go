@@ -2911,10 +2911,9 @@ func (s *Sink) applyDDL(ctx context.Context, state *tableState, ev model.Event) 
 
 	txn := state.table.NewTransaction()
 	updater := txn.UpdateSchema(false, s.cfg.AllowUnsafeTypeChanges)
-	currentTypes := icebergFieldTypesByName(state.table.Schema())
 
 	for _, action := range plan {
-		if err := applyDDLAction(updater, currentTypes, action, s.cfg); err != nil {
+		if err := applyDDLAction(updater, action, s.cfg); err != nil {
 			return util.Permanent(err)
 		}
 	}
@@ -2950,18 +2949,7 @@ func (s *Sink) applyDDL(ctx context.Context, state *tableState, ev model.Event) 
 	return nil
 }
 
-func icebergFieldTypesByName(schema *iceberglib.Schema) map[string]iceberglib.Type {
-	fields := make(map[string]iceberglib.Type)
-	if schema == nil {
-		return fields
-	}
-	for _, field := range schema.Fields() {
-		fields[strings.ToLower(strings.TrimSpace(field.Name))] = field.Type
-	}
-	return fields
-}
-
-func applyDDLAction(updater *icetable.UpdateSchema, currentTypes map[string]iceberglib.Type, action ddlAction, cfg config.IcebergConfig) error {
+func applyDDLAction(updater *icetable.UpdateSchema, action ddlAction, cfg config.IcebergConfig) error {
 	switch action.Kind {
 	case ddlActionAddColumn:
 		typ, err := icebergTypeForColumn(action.Column)
@@ -2970,40 +2958,23 @@ func applyDDLAction(updater *icetable.UpdateSchema, currentTypes map[string]iceb
 		}
 		required := false
 		updater.AddColumn([]string{action.Column.Name}, typ, "", required, nil)
-		currentTypes[strings.ToLower(strings.TrimSpace(action.Column.Name))] = typ
 		return nil
 	case ddlActionDropColumn:
 		if !cfg.AllowDropColumn {
 			return fmt.Errorf("drop column is disabled, column=%s", action.OldName)
 		}
 		updater.DeleteColumn([]string{action.OldName})
-		delete(currentTypes, strings.ToLower(strings.TrimSpace(action.OldName)))
 		return nil
 	case ddlActionRenameColumn:
 		if !cfg.AllowRenameColumn {
 			return fmt.Errorf("rename column is disabled, from=%s to=%s", action.OldName, action.NewName)
 		}
 		updater.RenameColumn([]string{action.OldName}, action.NewName)
-		oldKey := strings.ToLower(strings.TrimSpace(action.OldName))
-		newKey := strings.ToLower(strings.TrimSpace(action.NewName))
-		if typ, ok := currentTypes[oldKey]; ok {
-			currentTypes[newKey] = typ
-			delete(currentTypes, oldKey)
-		}
 		return nil
 	case ddlActionUpdateColumn:
 		colType, err := icebergTypeForColumn(action.Column)
 		if err != nil {
 			return err
-		}
-		key := strings.ToLower(strings.TrimSpace(action.Column.Name))
-		if currentType, ok := currentTypes[key]; ok && isLegacyLongToUnsignedBigintDecimal(currentType, colType) {
-			log.Printf(
-				"[iceberg] preserving legacy long column for DDL column=%s desired=%s; rebuild table to migrate existing data files",
-				action.Column.Name,
-				colType,
-			)
-			return nil
 		}
 		update := icetable.ColumnUpdate{
 			FieldType: iceberglib.Optional[iceberglib.Type]{Val: colType, Valid: true},
@@ -3012,7 +2983,6 @@ func applyDDLAction(updater *icetable.UpdateSchema, currentTypes map[string]iceb
 			update.Required = iceberglib.Optional[bool]{Val: !action.Column.IsNullable, Valid: true}
 		}
 		updater.UpdateColumn([]string{action.Column.Name}, update)
-		currentTypes[key] = colType
 		return nil
 	default:
 		return fmt.Errorf("unsupported ddl action %q", action.Kind)
