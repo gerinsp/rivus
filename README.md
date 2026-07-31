@@ -122,6 +122,10 @@ RIVUS_ALERT_COOLDOWN_SECONDS=600
 
 The lag monitor checks every 30 seconds. The cooldown is applied independently
 per job and alert type to avoid repeated Telegram messages during one incident.
+When `RIVUS_META_MYSQL_DSN` is configured, failed-job alerts are persisted in
+the `job_failure_notifications` outbox, retried with exponential backoff for
+transient delivery errors, and resumed after Rivus restarts. Permanent Telegram
+4xx responses are recorded as failed instead of retried indefinitely.
 
 Iceberg sink integrations can also use:
 

@@ -1068,12 +1068,12 @@ func (j *Job) preflight(ctx context.Context, src connector.Source, sink connecto
 	sp, hasSP := src.(connector.SchemaProvider)
 	tm, hasTM := sink.(connector.TableManager)
 	sc, hasSC := sink.(connector.SchemaConsumer)
-	countResume := snapshotCountResumeSupported(mode) && snapshotOnlyCountResumeEnabled(j.Config.Metadata)
+	safeSnapshotReload := snapshotCountResumeSupported(mode) && snapshotOnlyCountResumeEnabled(j.Config.Metadata)
 	pkSkipper, skipMissingPK := sink.(connector.SnapshotPrimaryKeySkipper)
 	skipMissingPK = mode == config.JobModeSnapshotOnly && skipMissingPK
 
-	if countResume && !hasTM {
-		return fmt.Errorf("snapshot count resume requires sink connector table manager support")
+	if safeSnapshotReload && !hasTM {
+		return fmt.Errorf("safe snapshot reload requires sink connector table manager support")
 	}
 	if !hasTM && !hasSC {
 		return nil
@@ -1082,30 +1082,13 @@ func (j *Job) preflight(ctx context.Context, src connector.Source, sink connecto
 		return fmt.Errorf("source connector does not support schema discovery required by sink")
 	}
 
-	var sourceCounter connector.TableRowCounter
-	var targetCounter connector.TargetTableRowCounter
 	var targetResetter connector.TargetTableResetter
 	var snapshotSkipper connector.SnapshotTableSkipper
-	if countResume {
+	if safeSnapshotReload {
 		var ok bool
-		snapshotSkipper, ok = src.(connector.SnapshotTableSkipper)
-		if !ok {
-			return fmt.Errorf("snapshot count resume requires source connector snapshot skip support")
-		}
-	}
-	if countResume {
-		var ok bool
-		sourceCounter, ok = src.(connector.TableRowCounter)
-		if !ok {
-			return fmt.Errorf("snapshot count resume requires source connector row count support")
-		}
-		targetCounter, ok = sink.(connector.TargetTableRowCounter)
-		if !ok {
-			return fmt.Errorf("snapshot count resume requires sink connector row count support")
-		}
 		targetResetter, ok = sink.(connector.TargetTableResetter)
 		if !ok {
-			return fmt.Errorf("snapshot count resume requires sink connector table reset support")
+			return fmt.Errorf("safe snapshot reload requires sink connector table reset support")
 		}
 	}
 
@@ -1114,14 +1097,12 @@ func (j *Job) preflight(ctx context.Context, src connector.Source, sink connecto
 		resolver = tr
 	}
 
-	type countResumeTarget struct {
-		schema     string
-		table      string
-		sourceRows int64
-		sources    []connector.TableRef
+	type snapshotReloadTarget struct {
+		schema string
+		table  string
 	}
 
-	countTargets := make(map[string]*countResumeTarget)
+	reloadTargets := make(map[string]*snapshotReloadTarget)
 	skipTables := make([]connector.TableRef, 0)
 	for _, t := range lister.Tables() {
 		schema, err := sp.FetchSchema(ctx, t.Schema, t.Table)
@@ -1157,42 +1138,24 @@ func (j *Job) preflight(ctx context.Context, src connector.Source, sink connecto
 				return err
 			}
 
-			if countResume {
-				sourceRows, err := sourceCounter.CountRows(ctx, t.Schema, t.Table)
-				if err != nil {
-					return fmt.Errorf("count source rows failed %s.%s: %w", t.Schema, t.Table, err)
-				}
+			if safeSnapshotReload {
 				targetName := strings.ToLower(strings.TrimSpace(targetDB + "." + targetTbl))
-				group := countTargets[targetName]
+				group := reloadTargets[targetName]
 				if group == nil {
-					group = &countResumeTarget{
+					group = &snapshotReloadTarget{
 						schema: targetDB,
 						table:  targetTbl,
 					}
-					countTargets[targetName] = group
+					reloadTargets[targetName] = group
 				}
-				group.sourceRows += sourceRows
-				group.sources = append(group.sources, t)
 			}
 		}
 	}
-	if countResume {
-		for targetName, group := range countTargets {
-			targetRows, err := targetCounter.CountTargetRows(ctx, group.schema, group.table)
-			if err != nil {
-				return fmt.Errorf("count target rows failed %s.%s: %w", group.schema, group.table, err)
-			}
-
-			if group.sourceRows == targetRows {
-				log.Printf("[job %s] snapshot count resume skip target=%s sources=%d rows=%d", j.Config.ID, targetName, len(group.sources), group.sourceRows)
-				skipTables = append(skipTables, group.sources...)
-				continue
-			}
-			if targetRows > 0 {
-				log.Printf("[job %s] snapshot count resume reset target=%s source_rows=%d target_rows=%d sources=%d", j.Config.ID, targetName, group.sourceRows, targetRows, len(group.sources))
-				if err := targetResetter.ResetTargetTable(ctx, group.schema, group.table); err != nil {
-					return fmt.Errorf("reset target table failed %s.%s: %w", group.schema, group.table, err)
-				}
+	if safeSnapshotReload {
+		for targetName, group := range reloadTargets {
+			log.Printf("[job %s] safe snapshot reload reset target=%s; resume mode uses saved snapshot cursor", j.Config.ID, targetName)
+			if err := targetResetter.ResetTargetTable(ctx, group.schema, group.table); err != nil {
+				return fmt.Errorf("reset target table failed %s.%s: %w", group.schema, group.table, err)
 			}
 		}
 	}

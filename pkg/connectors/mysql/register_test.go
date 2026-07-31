@@ -2,6 +2,17 @@ package mysql
 
 import "testing"
 
+func TestSinkUsesAcknowledgedSnapshotBatches(t *testing.T) {
+	for _, sinkType := range []string{"doris", "iceberg_native", " DORIS "} {
+		if !sinkUsesAcknowledgedSnapshotBatches(sinkType) {
+			t.Fatalf("sink %q should use acknowledged snapshot batches", sinkType)
+		}
+	}
+	if sinkUsesAcknowledgedSnapshotBatches("unknown") {
+		t.Fatal("unknown sink should not use acknowledged snapshot batches")
+	}
+}
+
 func TestDecodeMySQLConfigNormalizesTableConfigs(t *testing.T) {
 	cfg, err := decodeMySQLConfig(map[string]any{
 		"database": "legacy_db",

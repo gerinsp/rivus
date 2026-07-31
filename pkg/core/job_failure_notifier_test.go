@@ -8,11 +8,13 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/gerinsp/rivus/pkg/config"
 	"github.com/gerinsp/rivus/pkg/connector"
+	"github.com/gerinsp/rivus/pkg/meta"
 	"github.com/gerinsp/rivus/pkg/model"
 )
 
@@ -163,6 +165,158 @@ func TestJobManagerRecoversAndNotifiesSourcePanic(t *testing.T) {
 	}
 }
 
+func TestDeferredStartupFailureIsReconciledExactlyOnce(t *testing.T) {
+	notifier := &countingJobFailureNotifier{
+		sent: make(chan jobFailureNotification, 2),
+	}
+	manager := NewJobManager(
+		connector.NewRegistry(),
+		withJobFailureNotifier(notifier),
+	)
+	job := manager.newManagedJob(newNotificationTestJobConfig("job-startup-race", "test_source", "doris"))
+	manager.mu.Lock()
+	manager.jobs[job.Config.ID] = job
+	manager.mu.Unlock()
+
+	manager.deferFailureNotification(job.Config.ID)
+	job.addError("source", errors.New("source failed before Submit returned"))
+	job.setStatus(JobStatusFailed)
+
+	select {
+	case payload := <-notifier.sent:
+		t.Fatalf("notification sent while startup was deferred: %+v", payload)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	manager.finishDeferredFailureNotification(job, true)
+	manager.finishDeferredFailureNotification(job, true)
+
+	select {
+	case payload := <-notifier.sent:
+		if payload.JobID != job.Config.ID {
+			t.Fatalf("payload.JobID = %q, want %q", payload.JobID, job.Config.ID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for reconciled startup failure notification")
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := notifier.Attempts(); got != 1 {
+		t.Fatalf("notification attempts = %d, want exactly 1", got)
+	}
+}
+
+func TestJobManagerRetriesAndPersistsFailureNotification(t *testing.T) {
+	store := newMemoryJobStore()
+	notifier := &countingJobFailureNotifier{
+		failuresRemaining: 1,
+		sent:              make(chan jobFailureNotification, 2),
+	}
+	manager := NewJobManager(
+		connector.NewRegistry(),
+		WithJobStore(store),
+		withJobFailureNotifier(notifier),
+		withFailureNotificationRetry(10*time.Millisecond, 20*time.Millisecond),
+	)
+	job := manager.newManagedJob(newNotificationTestJobConfig("job-retry", "test_source", "doris"))
+	manager.mu.Lock()
+	manager.jobs[job.Config.ID] = job
+	manager.mu.Unlock()
+
+	job.addError("sink", errors.New("temporary Telegram test failure"))
+	job.setStatus(JobStatusFailed)
+
+	select {
+	case <-notifier.sent:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for retried failure notification")
+	}
+	if got := notifier.Attempts(); got != 2 {
+		t.Fatalf("notification attempts = %d, want 2", got)
+	}
+
+	waitForCondition(t, "retried notification state to persist", func() bool {
+		notification := onlyFailureNotification(t, store)
+		return notification.State == meta.FailureNotificationSent
+	})
+	notification := onlyFailureNotification(t, store)
+	if notification.State != meta.FailureNotificationSent {
+		t.Fatalf("notification state = %s, want SENT", notification.State)
+	}
+	if notification.Attempts != 2 {
+		t.Fatalf("persisted attempts = %d, want 2", notification.Attempts)
+	}
+	if notification.SentAt.IsZero() {
+		t.Fatal("persisted sent_at is zero")
+	}
+}
+
+func TestJobManagerRestoresPendingFailureNotification(t *testing.T) {
+	store := newMemoryJobStore()
+	cfg := newNotificationTestJobConfig("job-pending-notification", "test_source", "doris")
+	store.jobs[cfg.ID] = meta.PersistedJob{
+		ID:           cfg.ID,
+		Name:         cfg.Name,
+		Config:       cfg,
+		DesiredState: meta.DesiredStateStopped,
+		LastStatus:   string(JobStatusFailed),
+		Errors: []meta.PersistedJobError{{
+			Component: "sink",
+			Message:   "stream load failed",
+			Time:      time.Now().Add(-time.Minute),
+		}},
+		CreatedAt: time.Now().Add(-time.Hour),
+		UpdatedAt: time.Now().Add(-time.Minute),
+	}
+	incidentID := "failure-persisted-test"
+	store.notifications[incidentID] = meta.FailureNotification{
+		IncidentID: incidentID,
+		JobID:      cfg.ID,
+		Payload: meta.FailureNotificationPayload{
+			JobID:          cfg.ID,
+			JobName:        cfg.Name,
+			SinkType:       "doris",
+			ErrorComponent: "sink",
+			ErrorMessage:   "stream load failed",
+		},
+		State:     meta.FailureNotificationPending,
+		CreatedAt: time.Now().Add(-time.Minute),
+		UpdatedAt: time.Now().Add(-time.Minute),
+	}
+
+	notifier := &countingJobFailureNotifier{
+		sent: make(chan jobFailureNotification, 1),
+	}
+	manager := NewJobManager(
+		connector.NewRegistry(),
+		WithJobStore(store),
+		withJobFailureNotifier(notifier),
+		withFailureNotificationRetry(10*time.Millisecond, 20*time.Millisecond),
+	)
+	if err := manager.RestorePersistedJobs(context.Background()); err != nil {
+		t.Fatalf("RestorePersistedJobs returned error: %v", err)
+	}
+
+	select {
+	case payload := <-notifier.sent:
+		if payload.ErrorMessage != "stream load failed" {
+			t.Fatalf("payload.ErrorMessage = %q", payload.ErrorMessage)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for restored failure notification")
+	}
+	waitForCondition(t, "restored notification state to persist", func() bool {
+		notification, ok := store.GetFailureNotification(incidentID)
+		return ok && notification.State == meta.FailureNotificationSent
+	})
+	notification, ok := store.GetFailureNotification(incidentID)
+	if !ok {
+		t.Fatal("restored notification disappeared")
+	}
+	if notification.State != meta.FailureNotificationSent {
+		t.Fatalf("notification state = %s, want SENT", notification.State)
+	}
+}
+
 func TestBuildJobFailureNotificationFallsBackToNativeIcebergSinkTelegramConfig(t *testing.T) {
 	cfg := &config.JobConfig{
 		ID:   "native-job",
@@ -294,6 +448,68 @@ func TestTelegramJobFailureNotifierSendsExpectedPayload(t *testing.T) {
 	}
 }
 
+func TestTelegramJobFailureNotifierClassifiesRetryableAndPermanentResponses(t *testing.T) {
+	tests := []struct {
+		name       string
+		status     int
+		retryAfter string
+		permanent  bool
+		wantDelay  time.Duration
+	}{
+		{
+			name:       "rate limited",
+			status:     http.StatusTooManyRequests,
+			retryAfter: "3",
+			wantDelay:  3 * time.Second,
+		},
+		{
+			name:      "server failure",
+			status:    http.StatusServiceUnavailable,
+			permanent: false,
+		},
+		{
+			name:      "bad credentials",
+			status:    http.StatusUnauthorized,
+			permanent: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if tt.retryAfter != "" {
+					w.Header().Set("Retry-After", tt.retryAfter)
+				}
+				http.Error(w, "delivery failed", tt.status)
+			}))
+			defer server.Close()
+
+			notifier := &telegramJobFailureNotifier{
+				client:     server.Client(),
+				apiBaseURL: server.URL,
+			}
+			err := notifier.NotifyJobFailed(context.Background(), jobFailureNotification{
+				JobID: "job-classification",
+				Telegram: config.TelegramNotificationConfig{
+					Enabled:         true,
+					BotToken:        "bot-token",
+					ChatID:          "chat-id",
+					NotifyJobFailed: true,
+				},
+			})
+			if err == nil {
+				t.Fatal("NotifyJobFailed returned nil")
+			}
+			if got := isPermanentJobFailureDeliveryError(err); got != tt.permanent {
+				t.Fatalf("permanent = %t, want %t (err=%v)", got, tt.permanent, err)
+			}
+			if got := jobFailureRetryAfter(err); got != tt.wantDelay {
+				t.Fatalf("retry delay = %s, want %s", got, tt.wantDelay)
+			}
+		})
+	}
+}
+
 func newNotificationTestJobConfig(id, sourceType, sinkType string) *config.JobConfig {
 	cfg := &config.JobConfig{
 		ID:   id,
@@ -332,4 +548,48 @@ func (n *recordingJobFailureNotifier) NotifyJobFailed(ctx context.Context, paylo
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+type countingJobFailureNotifier struct {
+	mu                sync.Mutex
+	attempts          int
+	failuresRemaining int
+	sent              chan jobFailureNotification
+}
+
+func (n *countingJobFailureNotifier) NotifyJobFailed(ctx context.Context, payload jobFailureNotification) error {
+	n.mu.Lock()
+	n.attempts++
+	if n.failuresRemaining > 0 {
+		n.failuresRemaining--
+		n.mu.Unlock()
+		return errors.New("temporary notification failure")
+	}
+	n.mu.Unlock()
+
+	select {
+	case n.sent <- payload:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (n *countingJobFailureNotifier) Attempts() int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.attempts
+}
+
+func onlyFailureNotification(t *testing.T, store *memoryJobStore) meta.FailureNotification {
+	t.Helper()
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if len(store.notifications) != 1 {
+		t.Fatalf("notification count = %d, want 1", len(store.notifications))
+	}
+	for _, notification := range store.notifications {
+		return notification
+	}
+	return meta.FailureNotification{}
 }

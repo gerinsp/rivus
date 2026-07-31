@@ -25,6 +25,11 @@ var (
 
 const defaultMaxConcurrentSnapshotJobs = 2
 
+const (
+	defaultFailureNotificationRetryInitial = time.Second
+	defaultFailureNotificationRetryMax     = 10 * time.Minute
+)
+
 type JobInfo struct {
 	ID         string       `json:"id"`
 	Name       string       `json:"name"`
@@ -47,6 +52,13 @@ type JobManager struct {
 
 	healthAlertMu       sync.Mutex
 	healthAlertLastSent map[string]time.Time
+
+	failureDeliveryMu        sync.Mutex
+	deferredFailureJobs      map[string]struct{}
+	activeFailureDeliveries  map[string]struct{}
+	completedFailureDelivery map[string]struct{}
+	failureRetryInitial      time.Duration
+	failureRetryMax          time.Duration
 
 	jobStore          meta.JobStore
 	defaultMetaMySQL  string
@@ -91,6 +103,17 @@ func withJobHealthNotifier(notifier jobHealthNotifier) JobManagerOption {
 	}
 }
 
+func withFailureNotificationRetry(initial, max time.Duration) JobManagerOption {
+	return func(m *JobManager) {
+		if initial > 0 {
+			m.failureRetryInitial = initial
+		}
+		if max > 0 {
+			m.failureRetryMax = max
+		}
+	}
+}
+
 func NewJobManager(reg *connector.Registry, opts ...JobManagerOption) *JobManager {
 	telegramNotifier := newTelegramJobFailureNotifier(nil)
 	m := &JobManager{
@@ -99,6 +122,11 @@ func NewJobManager(reg *connector.Registry, opts ...JobManagerOption) *JobManage
 		failureNotifier:           telegramNotifier,
 		healthNotifier:            telegramNotifier,
 		healthAlertLastSent:       make(map[string]time.Time),
+		deferredFailureJobs:       make(map[string]struct{}),
+		activeFailureDeliveries:   make(map[string]struct{}),
+		completedFailureDelivery:  make(map[string]struct{}),
+		failureRetryInitial:       defaultFailureNotificationRetryInitial,
+		failureRetryMax:           defaultFailureNotificationRetryMax,
 		maxConcurrentSnapshotJobs: snapshotJobLimitFromEnv(),
 		snapshotQueueModes:        make(map[string]config.JobMode),
 		startingSnapshotJobs:      make(map[string]struct{}),
@@ -129,19 +157,20 @@ func (m *JobManager) Submit(cfg *config.JobConfig) (*Job, error) {
 		m.enqueueSnapshotJobLocked(cfg.ID, cfg.Mode)
 	}
 	m.mu.Unlock()
-	m.attachStatusListener(job, false)
+	m.attachStatusListener(job)
 
 	if shouldQueue {
-		m.attachStatusListener(job, true)
 		job.setStatus(JobStatusQueued)
 		return job, nil
 	}
 
+	m.deferFailureNotification(cfg.ID)
 	if err := m.startJob(job, cfg.Mode, true); err != nil {
+		m.finishDeferredFailureNotification(job, false)
 		log.Printf("[job-manager] job start failed job=%s: %v", cfg.ID, err)
 		return nil, err
 	}
-	m.attachStatusListener(job, true)
+	m.finishDeferredFailureNotification(job, true)
 	return job, nil
 }
 
@@ -371,7 +400,7 @@ func (m *JobManager) RestorePersistedJobs(ctx context.Context) error {
 		}
 	}
 
-	return nil
+	return m.restorePendingFailureNotifications(ctx)
 }
 
 func (m *JobManager) Delete(id string) error {
@@ -418,37 +447,23 @@ func (m *JobManager) normalizeConfig(cfg *config.JobConfig) *config.JobConfig {
 
 func (m *JobManager) newManagedJob(cfg *config.JobConfig) *Job {
 	job := NewJob(cfg, m.reg)
-	m.attachStatusListener(job, true)
+	m.attachStatusListener(job)
 	return job
 }
 
-func (m *JobManager) attachStatusListener(job *Job, notifyFailures bool) {
+func (m *JobManager) attachStatusListener(job *Job) {
 	job.setStatusListener(func(status JobStatus) {
+		if status == JobStatusFailed && m.failureNotifier != nil && !m.failureNotificationDeferred(job.Config.ID) {
+			// Persist the outbox record as part of handling the FAILED transition,
+			// before asynchronous delivery begins.
+			m.enqueueFailureNotification(job)
+		}
 		if err := m.saveJobRecord(context.Background(), job, desiredStateForStatus(status), status); err != nil {
 			log.Printf("[job-manager] persist job state failed job=%s status=%s: %v", job.Config.ID, status, err)
 		}
 		if snapshotStatusReleasesSlot(status) {
 			m.startQueuedSnapshotJobsAsync()
 		}
-		if !notifyFailures || status != JobStatusFailed || m.failureNotifier == nil {
-			return
-		}
-
-		payload, ok := buildJobFailureNotification(job)
-		if !ok {
-			log.Printf("[job-manager] skipped failed notification job=%s channel=telegram reason=disabled_or_missing_configuration", job.Config.ID)
-			return
-		}
-
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			if err := m.failureNotifier.NotifyJobFailed(ctx, payload); err != nil {
-				log.Printf("[job-manager] failed notification delivery job=%s channel=telegram: %v", job.Config.ID, err)
-				return
-			}
-			log.Printf("[job-manager] sent failed notification job=%s channel=telegram", job.Config.ID)
-		}()
 	})
 	job.setProgressListener(func(progress *JobProgress) {
 		if snapshotProgressReleasesSlot(progress) {
@@ -456,6 +471,231 @@ func (m *JobManager) attachStatusListener(job *Job, notifyFailures bool) {
 		}
 		m.maybeNotifyJobHealth(job, progress)
 	})
+}
+
+func (m *JobManager) deferFailureNotification(jobID string) {
+	m.failureDeliveryMu.Lock()
+	m.deferredFailureJobs[jobID] = struct{}{}
+	m.failureDeliveryMu.Unlock()
+}
+
+func (m *JobManager) finishDeferredFailureNotification(job *Job, accepted bool) {
+	if job == nil || job.Config == nil {
+		return
+	}
+	m.failureDeliveryMu.Lock()
+	delete(m.deferredFailureJobs, job.Config.ID)
+	m.failureDeliveryMu.Unlock()
+	if accepted && job.GetStatus() == JobStatusFailed {
+		m.enqueueFailureNotification(job)
+	}
+}
+
+func (m *JobManager) failureNotificationDeferred(jobID string) bool {
+	m.failureDeliveryMu.Lock()
+	defer m.failureDeliveryMu.Unlock()
+	_, ok := m.deferredFailureJobs[jobID]
+	return ok
+}
+
+func (m *JobManager) enqueueFailureNotification(job *Job) {
+	payload, ok := buildJobFailureNotification(job)
+	if !ok {
+		log.Printf("[job-manager] skipped failed notification job=%s channel=telegram reason=disabled_or_missing_configuration", job.Config.ID)
+		return
+	}
+	notification := buildPersistedFailureNotification(job, payload)
+	persisted := false
+	if store, ok := m.jobStore.(meta.FailureNotificationStore); ok {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := store.SaveFailureNotification(ctx, notification)
+		cancel()
+		if err != nil {
+			log.Printf("[job-manager] persist failed notification error job=%s incident=%s: %v", notification.JobID, notification.IncidentID, err)
+		} else {
+			persisted = true
+		}
+	}
+	m.scheduleFailureNotification(job, notification, persisted)
+}
+
+func (m *JobManager) scheduleFailureNotification(job *Job, notification meta.FailureNotification, persisted bool) {
+	if job == nil || job.Config == nil || notification.IncidentID == "" {
+		return
+	}
+	m.failureDeliveryMu.Lock()
+	if _, ok := m.completedFailureDelivery[notification.IncidentID]; ok {
+		m.failureDeliveryMu.Unlock()
+		return
+	}
+	if _, ok := m.activeFailureDeliveries[notification.IncidentID]; ok {
+		m.failureDeliveryMu.Unlock()
+		return
+	}
+	m.activeFailureDeliveries[notification.IncidentID] = struct{}{}
+	m.failureDeliveryMu.Unlock()
+
+	go m.deliverFailureNotification(job, notification, persisted)
+}
+
+func (m *JobManager) deliverFailureNotification(job *Job, notification meta.FailureNotification, persisted bool) {
+	defer func() {
+		m.failureDeliveryMu.Lock()
+		delete(m.activeFailureDeliveries, notification.IncidentID)
+		m.failureDeliveryMu.Unlock()
+	}()
+
+	store, _ := m.jobStore.(meta.FailureNotificationStore)
+	persistBackoff := m.failureRetryInitial
+	for store != nil && !persisted {
+		if !m.jobIsManaged(job) {
+			return
+		}
+		saveCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := store.SaveFailureNotification(saveCtx, notification)
+		cancel()
+		if err == nil {
+			persisted = true
+			break
+		}
+		log.Printf("[job-manager] persist failed notification error job=%s incident=%s: %v", notification.JobID, notification.IncidentID, err)
+		if !waitForFailureNotificationRetry(persistBackoff) {
+			return
+		}
+		persistBackoff = nextFailureNotificationBackoff(persistBackoff, m.failureRetryMax)
+	}
+
+	for {
+		if !m.jobIsManaged(job) {
+			return
+		}
+		if delay := time.Until(notification.NextAttemptAt); !notification.NextAttemptAt.IsZero() && delay > 0 {
+			if !waitForFailureNotificationRetry(delay) {
+				return
+			}
+		}
+
+		payload, ok := jobFailureNotificationFromPersisted(job, notification)
+		if !ok {
+			notification.State = meta.FailureNotificationFailed
+			notification.LastError = "notification disabled or missing configuration"
+			notification.UpdatedAt = time.Now().UTC()
+			m.saveFailureNotificationState(store, notification)
+			log.Printf("[job-manager] stopped failed notification job=%s incident=%s reason=disabled_or_missing_configuration", notification.JobID, notification.IncidentID)
+			return
+		}
+
+		attemptCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		err := m.failureNotifier.NotifyJobFailed(attemptCtx, payload)
+		cancel()
+		notification.Attempts++
+		notification.UpdatedAt = time.Now().UTC()
+
+		if err == nil {
+			notification.State = meta.FailureNotificationSent
+			notification.LastError = ""
+			notification.NextAttemptAt = time.Time{}
+			notification.SentAt = notification.UpdatedAt
+			m.saveFailureNotificationState(store, notification)
+			m.failureDeliveryMu.Lock()
+			m.completedFailureDelivery[notification.IncidentID] = struct{}{}
+			m.failureDeliveryMu.Unlock()
+			log.Printf("[job-manager] sent failed notification job=%s channel=telegram incident=%s attempts=%d", notification.JobID, notification.IncidentID, notification.Attempts)
+			return
+		}
+
+		notification.LastError = err.Error()
+		if isPermanentJobFailureDeliveryError(err) {
+			notification.State = meta.FailureNotificationFailed
+			notification.NextAttemptAt = time.Time{}
+			m.saveFailureNotificationState(store, notification)
+			log.Printf("[job-manager] permanent failed notification delivery job=%s channel=telegram incident=%s attempts=%d: %v", notification.JobID, notification.IncidentID, notification.Attempts, err)
+			return
+		}
+
+		delay := m.failureNotificationRetryDelay(notification.Attempts, err)
+		notification.State = meta.FailureNotificationPending
+		notification.NextAttemptAt = time.Now().UTC().Add(delay)
+		m.saveFailureNotificationState(store, notification)
+		log.Printf("[job-manager] retry failed notification delivery job=%s channel=telegram incident=%s attempts=%d retry_in=%s: %v",
+			notification.JobID, notification.IncidentID, notification.Attempts, delay.Round(time.Millisecond), err)
+	}
+}
+
+func (m *JobManager) failureNotificationRetryDelay(attempts int, err error) time.Duration {
+	if retryAfter := jobFailureRetryAfter(err); retryAfter > 0 {
+		return retryAfter
+	}
+	delay := m.failureRetryInitial
+	for i := 1; i < attempts; i++ {
+		delay = nextFailureNotificationBackoff(delay, m.failureRetryMax)
+	}
+	return delay
+}
+
+func nextFailureNotificationBackoff(current, max time.Duration) time.Duration {
+	if current <= 0 {
+		current = defaultFailureNotificationRetryInitial
+	}
+	next := current * 2
+	if max > 0 && next > max {
+		return max
+	}
+	return next
+}
+
+func waitForFailureNotificationRetry(delay time.Duration) bool {
+	if delay <= 0 {
+		return true
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	<-timer.C
+	return true
+}
+
+func (m *JobManager) saveFailureNotificationState(store meta.FailureNotificationStore, notification meta.FailureNotification) {
+	if store == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := store.SaveFailureNotification(ctx, notification); err != nil {
+		log.Printf("[job-manager] persist failed notification state error job=%s incident=%s state=%s: %v",
+			notification.JobID, notification.IncidentID, notification.State, err)
+	}
+}
+
+func (m *JobManager) restorePendingFailureNotifications(ctx context.Context) error {
+	store, ok := m.jobStore.(meta.FailureNotificationStore)
+	if !ok {
+		return nil
+	}
+	notifications, err := store.LoadPendingFailureNotifications(ctx)
+	if err != nil {
+		return err
+	}
+	for _, notification := range notifications {
+		m.mu.RLock()
+		job := m.jobs[notification.JobID]
+		m.mu.RUnlock()
+		if job == nil {
+			log.Printf("[job-manager] skip orphaned failed notification incident=%s job=%s", notification.IncidentID, notification.JobID)
+			continue
+		}
+		m.scheduleFailureNotification(job, notification, true)
+	}
+	return nil
+}
+
+func (m *JobManager) jobIsManaged(job *Job) bool {
+	if job == nil || job.Config == nil {
+		return false
+	}
+	m.mu.RLock()
+	managed := m.jobs[job.Config.ID] == job
+	m.mu.RUnlock()
+	return managed
 }
 
 func (m *JobManager) maybeNotifyJobHealth(job *Job, progress *JobProgress) {

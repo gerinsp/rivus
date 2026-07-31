@@ -2,6 +2,8 @@ package core
 
 import (
 	"context"
+	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +14,7 @@ import (
 	"time"
 
 	"github.com/gerinsp/rivus/pkg/config"
+	"github.com/gerinsp/rivus/pkg/meta"
 )
 
 type jobFailureNotification struct {
@@ -33,6 +36,20 @@ type jobFailureNotifier interface {
 type telegramJobFailureNotifier struct {
 	client     *http.Client
 	apiBaseURL string
+}
+
+type jobFailureDeliveryError struct {
+	err        error
+	permanent  bool
+	retryAfter time.Duration
+}
+
+func (e *jobFailureDeliveryError) Error() string {
+	return e.err.Error()
+}
+
+func (e *jobFailureDeliveryError) Unwrap() error {
+	return e.err
 }
 
 const (
@@ -71,13 +88,13 @@ func (n *telegramJobFailureNotifier) NotifyJobFailed(ctx context.Context, payloa
 	endpoint := fmt.Sprintf("%s/bot%s/sendMessage", strings.TrimRight(n.apiBaseURL, "/"), tg.BotToken)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(values.Encode()))
 	if err != nil {
-		return err
+		return &jobFailureDeliveryError{err: err, permanent: true}
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	resp, err := n.client.Do(req)
 	if err != nil {
-		return err
+		return &jobFailureDeliveryError{err: err}
 	}
 	defer resp.Body.Close()
 
@@ -87,11 +104,54 @@ func (n *telegramJobFailureNotifier) NotifyJobFailed(ctx context.Context, payloa
 		if msg == "" {
 			msg = resp.Status
 		}
-		return fmt.Errorf("telegram sendMessage failed: %s", msg)
+		deliveryErr := &jobFailureDeliveryError{
+			err: fmt.Errorf("telegram sendMessage failed: %s", msg),
+		}
+		switch {
+		case resp.StatusCode == http.StatusTooManyRequests:
+			deliveryErr.retryAfter = telegramRetryAfter(resp)
+		case resp.StatusCode == http.StatusRequestTimeout:
+		case resp.StatusCode >= 500:
+		default:
+			deliveryErr.permanent = true
+		}
+		return deliveryErr
 	}
 
 	_, _ = io.Copy(io.Discard, resp.Body)
 	return nil
+}
+
+func telegramRetryAfter(resp *http.Response) time.Duration {
+	if resp == nil {
+		return 0
+	}
+	raw := strings.TrimSpace(resp.Header.Get("Retry-After"))
+	if raw == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(raw); err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if retryAt, err := http.ParseTime(raw); err == nil {
+		if delay := time.Until(retryAt); delay > 0 {
+			return delay
+		}
+	}
+	return 0
+}
+
+func isPermanentJobFailureDeliveryError(err error) bool {
+	var deliveryErr *jobFailureDeliveryError
+	return errors.As(err, &deliveryErr) && deliveryErr.permanent
+}
+
+func jobFailureRetryAfter(err error) time.Duration {
+	var deliveryErr *jobFailureDeliveryError
+	if errors.As(err, &deliveryErr) {
+		return deliveryErr.retryAfter
+	}
+	return 0
 }
 
 func formatJobFailureTelegramText(payload jobFailureNotification) string {
@@ -221,6 +281,65 @@ func buildJobFailureNotification(job *Job) (jobFailureNotification, bool) {
 	}
 
 	return payload, true
+}
+
+func buildPersistedFailureNotification(job *Job, payload jobFailureNotification) meta.FailureNotification {
+	errorTime := time.Time{}
+	if lastError := job.GetLastError(); lastError != nil {
+		errorTime = lastError.Time
+	}
+	if errorTime.IsZero() {
+		job.mu.RLock()
+		errorTime = job.Updated
+		job.mu.RUnlock()
+	}
+	material := strings.Join([]string{
+		payload.JobID,
+		errorTime.UTC().Format(time.RFC3339Nano),
+		payload.ErrorComponent,
+		payload.ErrorMessage,
+	}, "\x00")
+	sum := sha256.Sum256([]byte(material))
+	now := time.Now().UTC()
+	return meta.FailureNotification{
+		IncidentID: fmt.Sprintf("failure-%x", sum[:16]),
+		JobID:      payload.JobID,
+		Payload: meta.FailureNotificationPayload{
+			JobID:           payload.JobID,
+			JobName:         payload.JobName,
+			SinkType:        payload.SinkType,
+			ErrorComponent:  payload.ErrorComponent,
+			ErrorMessage:    payload.ErrorMessage,
+			ProgressSummary: payload.ProgressSummary,
+			ProgressDetail:  payload.ProgressDetail,
+			DashboardURL:    payload.DashboardURL,
+		},
+		State:     meta.FailureNotificationPending,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+}
+
+func jobFailureNotificationFromPersisted(job *Job, notification meta.FailureNotification) (jobFailureNotification, bool) {
+	if job == nil || job.Config == nil {
+		return jobFailureNotification{}, false
+	}
+	tg, ok := jobFailureTelegramConfig(job.Config)
+	if !ok {
+		return jobFailureNotification{}, false
+	}
+	payload := notification.Payload
+	return jobFailureNotification{
+		JobID:           payload.JobID,
+		JobName:         payload.JobName,
+		SinkType:        payload.SinkType,
+		ErrorComponent:  payload.ErrorComponent,
+		ErrorMessage:    payload.ErrorMessage,
+		ProgressSummary: payload.ProgressSummary,
+		ProgressDetail:  payload.ProgressDetail,
+		DashboardURL:    payload.DashboardURL,
+		Telegram:        tg,
+	}, true
 }
 
 func jobFailureTelegramConfig(cfg *config.JobConfig) (config.TelegramNotificationConfig, bool) {

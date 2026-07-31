@@ -549,7 +549,7 @@ func TestResumeWithoutCDCStateUsesSnapshotConcurrencyQueue(t *testing.T) {
 	_ = manager.Cancel("job-resume-queued")
 }
 
-func TestPreflightSnapshotOnlyCountResumeSkipsMatchedAndResetsMismatched(t *testing.T) {
+func TestPreflightSnapshotOnlyCountResumePerformsSafeFullReload(t *testing.T) {
 	cfg := newTestJobConfig("job-count-resume")
 	cfg.Mode = config.JobModeSnapshotOnly
 	cfg.Metadata = map[string]string{"snapshot_only_count_resume": "true"}
@@ -576,21 +576,24 @@ func TestPreflightSnapshotOnlyCountResumeSkipsMatchedAndResetsMismatched(t *test
 		t.Fatalf("preflight returned error: %v", err)
 	}
 
-	if got := len(src.skipped); got != 1 {
-		t.Fatalf("skipped tables = %d, want 1", got)
+	if got := len(src.skipped); got != 0 {
+		t.Fatalf("skipped tables = %d, want 0", got)
 	}
-	if got := tableRefKey(src.skipped[0]); got != "app.matched" {
-		t.Fatalf("skipped table = %q, want app.matched", got)
+	if got := len(sink.resetTargets); got != 2 {
+		t.Fatalf("reset targets = %d, want 2", got)
 	}
-	if got := len(sink.resetTargets); got != 1 {
-		t.Fatalf("reset targets = %d, want 1", got)
+	reset := map[string]bool{}
+	for _, target := range sink.resetTargets {
+		reset[target] = true
 	}
-	if got := sink.resetTargets[0]; got != "target.partial" {
-		t.Fatalf("reset target = %q, want target.partial", got)
+	for _, target := range []string{"target.matched", "target.partial"} {
+		if !reset[target] {
+			t.Fatalf("target %q was not reset: %#v", target, sink.resetTargets)
+		}
 	}
 }
 
-func TestPreflightInitialCountResumeSkipsMatchedAndResetsMismatched(t *testing.T) {
+func TestPreflightInitialCountResumePerformsSafeFullReload(t *testing.T) {
 	cfg := newTestJobConfig("job-initial-count-resume")
 	cfg.Mode = config.JobModeInitial
 	cfg.Metadata = map[string]string{"snapshot_only_count_resume": "true"}
@@ -617,17 +620,20 @@ func TestPreflightInitialCountResumeSkipsMatchedAndResetsMismatched(t *testing.T
 		t.Fatalf("preflight returned error: %v", err)
 	}
 
-	if got := len(src.skipped); got != 1 {
-		t.Fatalf("skipped tables = %d, want 1", got)
+	if got := len(src.skipped); got != 0 {
+		t.Fatalf("skipped tables = %d, want 0", got)
 	}
-	if got := tableRefKey(src.skipped[0]); got != "app.matched" {
-		t.Fatalf("skipped table = %q, want app.matched", got)
+	if got := len(sink.resetTargets); got != 2 {
+		t.Fatalf("reset targets = %d, want 2", got)
 	}
-	if got := len(sink.resetTargets); got != 1 {
-		t.Fatalf("reset targets = %d, want 1", got)
+	reset := map[string]bool{}
+	for _, target := range sink.resetTargets {
+		reset[target] = true
 	}
-	if got := sink.resetTargets[0]; got != "target.partial" {
-		t.Fatalf("reset target = %q, want target.partial", got)
+	for _, target := range []string{"target.matched", "target.partial"} {
+		if !reset[target] {
+			t.Fatalf("target %q was not reset: %#v", target, sink.resetTargets)
+		}
 	}
 }
 
@@ -668,19 +674,20 @@ func TestPreflightSnapshotOnlyCountResumeAggregatesFanInTargets(t *testing.T) {
 		t.Fatalf("preflight returned error: %v", err)
 	}
 
-	if got := len(src.skipped); got != 2 {
-		t.Fatalf("skipped tables = %d, want 2 (%#v)", got, src.skipped)
+	if got := len(src.skipped); got != 0 {
+		t.Fatalf("skipped tables = %d, want 0 (%#v)", got, src.skipped)
 	}
-	for _, table := range src.skipped {
-		if !strings.HasPrefix(table.Table, "tbl_reservasi_backup_") {
-			t.Fatalf("skipped table = %s, want only tbl_reservasi backups", tableRefKey(table))
+	if got := len(sink.resetTargets); got != 2 {
+		t.Fatalf("reset targets = %d, want 2 (%#v)", got, sink.resetTargets)
+	}
+	reset := map[string]bool{}
+	for _, target := range sink.resetTargets {
+		reset[target] = true
+	}
+	for _, target := range []string{"target.tbl_reservasi", "target.tbl_member"} {
+		if !reset[target] {
+			t.Fatalf("target %q was not reset: %#v", target, sink.resetTargets)
 		}
-	}
-	if got := len(sink.resetTargets); got != 1 {
-		t.Fatalf("reset targets = %d, want 1 (%#v)", got, sink.resetTargets)
-	}
-	if got := sink.resetTargets[0]; got != "target.tbl_member" {
-		t.Fatalf("reset target = %q, want target.tbl_member", got)
 	}
 }
 
@@ -762,13 +769,15 @@ func TestPreflightDoesNotSkipTablesWithoutPrimaryKeyOutsideSnapshotOnly(t *testi
 }
 
 type memoryJobStore struct {
-	mu   sync.Mutex
-	jobs map[string]meta.PersistedJob
+	mu            sync.Mutex
+	jobs          map[string]meta.PersistedJob
+	notifications map[string]meta.FailureNotification
 }
 
 func newMemoryJobStore() *memoryJobStore {
 	return &memoryJobStore{
-		jobs: make(map[string]meta.PersistedJob),
+		jobs:          make(map[string]meta.PersistedJob),
+		notifications: make(map[string]meta.FailureNotification),
 	}
 }
 
@@ -813,6 +822,11 @@ func (s *memoryJobStore) DeleteJob(_ context.Context, jobID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.jobs, jobID)
+	for incidentID, notification := range s.notifications {
+		if notification.JobID == jobID {
+			delete(s.notifications, incidentID)
+		}
+	}
 	return nil
 }
 
@@ -825,6 +839,37 @@ func (s *memoryJobStore) Get(jobID string) (meta.PersistedJob, bool) {
 	}
 	record.Config = cloneTestJobConfig(record.Config)
 	return record, true
+}
+
+func (s *memoryJobStore) SaveFailureNotification(_ context.Context, notification meta.FailureNotification) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if existing, ok := s.notifications[notification.IncidentID]; ok {
+		if existing.State == meta.FailureNotificationSent || existing.State == meta.FailureNotificationFailed {
+			return nil
+		}
+	}
+	s.notifications[notification.IncidentID] = notification
+	return nil
+}
+
+func (s *memoryJobStore) LoadPendingFailureNotifications(context.Context) ([]meta.FailureNotification, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]meta.FailureNotification, 0)
+	for _, notification := range s.notifications {
+		if notification.State == meta.FailureNotificationPending {
+			out = append(out, notification)
+		}
+	}
+	return out, nil
+}
+
+func (s *memoryJobStore) GetFailureNotification(incidentID string) (meta.FailureNotification, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	notification, ok := s.notifications[incidentID]
+	return notification, ok
 }
 
 func newTestRegistry() (*connector.Registry, <-chan config.JobMode) {

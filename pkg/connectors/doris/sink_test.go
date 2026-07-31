@@ -4,7 +4,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/gerinsp/rivus/pkg/config"
@@ -103,9 +107,137 @@ func TestWriteBatchPayloadUsesSourceBindings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("writeBatchPayload() returned error: %v", err)
 	}
-	want := "2022-01-01\n"
+	want := "2022-01-01" + fieldSep + "0\n"
 	if payload.String() != want {
 		t.Fatalf("payload = %q, want %q", payload.String(), want)
+	}
+}
+
+func TestWriteBatchPayloadAddsDeleteMarker(t *testing.T) {
+	var payload bytes.Buffer
+	err := (&Sink{}).writeBatchPayload(
+		&payload,
+		[]columnBinding{{Source: "id", Target: "id"}},
+		[]bool{false},
+		[]int{0},
+		[]model.Event{
+			{Type: model.EventTypeInsert, Data: map[string]interface{}{"id": 1}},
+			{Type: model.EventTypeUpdate, Data: map[string]interface{}{"id": 2}},
+			{Type: model.EventTypeDelete, Data: map[string]interface{}{"id": 3}},
+		},
+	)
+	if err != nil {
+		t.Fatalf("writeBatchPayload() returned error: %v", err)
+	}
+	want := strings.Join([]string{
+		"1" + fieldSep + "0",
+		"2" + fieldSep + "0",
+		"3" + fieldSep + "1",
+		"",
+	}, "\n")
+	if payload.String() != want {
+		t.Fatalf("payload = %q, want %q", payload.String(), want)
+	}
+}
+
+func TestSendBatchUsesMergeDeleteSemantics(t *testing.T) {
+	var gotHeaders http.Header
+	var gotBody string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeaders = r.Header.Clone()
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read request body: %v", err)
+		}
+		gotBody = string(body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{
+			"Status":"Success",
+			"Message":"OK",
+			"Label":"test-label",
+			"NumberTotalRows":2,
+			"NumberLoadedRows":2,
+			"NumberFilteredRows":0,
+			"NumberUnselectedRows":0
+		}`)
+	}))
+	defer server.Close()
+
+	targetKey := "target.orders"
+	sink := &Sink{
+		jobID:      "job-1",
+		httpClient: server.Client(),
+		retry:      config.RetryPolicy{MaxAttempts: 1},
+		cfg: config.DorisConfig{
+			HTTPHost: server.URL,
+		},
+		columnBindings: map[string][]columnBinding{
+			targetKey: {{Source: "id", Target: "id"}},
+		},
+		isString: map[string]map[string]bool{
+			targetKey: {"id": false},
+		},
+		maxLen: map[string]map[string]int{
+			targetKey: {"id": 0},
+		},
+	}
+	err := sink.sendBatch(context.Background(), "target", "orders", []model.Event{
+		{Type: model.EventTypeInsert, Data: map[string]interface{}{"id": 1}},
+		{Type: model.EventTypeDelete, Data: map[string]interface{}{"id": 2}},
+	})
+	if err != nil {
+		t.Fatalf("sendBatch() returned error: %v", err)
+	}
+	if got := gotHeaders.Get("merge_type"); got != "MERGE" {
+		t.Fatalf("merge_type = %q, want MERGE", got)
+	}
+	if got := gotHeaders.Get("delete"); got != dorisDeleteMarkerColumn+" = 1" {
+		t.Fatalf("delete = %q, want delete marker condition", got)
+	}
+	if got := gotHeaders.Get("columns"); !strings.Contains(got, dorisDeleteMarkerColumn) {
+		t.Fatalf("columns = %q, want synthetic delete marker", got)
+	}
+	wantBody := "1" + fieldSep + "0\n2" + fieldSep + "1\n"
+	if gotBody != wantBody {
+		t.Fatalf("body = %q, want %q", gotBody, wantBody)
+	}
+}
+
+func TestValidateStreamLoadCountsRejectsIncompleteSuccess(t *testing.T) {
+	tests := []struct {
+		name string
+		resp streamLoadResp
+	}{
+		{
+			name: "filtered",
+			resp: streamLoadResp{NumberTotalRows: 2, NumberLoadedRows: 1, NumberFilteredRows: 1},
+		},
+		{
+			name: "unselected",
+			resp: streamLoadResp{NumberTotalRows: 2, NumberLoadedRows: 1, NumberUnselectedRows: 1},
+		},
+		{
+			name: "missing total row",
+			resp: streamLoadResp{NumberTotalRows: 1, NumberLoadedRows: 1},
+		},
+		{
+			name: "missing loaded row",
+			resp: streamLoadResp{NumberTotalRows: 2, NumberLoadedRows: 1},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := validateStreamLoadCounts(tt.resp, 2); err == nil {
+				t.Fatal("validateStreamLoadCounts() returned nil")
+			}
+		})
+	}
+
+	if err := validateStreamLoadCounts(streamLoadResp{
+		NumberTotalRows:  2,
+		NumberLoadedRows: 2,
+	}, 2); err != nil {
+		t.Fatalf("complete response rejected: %v", err)
 	}
 }
 
@@ -487,5 +619,81 @@ func TestFailedStreamLoadDoesNotCommitCheckpoint(t *testing.T) {
 	}
 	if state.allBatchesEmpty() {
 		t.Fatal("failed batch was discarded")
+	}
+}
+
+func TestSnapshotBatchAcknowledgesOnlyAfterDorisFlush(t *testing.T) {
+	var loaded [][]model.Event
+	sink := &Sink{
+		jobID: "job-1",
+		cfg: config.DorisConfig{
+			BatchSize: 2,
+		},
+		sendBatchOverride: func(_ context.Context, db, table string, batch []model.Event) error {
+			if db != "source_db" || table != "orders" {
+				t.Fatalf("target = %s.%s, want source_db.orders", db, table)
+			}
+			loaded = append(loaded, append([]model.Event(nil), batch...))
+			return nil
+		},
+	}
+	state := newDorisRunState(sink)
+	ack := make(chan error, 1)
+
+	err := state.handleEvent(context.Background(), model.Event{
+		Type:   model.EventTypeSnapshotBatch,
+		Schema: "source_db",
+		Table:  "orders",
+		Rows: []map[string]interface{}{
+			{"id": 1},
+			{"id": 2},
+			{"id": 3},
+		},
+		Ack: ack,
+	})
+	if err != nil {
+		t.Fatalf("handle snapshot batch: %v", err)
+	}
+	if got, want := len(loaded), 2; got != want {
+		t.Fatalf("loaded chunks = %d, want %d", got, want)
+	}
+	for _, batch := range loaded {
+		for _, ev := range batch {
+			if ev.Type != model.EventTypeInsert || ev.Origin != model.EventOriginSnapshot {
+				t.Fatalf("snapshot row event = %#v", ev)
+			}
+		}
+	}
+	if ackErr, ok := <-ack; !ok || ackErr != nil {
+		t.Fatalf("ack = %v, open=%t, want nil acknowledgement", ackErr, ok)
+	}
+}
+
+func TestSnapshotBatchReturnsFlushFailureThroughAcknowledgement(t *testing.T) {
+	loadErr := errors.New("stream load failed")
+	sink := &Sink{
+		jobID: "job-1",
+		cfg: config.DorisConfig{
+			BatchSize: 2,
+		},
+		sendBatchOverride: func(context.Context, string, string, []model.Event) error {
+			return loadErr
+		},
+	}
+	state := newDorisRunState(sink)
+	ack := make(chan error, 1)
+
+	err := state.handleEvent(context.Background(), model.Event{
+		Type:   model.EventTypeSnapshotBatch,
+		Schema: "source_db",
+		Table:  "orders",
+		Rows:   []map[string]interface{}{{"id": 1}},
+		Ack:    ack,
+	})
+	if !errors.Is(err, loadErr) {
+		t.Fatalf("handle snapshot batch error = %v, want %v", err, loadErr)
+	}
+	if ackErr, ok := <-ack; !ok || !errors.Is(ackErr, loadErr) {
+		t.Fatalf("ack = %v, open=%t, want %v", ackErr, ok, loadErr)
 	}
 }

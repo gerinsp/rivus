@@ -95,7 +95,7 @@ func buildSourceGraphNode(cfg *config.JobConfig, id, sourceType string, status J
 		metrics = append(metrics, GraphMetric{Label: "CDC start", Value: graphBinlogPosition(progress.CDCStartFile, progress.CDCStartPos), Tone: "slate"})
 	}
 	if countResumeEnabled(cfg) {
-		metrics = append(metrics, GraphMetric{Label: "Resume strategy", Value: "COUNT(*) skip/reset", Tone: "blue"})
+		metrics = append(metrics, GraphMetric{Label: "Snapshot strategy", Value: "Fresh reset + cursor resume", Tone: "blue"})
 	}
 	if filterCount := sourceFilterCount(cfg, sourceType); filterCount > 0 {
 		metrics = append(metrics, GraphMetric{Label: "Filters", Value: graphFormatInt(int64(filterCount)), Tone: "slate"})

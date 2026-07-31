@@ -49,6 +49,7 @@ const (
 	retainedBatchCapLimit    = 1024
 	dorisMaxVarcharLen       = 65533
 	dorisMaxDecimalPrecision = 38
+	dorisDeleteMarkerColumn  = "__rivus_delete"
 )
 
 // =======================
@@ -478,13 +479,14 @@ func (s *Sink) applyDDL(ctx context.Context, targetDB, targetTable string, ev mo
 }
 
 type streamLoadResp struct {
-	Status             string `json:"Status"`
-	Message            string `json:"Message"`
-	Label              string `json:"Label"`
-	NumberTotalRows    int64  `json:"NumberTotalRows"`
-	NumberLoadedRows   int64  `json:"NumberLoadedRows"`
-	NumberFilteredRows int64  `json:"NumberFilteredRows"`
-	ErrorURL           string `json:"ErrorURL,omitempty"`
+	Status               string `json:"Status"`
+	Message              string `json:"Message"`
+	Label                string `json:"Label"`
+	NumberTotalRows      int64  `json:"NumberTotalRows"`
+	NumberLoadedRows     int64  `json:"NumberLoadedRows"`
+	NumberFilteredRows   int64  `json:"NumberFilteredRows"`
+	NumberUnselectedRows int64  `json:"NumberUnselectedRows"`
+	ErrorURL             string `json:"ErrorURL,omitempty"`
 }
 
 func sanitizeCell(v string) string {
@@ -710,6 +712,19 @@ func (s *Sink) writeBatchPayload(
 			}
 		}
 
+		if len(bindings) > 0 {
+			if err := bw.WriteByte(fieldSep[0]); err != nil {
+				return err
+			}
+		}
+		deleteMarker := "0"
+		if ev.Type == model.EventTypeDelete {
+			deleteMarker = "1"
+		}
+		if _, err := bw.WriteString(deleteMarker); err != nil {
+			return err
+		}
+
 		if err := bw.WriteByte('\n'); err != nil {
 			return err
 		}
@@ -791,7 +806,7 @@ func (s *Sink) sendBatch(ctx context.Context, targetDB, targetTable string, batc
 	isString, maxLen := s.getColumnRuntimeMeta(targetKey, cols)
 	url := fmt.Sprintf("%s/api/%s/%s/_stream_load", s.cfg.HTTPHost, targetDB, targetTable)
 	label := fmt.Sprintf("gosync_%d", time.Now().UnixNano())
-	columnsHeader := buildColumnsHeader(cols)
+	columnsHeader := buildColumnsHeader(append(append([]string(nil), cols...), dorisDeleteMarkerColumn))
 	var payload bytes.Buffer
 	if err := s.writeBatchPayload(&payload, bindings, isString, maxLen, batch); err != nil {
 		return err
@@ -821,6 +836,8 @@ func (s *Sink) sendBatch(ctx context.Context, targetDB, targetTable string, batc
 			req.Header.Set("label", label)
 			req.Header.Set("format", "csv")
 			req.Header.Set("columns", columnsHeader)
+			req.Header.Set("merge_type", "MERGE")
+			req.Header.Set("delete", dorisDeleteMarkerColumn+" = 1")
 			req.Header.Set("strict_mode", "true")
 			req.Header.Set("column_separator", headerFieldSep)
 			req.Header.Set("null_value", "\\N")
@@ -884,13 +901,15 @@ func (s *Sink) sendBatch(ctx context.Context, targetDB, targetTable string, batc
 			))
 		}
 
-		if r.NumberFilteredRows > 0 {
-			log.Printf("[doris][job %s] stream_load success filtered=%d total=%d label=%s target=%s.%s traces=%s msg=%s",
-				s.jobID, r.NumberFilteredRows, r.NumberTotalRows, r.Label, targetDB, targetTable, traces, r.Message)
-		} else {
-			log.Printf("[doris][job %s] stream_load success label=%s target=%s.%s total=%d loaded=%d traces=%s",
-				s.jobID, r.Label, targetDB, targetTable, r.NumberTotalRows, r.NumberLoadedRows, traces)
+		if err := validateStreamLoadCounts(r, len(batch)); err != nil {
+			return util.Permanent(fmt.Errorf(
+				"doris stream load incomplete: %w label=%s target=%s.%s error_url=%s body=%s",
+				err, r.Label, targetDB, targetTable, r.ErrorURL, string(body),
+			))
 		}
+
+		log.Printf("[doris][job %s] stream_load success label=%s target=%s.%s total=%d loaded=%d traces=%s",
+			s.jobID, r.Label, targetDB, targetTable, r.NumberTotalRows, r.NumberLoadedRows, traces)
 
 		return nil
 	})
@@ -898,6 +917,23 @@ func (s *Sink) sendBatch(ctx context.Context, targetDB, targetTable string, batc
 		return err
 	}
 	s.recordDorisSinkFlush(batch, dorisTableKey(targetDB, targetTable), time.Since(start))
+	return nil
+}
+
+func validateStreamLoadCounts(resp streamLoadResp, expectedRows int) error {
+	if resp.NumberFilteredRows != 0 {
+		return fmt.Errorf("filtered rows=%d", resp.NumberFilteredRows)
+	}
+	if resp.NumberUnselectedRows != 0 {
+		return fmt.Errorf("unselected rows=%d", resp.NumberUnselectedRows)
+	}
+	expected := int64(expectedRows)
+	if resp.NumberTotalRows != expected {
+		return fmt.Errorf("total rows=%d expected=%d", resp.NumberTotalRows, expected)
+	}
+	if resp.NumberLoadedRows != expected {
+		return fmt.Errorf("loaded rows=%d expected=%d", resp.NumberLoadedRows, expected)
+	}
 	return nil
 }
 
@@ -1008,6 +1044,9 @@ func (state *dorisRunState) handleEvent(procCtx context.Context, ev model.Event)
 		state.rememberOffset(ev.SourceOffset, eventTraceID(ev))
 		return nil
 	}
+	if ev.Type == model.EventTypeSnapshotBatch {
+		return state.handleSnapshotBatch(procCtx, ev)
+	}
 
 	targetDB, targetTable := state.sink.resolveTarget(ev.Schema, ev.Table)
 	targetKey := strings.ToLower(targetDB + "." + targetTable)
@@ -1041,6 +1080,52 @@ func (state *dorisRunState) handleEvent(procCtx context.Context, ev model.Event)
 		}
 	}
 	return nil
+}
+
+func (state *dorisRunState) handleSnapshotBatch(ctx context.Context, ev model.Event) (err error) {
+	if ev.Ack != nil {
+		defer func() {
+			ev.Ack <- err
+			close(ev.Ack)
+		}()
+	}
+	if len(ev.Rows) == 0 {
+		return nil
+	}
+
+	if err := state.flushAll(ctx); err != nil {
+		return err
+	}
+
+	targetDB, targetTable := state.sink.resolveTarget(ev.Schema, ev.Table)
+	batchSize := state.sink.cfg.BatchSize
+	if batchSize <= 0 {
+		batchSize = len(ev.Rows)
+	}
+	for start := 0; start < len(ev.Rows); start += batchSize {
+		end := start + batchSize
+		if end > len(ev.Rows) {
+			end = len(ev.Rows)
+		}
+
+		batch := make([]model.Event, 0, end-start)
+		for _, row := range ev.Rows[start:end] {
+			batch = append(batch, model.Event{
+				Type:      model.EventTypeInsert,
+				Schema:    ev.Schema,
+				Table:     ev.Table,
+				Data:      row,
+				Timestamp: ev.Timestamp,
+				Origin:    model.EventOriginSnapshot,
+			})
+		}
+		if err := state.sink.sendBatchForRun(ctx, targetDB, targetTable, batch); err != nil {
+			return err
+		}
+		log.Printf("[doris][job %s] snapshot batch flushed target=%s.%s rows=%d offset=%d",
+			state.sink.jobID, targetDB, targetTable, len(batch), ev.SnapshotStartOffset+int64(start))
+	}
+	return state.commitPendingOffset(ctx)
 }
 
 func (s *Sink) Run(ctx context.Context, in <-chan model.Event) error {

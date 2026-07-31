@@ -3,6 +3,7 @@ package mysql
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 
@@ -22,11 +23,20 @@ func Register(reg *connector.Registry) {
 		if err != nil {
 			return nil, err
 		}
-		inner.UseSnapshotBatchEvents(jctx.SinkType == "iceberg_native")
+		inner.UseSnapshotBatchEvents(sinkUsesAcknowledgedSnapshotBatches(jctx.SinkType))
 		inner.SetSinkType(jctx.SinkType)
 
 		return &sourceAdapter{inner: inner, mode: jctx.Mode, storedMode: jctx.StoredMode, tables: inner.tableRefs()}, nil
 	})
+}
+
+func sinkUsesAcknowledgedSnapshotBatches(sinkType string) bool {
+	switch strings.ToLower(strings.TrimSpace(sinkType)) {
+	case "doris", "iceberg_native":
+		return true
+	default:
+		return false
+	}
 }
 
 type sourceAdapter struct {
