@@ -131,11 +131,17 @@ func buildKeyFilter(schema *iceberglib.Schema, keys []map[string]interface{}) (i
 			if !ok {
 				return nil, fmt.Errorf("field %s not found in iceberg schema", col)
 			}
-			lit, err := literalForValue(field.Type, value)
-			if err != nil {
-				return nil, fmt.Errorf("field %s: %w", col, err)
+			ref := iceberglib.Reference(field.Name)
+			var pred iceberglib.BooleanExpression
+			if isMySQLZeroDateForType(field.Type, value) {
+				pred = iceberglib.IsNull(ref)
+			} else {
+				lit, err := literalForValue(field.Type, value)
+				if err != nil {
+					return nil, fmt.Errorf("field %s: %w", col, err)
+				}
+				pred = iceberglib.LiteralPredicate(iceberglib.OpEQ, ref, lit)
 			}
-			pred := iceberglib.LiteralPredicate(iceberglib.OpEQ, iceberglib.Reference(field.Name), lit)
 			if rowFilter == nil {
 				rowFilter = pred
 			} else {
@@ -542,6 +548,19 @@ func isMySQLZeroDateValue(value interface{}) bool {
 		return isMySQLZeroDateString(v)
 	case []byte:
 		return isMySQLZeroDateString(string(v))
+	default:
+		return false
+	}
+}
+
+func isMySQLZeroDateForType(typ iceberglib.Type, value interface{}) bool {
+	switch typ.(type) {
+	case iceberglib.DateType,
+		iceberglib.TimestampType,
+		iceberglib.TimestampTzType,
+		iceberglib.TimestampNsType,
+		iceberglib.TimestampTzNsType:
+		return isMySQLZeroDateValue(value)
 	default:
 		return false
 	}

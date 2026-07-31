@@ -2,7 +2,6 @@ package iceberg
 
 import (
 	"fmt"
-	"strconv"
 	"strings"
 
 	iceberglib "github.com/apache/iceberg-go"
@@ -10,6 +9,7 @@ import (
 
 	"github.com/gerinsp/rivus/pkg/config"
 	"github.com/gerinsp/rivus/pkg/model"
+	"github.com/gerinsp/rivus/pkg/schemachange"
 )
 
 type ddlActionKind string
@@ -24,10 +24,12 @@ const (
 const maxIcebergDecimalPrecision = 38
 
 type ddlAction struct {
-	Kind    ddlActionKind
-	OldName string
-	NewName string
-	Column  model.TableColumn
+	Kind        ddlActionKind
+	OldName     string
+	NewName     string
+	Column      model.TableColumn
+	Position    model.ColumnPosition
+	AfterColumn string
 }
 
 func copyTableSchema(in *model.TableSchema) *model.TableSchema {
@@ -192,7 +194,12 @@ func icebergTypeForColumn(col model.TableColumn) (iceberglib.Type, error) {
 	unsigned := strings.Contains(strings.ToLower(col.ColumnType), "unsigned")
 
 	switch dataType {
-	case "tinyint", "smallint", "mediumint":
+	case "tinyint":
+		if !unsigned && schemachange.MySQLColumnTypeHasWidth(col.ColumnType, "tinyint", 1) {
+			return iceberglib.PrimitiveTypes.Bool, nil
+		}
+		return iceberglib.PrimitiveTypes.Int32, nil
+	case "smallint", "mediumint", "year":
 		return iceberglib.PrimitiveTypes.Int32, nil
 	case "int", "integer":
 		if unsigned {
@@ -218,14 +225,21 @@ func icebergTypeForColumn(col model.TableColumn) (iceberglib.Type, error) {
 			scale = int(*col.NumScale)
 		}
 		if precision > maxIcebergDecimalPrecision {
-			precision = maxIcebergDecimalPrecision
+			// Match Flink CDC's lossless rule: MySQL supports decimal
+			// precision up to 65, while Iceberg is capped at 38.
+			return iceberglib.PrimitiveTypes.String, nil
 		}
 		if scale > precision {
 			scale = precision
 		}
 		return iceberglib.DecimalTypeOf(precision, scale), nil
-	case "bool", "boolean", "bit":
+	case "bool", "boolean":
 		return iceberglib.PrimitiveTypes.Bool, nil
+	case "bit":
+		if schemachange.MySQLColumnTypeHasWidth(col.ColumnType, "bit", 1) {
+			return iceberglib.PrimitiveTypes.Bool, nil
+		}
+		return iceberglib.PrimitiveTypes.Binary, nil
 	case "date":
 		return iceberglib.PrimitiveTypes.Date, nil
 	case "datetime", "timestamp":
@@ -240,162 +254,58 @@ func icebergTypeForColumn(col model.TableColumn) (iceberglib.Type, error) {
 }
 
 func parseDDLPlan(mysqlDDL string) ([]ddlAction, bool, error) {
-	ddl := strings.TrimSpace(strings.TrimSuffix(mysqlDDL, ";"))
-	if ddl == "" {
-		return nil, true, nil
+	changes, err := schemachange.ParseMySQLDDL(mysqlDDL)
+	if err != nil {
+		return nil, false, err
 	}
+	return ddlActionsFromSchemaChanges(changes)
+}
 
-	low := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(ddl, "\n", " "), "\t", " "))
-	switch {
-	case strings.HasPrefix(low, "create table"):
-		return nil, true, nil
-	case strings.HasPrefix(low, "rename table"):
-		return nil, true, nil
-	case strings.HasPrefix(low, "alter table"):
-		parts := strings.Fields(ddl)
-		if len(parts) < 4 {
-			return nil, false, fmt.Errorf("alter table too short")
-		}
-		actionsRaw := strings.Join(parts[3:], " ")
-		partsRaw := splitTopLevelComma(actionsRaw)
-		out := make([]ddlAction, 0, len(partsRaw))
-		for _, part := range partsRaw {
-			translated, err := translateAlterAction(part)
-			if err != nil {
-				return nil, false, err
+func ddlActionsFromSchemaChanges(changes []model.SchemaChange) ([]ddlAction, bool, error) {
+	out := make([]ddlAction, 0, len(changes))
+	for _, change := range changes {
+		switch change.Type {
+		case model.SchemaChangeAddColumn:
+			if change.Column == nil {
+				return nil, false, fmt.Errorf("add-column schema change has no column")
 			}
-			out = append(out, translated...)
+			out = append(out, ddlAction{
+				Kind:        ddlActionAddColumn,
+				Column:      *change.Column,
+				Position:    change.Position,
+				AfterColumn: change.AfterColumn,
+			})
+		case model.SchemaChangeAlterColumnType:
+			if change.Column == nil {
+				return nil, false, fmt.Errorf("alter-column schema change has no column")
+			}
+			out = append(out, ddlAction{
+				Kind:        ddlActionUpdateColumn,
+				Column:      *change.Column,
+				Position:    change.Position,
+				AfterColumn: change.AfterColumn,
+			})
+		case model.SchemaChangeDropColumn:
+			out = append(out, ddlAction{Kind: ddlActionDropColumn, OldName: change.OldName})
+		case model.SchemaChangeRenameColumn:
+			out = append(out, ddlAction{
+				Kind:    ddlActionRenameColumn,
+				OldName: change.OldName,
+				NewName: change.NewName,
+			})
+		case model.SchemaChangeCreateTable,
+			model.SchemaChangeDropTable,
+			model.SchemaChangeTruncateTable:
+			// Destructive table-level changes follow Flink's lenient behavior
+			// and are not applied implicitly by the Iceberg metadata applier.
 		}
-		if len(out) == 0 {
-			return nil, true, nil
-		}
-		return out, false, nil
-	default:
-		return nil, false, fmt.Errorf("unsupported DDL: %s", ddl)
 	}
+	return out, len(out) == 0, nil
 }
 
 func isCreateTableDDL(ddl string) bool {
 	low := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(ddl, "\n", " "), "\t", " "))
 	return strings.HasPrefix(strings.TrimSpace(low), "create table")
-}
-
-func translateAlterAction(action string) ([]ddlAction, error) {
-	trimmed := strings.TrimSpace(action)
-	low := strings.ToLower(trimmed)
-
-	switch {
-	case strings.HasPrefix(low, "add ") || strings.HasPrefix(low, "add column "):
-		act := strings.TrimSpace(trimmed)
-		if strings.HasPrefix(strings.ToLower(act), "add column ") {
-			act = strings.TrimSpace(act[len("add column "):])
-		} else {
-			act = strings.TrimSpace(act[len("add "):])
-			if strings.HasPrefix(strings.ToLower(act), "column ") {
-				act = strings.TrimSpace(act[len("column "):])
-			}
-		}
-		name, rest, ok := splitFirstIdent(act)
-		if !ok {
-			return nil, fmt.Errorf("cannot parse add column name")
-		}
-		colType, notNull := parseMySQLColumnTypeAndNullability(rest)
-		if colType == "" {
-			return nil, fmt.Errorf("cannot parse add column type")
-		}
-		return []ddlAction{{
-			Kind:   ddlActionAddColumn,
-			Column: mysqlDDLColumn(name, colType, notNull),
-		}}, nil
-	case strings.HasPrefix(low, "drop ") || strings.HasPrefix(low, "drop column "):
-		act := strings.TrimSpace(trimmed)
-		if strings.HasPrefix(strings.ToLower(act), "drop column ") {
-			act = strings.TrimSpace(act[len("drop column "):])
-		} else {
-			act = strings.TrimSpace(act[len("drop "):])
-			if strings.HasPrefix(strings.ToLower(act), "column ") {
-				act = strings.TrimSpace(act[len("column "):])
-			}
-		}
-		name, _, ok := splitFirstIdent(act)
-		if !ok {
-			return nil, fmt.Errorf("cannot parse drop column name")
-		}
-		return []ddlAction{{Kind: ddlActionDropColumn, OldName: name}}, nil
-	case strings.HasPrefix(low, "modify ") || strings.HasPrefix(low, "modify column "):
-		act := strings.TrimSpace(trimmed)
-		if strings.HasPrefix(strings.ToLower(act), "modify column ") {
-			act = strings.TrimSpace(act[len("modify column "):])
-		} else {
-			act = strings.TrimSpace(act[len("modify "):])
-			if strings.HasPrefix(strings.ToLower(act), "column ") {
-				act = strings.TrimSpace(act[len("column "):])
-			}
-		}
-		name, rest, ok := splitFirstIdent(act)
-		if !ok {
-			return nil, fmt.Errorf("cannot parse modify column name")
-		}
-		colType, notNull := parseMySQLColumnTypeAndNullability(rest)
-		if colType == "" {
-			return nil, fmt.Errorf("cannot parse modify column type")
-		}
-		return []ddlAction{{
-			Kind:   ddlActionUpdateColumn,
-			Column: mysqlDDLColumn(name, colType, notNull),
-		}}, nil
-	case strings.HasPrefix(low, "change ") || strings.HasPrefix(low, "change column "):
-		act := strings.TrimSpace(trimmed)
-		if strings.HasPrefix(strings.ToLower(act), "change column ") {
-			act = strings.TrimSpace(act[len("change column "):])
-		} else {
-			act = strings.TrimSpace(act[len("change "):])
-			if strings.HasPrefix(strings.ToLower(act), "column ") {
-				act = strings.TrimSpace(act[len("column "):])
-			}
-		}
-		oldName, rest, ok := splitFirstIdent(act)
-		if !ok {
-			return nil, fmt.Errorf("cannot parse change old name")
-		}
-		newName, rest, ok := splitFirstIdent(rest)
-		if !ok {
-			return nil, fmt.Errorf("cannot parse change new name")
-		}
-		colType, notNull := parseMySQLColumnTypeAndNullability(rest)
-		if colType == "" {
-			return nil, fmt.Errorf("cannot parse change column type")
-		}
-		actions := make([]ddlAction, 0, 2)
-		if !strings.EqualFold(oldName, newName) {
-			actions = append(actions, ddlAction{Kind: ddlActionRenameColumn, OldName: oldName, NewName: newName})
-		}
-		actions = append(actions, ddlAction{
-			Kind:   ddlActionUpdateColumn,
-			Column: mysqlDDLColumn(newName, colType, notNull),
-		})
-		return actions, nil
-	case strings.HasPrefix(low, "rename column "):
-		act := strings.TrimSpace(trimmed[len("rename column "):])
-		oldName, rest, ok := splitFirstIdent(act)
-		if !ok {
-			return nil, fmt.Errorf("cannot parse rename column old name")
-		}
-		rest = strings.TrimSpace(rest)
-		restLow := strings.ToLower(rest)
-		if strings.HasPrefix(restLow, "to ") {
-			rest = strings.TrimSpace(rest[len("to "):])
-		}
-		newName, _, ok := splitFirstIdent(rest)
-		if !ok {
-			return nil, fmt.Errorf("cannot parse rename column new name")
-		}
-		return []ddlAction{{Kind: ddlActionRenameColumn, OldName: oldName, NewName: newName}}, nil
-	case strings.HasPrefix(low, "rename to ") || strings.HasPrefix(low, "rename "):
-		return nil, nil
-	default:
-		return nil, fmt.Errorf("unsupported alter action: %s", trimmed)
-	}
 }
 
 func applyDDLToSourceSchema(schema *model.TableSchema, actions []ddlAction) *model.TableSchema {
@@ -408,6 +318,7 @@ func applyDDLToSourceSchema(schema *model.TableSchema, actions []ddlAction) *mod
 		switch action.Kind {
 		case ddlActionAddColumn:
 			out.Columns = append(out.Columns, action.Column)
+			moveSourceSchemaColumn(out, action.Column.Name, action.Position, action.AfterColumn)
 		case ddlActionDropColumn:
 			filtered := out.Columns[:0]
 			for _, col := range out.Columns {
@@ -432,133 +343,41 @@ func applyDDLToSourceSchema(schema *model.TableSchema, actions []ddlAction) *mod
 					break
 				}
 			}
+			moveSourceSchemaColumn(out, action.Column.Name, action.Position, action.AfterColumn)
 		}
 	}
 
 	return out
 }
 
-func splitTopLevelComma(s string) []string {
-	out := make([]string, 0)
-	start := 0
-	depth := 0
-	for i, r := range s {
-		switch r {
-		case '(':
-			depth++
-		case ')':
-			if depth > 0 {
-				depth--
-			}
-		case ',':
-			if depth == 0 {
-				out = append(out, s[start:i])
-				start = i + 1
-			}
+func moveSourceSchemaColumn(schema *model.TableSchema, name string, position model.ColumnPosition, after string) {
+	if schema == nil || position == "" || position == model.ColumnPositionLast {
+		return
+	}
+	current := -1
+	for idx := range schema.Columns {
+		if strings.EqualFold(schema.Columns[idx].Name, name) {
+			current = idx
+			break
 		}
 	}
-	out = append(out, s[start:])
-	return out
-}
-
-func splitFirstIdent(s string) (string, string, bool) {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return "", "", false
+	if current < 0 {
+		return
 	}
 
-	if strings.HasPrefix(s, "`") {
-		end := strings.Index(s[1:], "`")
-		if end < 0 {
-			return "", "", false
-		}
-		name := s[1 : 1+end]
-		return name, strings.TrimSpace(s[1+end+1:]), true
-	}
-
-	for i, r := range s {
-		switch r {
-		case ' ', '\t', '\n', '\r':
-			return s[:i], strings.TrimSpace(s[i:]), true
-		}
-	}
-
-	return s, "", true
-}
-
-func parseMySQLColumnTypeAndNullability(rest string) (string, bool) {
-	rest = strings.TrimSpace(rest)
-	if rest == "" {
-		return "", false
-	}
-	low := strings.ToLower(rest)
-	notNull := strings.Contains(low, " not null")
-
-	depth := 0
-	for i, r := range rest {
-		switch r {
-		case '(':
-			depth++
-		case ')':
-			if depth > 0 {
-				depth--
-			}
-		case ' ', '\t', '\n', '\r':
-			if depth == 0 {
-				return strings.TrimSpace(rest[:i]), notNull
+	column := schema.Columns[current]
+	schema.Columns = append(schema.Columns[:current], schema.Columns[current+1:]...)
+	target := 0
+	if position == model.ColumnPositionAfter {
+		target = len(schema.Columns)
+		for idx := range schema.Columns {
+			if strings.EqualFold(schema.Columns[idx].Name, after) {
+				target = idx + 1
+				break
 			}
 		}
 	}
-
-	return strings.TrimSpace(rest), notNull
-}
-
-func mysqlDDLColumn(name, columnType string, notNull bool) model.TableColumn {
-	base := strings.ToLower(strings.TrimSpace(columnType))
-	base = strings.ReplaceAll(base, "unsigned", "")
-	base = strings.ReplaceAll(base, "zerofill", "")
-	base = strings.TrimSpace(base)
-
-	col := model.TableColumn{
-		Name:       name,
-		DataType:   baseTypeName(base),
-		ColumnType: columnType,
-		IsNullable: !notNull,
-	}
-
-	if lParen := strings.IndexByte(base, '('); lParen >= 0 {
-		if rParen := strings.IndexByte(base, ')'); rParen > lParen+1 {
-			args := strings.Split(base[lParen+1:rParen], ",")
-			switch col.DataType {
-			case "char", "varchar":
-				if n, err := strconv.ParseInt(strings.TrimSpace(args[0]), 10, 64); err == nil {
-					col.CharMaxLen = &n
-				}
-			case "decimal", "numeric":
-				if len(args) >= 1 {
-					if n, err := strconv.ParseInt(strings.TrimSpace(args[0]), 10, 64); err == nil {
-						col.NumPrec = &n
-					}
-				}
-				if len(args) >= 2 {
-					if n, err := strconv.ParseInt(strings.TrimSpace(args[1]), 10, 64); err == nil {
-						col.NumScale = &n
-					}
-				}
-			}
-		}
-	}
-
-	return col
-}
-
-func baseTypeName(columnType string) string {
-	columnType = strings.TrimSpace(columnType)
-	if idx := strings.IndexByte(columnType, '('); idx >= 0 {
-		columnType = columnType[:idx]
-	}
-	if idx := strings.IndexByte(columnType, ' '); idx >= 0 {
-		columnType = columnType[:idx]
-	}
-	return strings.ToLower(strings.TrimSpace(columnType))
+	schema.Columns = append(schema.Columns, model.TableColumn{})
+	copy(schema.Columns[target+1:], schema.Columns[target:])
+	schema.Columns[target] = column
 }

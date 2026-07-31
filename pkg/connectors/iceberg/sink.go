@@ -30,6 +30,7 @@ import (
 	"github.com/gerinsp/rivus/pkg/meta"
 	"github.com/gerinsp/rivus/pkg/model"
 	"github.com/gerinsp/rivus/pkg/observability"
+	"github.com/gerinsp/rivus/pkg/schemachange"
 	"github.com/gerinsp/rivus/pkg/util"
 )
 
@@ -936,11 +937,16 @@ func (s *Sink) keyDeleteTrinoSQL(state *tableState, keys []map[string]interface{
 			if !ok {
 				return "", fmt.Errorf("field %s not found in iceberg schema", col)
 			}
+			quotedField := quoteTrinoIdentifier(field.Name)
+			if isMySQLZeroDateForType(field.Type, value) {
+				parts = append(parts, quotedField+" IS NULL")
+				continue
+			}
 			lit, err := trinoLiteralForAny(field.Type, value)
 			if err != nil {
 				return "", fmt.Errorf("field %s: %w", field.Name, err)
 			}
-			parts = append(parts, fmt.Sprintf("%s = %s", quoteTrinoIdentifier(field.Name), lit))
+			parts = append(parts, fmt.Sprintf("%s = %s", quotedField, lit))
 		}
 		if len(parts) == 0 {
 			return "", fmt.Errorf("empty delete key for %s", state.sourceKey)
@@ -2893,7 +2899,15 @@ func (s *Sink) applyDDL(ctx context.Context, state *tableState, ev model.Event) 
 		return nil
 	}
 
-	plan, skip, err := parseDDLPlan(ddl)
+	changes := ev.SchemaChanges
+	var err error
+	if changes == nil {
+		changes, err = schemachange.ParseMySQLDDL(ddl)
+		if err != nil {
+			return util.Permanent(err)
+		}
+	}
+	plan, skip, err := ddlActionsFromSchemaChanges(changes)
 	if err != nil {
 		return util.Permanent(err)
 	}
@@ -2958,6 +2972,7 @@ func applyDDLAction(updater *icetable.UpdateSchema, action ddlAction, cfg config
 		}
 		required := false
 		updater.AddColumn([]string{action.Column.Name}, typ, "", required, nil)
+		moveIcebergDDLColumn(updater, action)
 		return nil
 	case ddlActionDropColumn:
 		if !cfg.AllowDropColumn {
@@ -2983,9 +2998,21 @@ func applyDDLAction(updater *icetable.UpdateSchema, action ddlAction, cfg config
 			update.Required = iceberglib.Optional[bool]{Val: !action.Column.IsNullable, Valid: true}
 		}
 		updater.UpdateColumn([]string{action.Column.Name}, update)
+		moveIcebergDDLColumn(updater, action)
 		return nil
 	default:
 		return fmt.Errorf("unsupported ddl action %q", action.Kind)
+	}
+}
+
+func moveIcebergDDLColumn(updater *icetable.UpdateSchema, action ddlAction) {
+	switch action.Position {
+	case model.ColumnPositionFirst:
+		updater.MoveFirst([]string{action.Column.Name})
+	case model.ColumnPositionAfter:
+		if strings.TrimSpace(action.AfterColumn) != "" {
+			updater.MoveAfter([]string{action.Column.Name}, []string{action.AfterColumn})
+		}
 	}
 }
 

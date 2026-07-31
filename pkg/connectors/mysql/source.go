@@ -25,6 +25,7 @@ import (
 	"github.com/gerinsp/rivus/pkg/meta"
 	"github.com/gerinsp/rivus/pkg/model"
 	"github.com/gerinsp/rivus/pkg/observability"
+	"github.com/gerinsp/rivus/pkg/schemachange"
 	"github.com/gerinsp/rivus/pkg/util"
 )
 
@@ -798,13 +799,19 @@ func (h *cdcHandler) OnDDL(header *replication.EventHeader, nextPos gomysql.Posi
 		return nil
 	}
 
+	schemaChanges, err := schemachange.ParseMySQLDDL(stmt)
+	if err != nil {
+		return fmt.Errorf("parse schema change for %s: %w", key, err)
+	}
+
 	ddlEvent := model.Event{
-		Type:      model.EventTypeDDL,
-		Schema:    db,
-		Table:     tbl,
-		DDL:       stmt,
-		Timestamp: time.Now(),
-		Origin:    model.EventOriginCDC,
+		Type:          model.EventTypeDDL,
+		Schema:        db,
+		Table:         tbl,
+		DDL:           stmt,
+		Timestamp:     time.Now(),
+		Origin:        model.EventOriginCDC,
+		SchemaChanges: schemaChanges,
 	}
 	if isCreateTableDDL(stmt) && h.schemaFetcher != nil {
 		schema, err := h.schemaFetcher(h.ctx, db, tbl)

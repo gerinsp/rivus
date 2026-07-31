@@ -419,7 +419,7 @@ func TestCheckpointDoesNotForceFlushPendingCDCEvents(t *testing.T) {
 	}
 }
 
-func TestIcebergTypeForColumnClampsDecimalPrecision(t *testing.T) {
+func TestIcebergTypeForColumnUsesStringForOversizedDecimal(t *testing.T) {
 	precision := int64(65)
 	scale := int64(30)
 	typ, err := icebergTypeForColumn(model.TableColumn{
@@ -431,16 +431,54 @@ func TestIcebergTypeForColumnClampsDecimalPrecision(t *testing.T) {
 	if err != nil {
 		t.Fatalf("icebergTypeForColumn returned error: %v", err)
 	}
+	if !typ.Equals(iceberglib.PrimitiveTypes.String) {
+		t.Fatalf("type = %s, want string", typ)
+	}
+}
 
-	dec, ok := typ.(iceberglib.DecimalType)
-	if !ok {
-		t.Fatalf("type = %T, want iceberg.DecimalType", typ)
+func TestIcebergTypeForColumnFollowsFlinkBooleanAndYearMapping(t *testing.T) {
+	tests := []struct {
+		name string
+		col  model.TableColumn
+		want iceberglib.Type
+	}{
+		{
+			name: "tinyint one",
+			col:  model.TableColumn{DataType: "tinyint", ColumnType: "tinyint(1)"},
+			want: iceberglib.PrimitiveTypes.Bool,
+		},
+		{
+			name: "unsigned tinyint one widens",
+			col:  model.TableColumn{DataType: "tinyint", ColumnType: "tinyint(1) unsigned"},
+			want: iceberglib.PrimitiveTypes.Int32,
+		},
+		{
+			name: "bit one",
+			col:  model.TableColumn{DataType: "bit", ColumnType: "bit(1)"},
+			want: iceberglib.PrimitiveTypes.Bool,
+		},
+		{
+			name: "wide bit",
+			col:  model.TableColumn{DataType: "bit", ColumnType: "bit(8)"},
+			want: iceberglib.PrimitiveTypes.Binary,
+		},
+		{
+			name: "year",
+			col:  model.TableColumn{DataType: "year", ColumnType: "year"},
+			want: iceberglib.PrimitiveTypes.Int32,
+		},
 	}
-	if got, want := dec.Precision(), maxIcebergDecimalPrecision; got != want {
-		t.Fatalf("precision = %d, want %d", got, want)
-	}
-	if got, want := dec.Scale(), 30; got != want {
-		t.Fatalf("scale = %d, want %d", got, want)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := icebergTypeForColumn(tt.col)
+			if err != nil {
+				t.Fatalf("icebergTypeForColumn returned error: %v", err)
+			}
+			if !got.Equals(tt.want) {
+				t.Fatalf("type = %s, want %s", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -628,6 +666,22 @@ func TestLiteralForTimestampValueAcceptsMySQLDateTime(t *testing.T) {
 	}
 }
 
+func TestBuildKeyFilterConvertsMySQLZeroDateToNullPredicate(t *testing.T) {
+	schema := iceberglib.NewSchema(1,
+		iceberglib.NestedField{ID: 1, Name: "TglBerangkat", Type: iceberglib.PrimitiveTypes.Date},
+	)
+
+	filter, err := buildKeyFilter(schema, []map[string]interface{}{
+		{"TglBerangkat": "0000-00-00"},
+	})
+	if err != nil {
+		t.Fatalf("buildKeyFilter returned error: %v", err)
+	}
+	if got := filter.String(); !strings.Contains(got, "IsNull") {
+		t.Fatalf("filter = %q, want an IsNull predicate", got)
+	}
+}
+
 func TestTrinoLiteralForTimestampValueAcceptsMySQLDateTime(t *testing.T) {
 	lit, err := trinoLiteralForValue(iceberglib.PrimitiveTypes.Timestamp, "2026-04-01 00:00:00")
 	if err != nil {
@@ -707,6 +761,34 @@ func TestKeyDeleteTrinoSQLBuildsCompositePredicate(t *testing.T) {
 		t.Fatalf("keyDeleteTrinoSQL returned error: %v", err)
 	}
 	want := `DELETE FROM "generic"."aragon_bronze"."tbl_biaya_op" WHERE ("kode" = 'A''01' AND "seq" = 7) OR ("kode" = 'B02' AND "seq" = 8)`
+	if query != want {
+		t.Fatalf("query = %q, want %q", query, want)
+	}
+}
+
+func TestKeyDeleteTrinoSQLConvertsMySQLZeroDateToNullPredicate(t *testing.T) {
+	schema := iceberglib.NewSchema(1,
+		iceberglib.NestedField{ID: 1, Name: "TglBerangkat", Type: iceberglib.PrimitiveTypes.Date},
+	)
+	meta, err := table.NewMetadata(schema, iceberglib.UnpartitionedSpec, table.UnsortedSortOrder, "s3://warehouse-generic/bronze/orders", iceberglib.Properties{})
+	if err != nil {
+		t.Fatalf("NewMetadata returned error: %v", err)
+	}
+	sink := &Sink{cfg: normalizeIcebergConfig(config.IcebergConfig{Warehouse: "generic"})}
+	state := &tableState{
+		sourceKey:       "source.orders",
+		targetNamespace: "bronze",
+		targetTable:     "orders",
+		table:           table.New(table.Identifier{"generic", "bronze", "orders"}, meta, "", nil, nil),
+	}
+
+	query, err := sink.keyDeleteTrinoSQL(state, []map[string]interface{}{
+		{"TglBerangkat": "0000-00-00"},
+	})
+	if err != nil {
+		t.Fatalf("keyDeleteTrinoSQL returned error: %v", err)
+	}
+	want := `DELETE FROM "generic"."bronze"."orders" WHERE ("TglBerangkat" IS NULL)`
 	if query != want {
 		t.Fatalf("query = %q, want %q", query, want)
 	}
@@ -1325,6 +1407,30 @@ func TestEqualityDeletePartitionDataDayTransform(t *testing.T) {
 	}
 }
 
+func TestEqualityDeletePartitionDataConvertsMySQLZeroDateToNull(t *testing.T) {
+	schema := iceberglib.NewSchema(1,
+		iceberglib.NestedField{ID: 1, Name: "id", Type: iceberglib.PrimitiveTypes.Int64, Required: true},
+		iceberglib.NestedField{ID: 2, Name: "TglBerangkat", Type: iceberglib.PrimitiveTypes.Date},
+	)
+	spec := iceberglib.NewPartitionSpecID(1, iceberglib.PartitionField{
+		SourceIDs: []int{2},
+		FieldID:   1000,
+		Name:      "tgl_berangkat_day",
+		Transform: iceberglib.DayTransform{},
+	})
+
+	partitionData, err := equalityDeletePartitionData(schema, spec, map[string]interface{}{
+		"id":           int64(10),
+		"TglBerangkat": "0000-00-00",
+	})
+	if err != nil {
+		t.Fatalf("equalityDeletePartitionData returned error: %v", err)
+	}
+	if got := partitionData[1000]; got != nil {
+		t.Fatalf("partition value = %v, want nil", got)
+	}
+}
+
 func TestPartitionDeleteGroupsUsesEveryPartitionMoveForSameKey(t *testing.T) {
 	schema := iceberglib.NewSchema(1,
 		iceberglib.NestedField{ID: 1, Name: "id", Type: iceberglib.PrimitiveTypes.Int64, Required: true},
@@ -1604,6 +1710,27 @@ func TestParseDDLPlanChangeColumn(t *testing.T) {
 	}
 	if actions[1].Column.IsNullable {
 		t.Fatalf("updated column should be not null")
+	}
+}
+
+func TestParseDDLPlanDoesNotSplitCommaInsideQuotedDefault(t *testing.T) {
+	actions, skip, err := parseDDLPlan(
+		"ALTER TABLE `orders` ADD COLUMN `note` varchar(64) DEFAULT 'x,ADD COLUMN phantom', ADD COLUMN `TglBerangkat` date",
+	)
+	if err != nil {
+		t.Fatalf("parseDDLPlan returned error: %v", err)
+	}
+	if skip {
+		t.Fatal("parseDDLPlan unexpectedly skipped ddl")
+	}
+	if got, want := len(actions), 2; got != want {
+		t.Fatalf("len(actions) = %d, want %d", got, want)
+	}
+	if got, want := actions[0].Column.Name, "note"; got != want {
+		t.Fatalf("first column = %q, want %q", got, want)
+	}
+	if got, want := actions[1].Column.Name, "TglBerangkat"; got != want {
+		t.Fatalf("second column = %q, want %q", got, want)
 	}
 }
 

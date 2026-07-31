@@ -297,7 +297,7 @@ func equalityDeletePartitionData(schema *iceberglib.Schema, spec iceberglib.Part
 }
 
 func applyPartitionTransform(transform iceberglib.Transform, sourceType iceberglib.Type, value interface{}) (any, error) {
-	if value == nil {
+	if value == nil || isMySQLZeroDateForType(sourceType, value) {
 		return nil, nil
 	}
 	lit, err := partitionSourceLiteral(sourceType, value)

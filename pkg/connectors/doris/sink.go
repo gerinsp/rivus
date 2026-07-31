@@ -26,6 +26,7 @@ import (
 	"github.com/gerinsp/rivus/pkg/meta"
 	"github.com/gerinsp/rivus/pkg/model"
 	"github.com/gerinsp/rivus/pkg/observability"
+	"github.com/gerinsp/rivus/pkg/schemachange"
 	"github.com/gerinsp/rivus/pkg/util"
 )
 
@@ -199,14 +200,20 @@ func decimalTypeForDoris(precision, scale int64) string {
 
 func mapMySQLColumnToDoris(c model.TableColumn, keyColumn bool) string {
 	t := strings.ToLower(strings.TrimSpace(c.DataType))
+	unsigned := strings.Contains(strings.ToLower(c.ColumnType), "unsigned")
 
 	switch t {
 	// integer family
-	case "int", "bigint", "smallint", "tinyint", "mediumint":
+	case "tinyint":
+		if !unsigned && schemachange.MySQLColumnTypeHasWidth(c.ColumnType, "tinyint", 1) {
+			return "BOOLEAN"
+		}
+		return "BIGINT"
+	case "int", "bigint", "smallint", "mediumint", "year":
 		return "BIGINT"
 
 	// float/double
-	case "float", "double":
+	case "float", "double", "real":
 		if keyColumn {
 			return "DECIMAL(27,9)"
 		}
@@ -228,6 +235,16 @@ func mapMySQLColumnToDoris(c model.TableColumn, keyColumn bool) string {
 		return "DATETIME"
 	case "date":
 		return "DATE"
+	case "bool", "boolean":
+		return "BOOLEAN"
+	case "bit":
+		if schemachange.MySQLColumnTypeHasWidth(c.ColumnType, "bit", 1) {
+			return "BOOLEAN"
+		}
+		if keyColumn {
+			return keyCompatibleStringType(c)
+		}
+		return "STRING"
 
 	// char/varchar: ikut length
 	case "char", "varchar":
@@ -429,10 +446,18 @@ func (s *Sink) ResetTargetTable(ctx context.Context, targetDB, targetTable strin
 	})
 }
 
-func (s *Sink) applyDDL(ctx context.Context, targetDB, targetTable, mysqlDDL string) error {
-	stmts, ok, reason := s.translateMySQLDDLToDoris(mysqlDDL, targetDB, targetTable)
+func (s *Sink) applyDDL(ctx context.Context, targetDB, targetTable string, ev model.Event) error {
+	changes := ev.SchemaChanges
+	if changes == nil {
+		var err error
+		changes, err = schemachange.ParseMySQLDDL(ev.DDL)
+		if err != nil {
+			return err
+		}
+	}
+	stmts, ok, reason := s.translateSchemaChangesToDoris(changes, targetDB, targetTable)
 	if !ok {
-		log.Printf("[doris] skip DDL: %s | reason=%s", mysqlDDL, reason)
+		log.Printf("[doris] skip DDL: %s | reason=%s", ev.DDL, reason)
 		return nil
 	}
 
@@ -991,7 +1016,7 @@ func (state *dorisRunState) handleEvent(procCtx context.Context, ev model.Event)
 		if err := state.flushAll(procCtx); err != nil {
 			return err
 		}
-		if err := state.sink.applyDDL(procCtx, targetDB, targetTable, ev.DDL); err != nil {
+		if err := state.sink.applyDDL(procCtx, targetDB, targetTable, ev); err != nil {
 			log.Printf("[doris] DDL error: %v", err)
 			return err
 		}

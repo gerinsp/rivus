@@ -109,6 +109,42 @@ func TestWriteBatchPayloadUsesSourceBindings(t *testing.T) {
 	}
 }
 
+func TestTranslateMySQLDDLToDorisUsesStructuredParser(t *testing.T) {
+	sink := &Sink{}
+	stmts, ok, reason := sink.translateMySQLDDLToDoris(
+		"ALTER TABLE `orders` ADD COLUMN `note` varchar(64) DEFAULT 'x,ADD COLUMN phantom', ADD COLUMN `TglBerangkat` date",
+		"bronze",
+		"orders",
+	)
+	if !ok {
+		t.Fatalf("translation failed: %s", reason)
+	}
+	if got, want := len(stmts), 2; got != want {
+		t.Fatalf("statement count = %d, want %d", got, want)
+	}
+	if got, want := stmts[0], "ALTER TABLE `bronze`.`orders` ADD COLUMN `note` VARCHAR(64) NULL"; got != want {
+		t.Fatalf("first statement = %q, want %q", got, want)
+	}
+	if got, want := stmts[1], "ALTER TABLE `bronze`.`orders` ADD COLUMN `TglBerangkat` DATE NULL"; got != want {
+		t.Fatalf("second statement = %q, want %q", got, want)
+	}
+}
+
+func TestTranslateMySQLDDLToDorisIgnoresIndexChanges(t *testing.T) {
+	sink := &Sink{}
+	stmts, ok, reason := sink.translateMySQLDDLToDoris(
+		"ALTER TABLE `orders` ADD INDEX `idx_departure` (`TglBerangkat`)",
+		"bronze",
+		"orders",
+	)
+	if ok {
+		t.Fatalf("translation unexpectedly succeeded with statements %#v", stmts)
+	}
+	if got, want := reason, "no row-schema changes"; got != want {
+		t.Fatalf("reason = %q, want %q", got, want)
+	}
+}
+
 func TestRewriteStreamLoadRedirectURLWithoutOverride(t *testing.T) {
 	rawURL, err := url.Parse("http://192.0.2.10:8040/api/demo/users/_stream_load")
 	if err != nil {
@@ -248,6 +284,43 @@ func TestMapMySQLColumnToDorisKeepsDoubleForNonKeyDouble(t *testing.T) {
 	}
 }
 
+func TestMapMySQLColumnToDorisFollowsFlinkBooleanAndYearMapping(t *testing.T) {
+	tests := []struct {
+		name string
+		col  model.TableColumn
+		want string
+	}{
+		{
+			name: "tinyint one",
+			col:  model.TableColumn{DataType: "tinyint", ColumnType: "tinyint(1)"},
+			want: "BOOLEAN",
+		},
+		{
+			name: "unsigned tinyint one",
+			col:  model.TableColumn{DataType: "tinyint", ColumnType: "tinyint(1) unsigned"},
+			want: "BIGINT",
+		},
+		{
+			name: "bit one",
+			col:  model.TableColumn{DataType: "bit", ColumnType: "bit(1)"},
+			want: "BOOLEAN",
+		},
+		{
+			name: "year",
+			col:  model.TableColumn{DataType: "year", ColumnType: "year"},
+			want: "BIGINT",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := mapMySQLColumnToDoris(tt.col, false); got != tt.want {
+				t.Fatalf("type = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestMapMySQLColumnToDorisUsesVarcharForOversizedDecimal(t *testing.T) {
 	numPrec := int64(65)
 	numScale := int64(30)
@@ -260,14 +333,6 @@ func TestMapMySQLColumnToDorisUsesVarcharForOversizedDecimal(t *testing.T) {
 	want := "VARCHAR(67)"
 	if got != want {
 		t.Fatalf("mapMySQLColumnToDoris() = %q, want %q", got, want)
-	}
-}
-
-func TestMapMySQLTypeStrToDorisUsesVarcharForOversizedDecimal(t *testing.T) {
-	got := mapMySQLTypeStrToDoris("decimal(65,30)")
-	want := "VARCHAR(67)"
-	if got != want {
-		t.Fatalf("mapMySQLTypeStrToDoris() = %q, want %q", got, want)
 	}
 }
 
