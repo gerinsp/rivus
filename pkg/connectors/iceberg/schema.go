@@ -144,7 +144,17 @@ func shouldUpdateIcebergType(current, desired iceberglib.Type, allowUnsafe bool)
 	if allowUnsafe {
 		return true
 	}
-	return !icebergTypeCanRepresent(current, desired)
+	if icebergTypeCanRepresent(current, desired) {
+		return false
+	}
+
+	// Iceberg only permits a small set of safe type promotions. Do not enqueue
+	// an incompatible schema update (for example, a legacy INT column whose
+	// MySQL TINYINT(1) source now maps to BOOLEAN), because UpdateSchema would
+	// reject the entire reconciliation. The existing Iceberg type remains the
+	// writer type and can still safely encode the incoming value.
+	_, err := iceberglib.PromoteType(current, desired)
+	return err == nil
 }
 
 func icebergTypeCanRepresent(current, desired iceberglib.Type) bool {

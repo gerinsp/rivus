@@ -531,11 +531,67 @@ func TestShouldUpdateIcebergTypeSkipsExistingWiderType(t *testing.T) {
 	if shouldUpdateIcebergType(iceberglib.PrimitiveTypes.String, iceberglib.PrimitiveTypes.Int32, false) {
 		t.Fatal("existing string should be kept when source is a narrower scalar type")
 	}
+	if shouldUpdateIcebergType(iceberglib.PrimitiveTypes.Int32, iceberglib.PrimitiveTypes.Bool, false) {
+		t.Fatal("existing int should be kept when tinyint(1) source maps to boolean")
+	}
+	if shouldUpdateIcebergType(iceberglib.PrimitiveTypes.Bool, iceberglib.PrimitiveTypes.Int32, false) {
+		t.Fatal("existing boolean should be kept when source maps to int")
+	}
 	if !shouldUpdateIcebergType(iceberglib.PrimitiveTypes.Int32, iceberglib.PrimitiveTypes.Int64, false) {
 		t.Fatal("existing int should be promoted when source widens to long")
 	}
 	if !shouldUpdateIcebergType(iceberglib.PrimitiveTypes.Int64, iceberglib.PrimitiveTypes.Int32, true) {
 		t.Fatal("unsafe type changes should preserve explicit narrowing requests")
+	}
+}
+
+func TestSyncSchemaKeepsLegacyIntForTinyintBoolean(t *testing.T) {
+	current := iceberglib.NewSchema(1,
+		iceberglib.NestedField{
+			ID:       1,
+			Name:     "IsAktif",
+			Type:     iceberglib.PrimitiveTypes.Int32,
+			Required: false,
+		},
+	)
+	meta, err := table.NewMetadata(
+		current,
+		iceberglib.UnpartitionedSpec,
+		table.UnsortedSortOrder,
+		"s3://warehouse-test/asmat_daytrans/tbl_user",
+		iceberglib.Properties{},
+	)
+	if err != nil {
+		t.Fatalf("NewMetadata returned error: %v", err)
+	}
+	tbl := table.New(
+		table.Identifier{"catalog", "asmat_daytrans", "tbl_user"},
+		meta,
+		"",
+		nil,
+		nil,
+	)
+	updater := tbl.NewTransaction().UpdateSchema(false, false)
+	source := &model.TableSchema{
+		SchemaName: "asmat_daytrans",
+		TableName:  "tbl_user",
+		Columns: []model.TableColumn{{
+			Name:       "IsAktif",
+			DataType:   "tinyint",
+			ColumnType: "tinyint(1)",
+			IsNullable: true,
+		}},
+	}
+
+	changed, err := syncSchema(updater, current, source, nil, config.IcebergConfig{})
+	if err != nil {
+		t.Fatalf("syncSchema returned error: %v", err)
+	}
+	if changed {
+		t.Fatal("syncSchema changed = true, want legacy int column preserved")
+	}
+	if _, err := updater.Apply(); err != nil {
+		t.Fatalf("Apply returned error: %v", err)
 	}
 }
 
