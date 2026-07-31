@@ -219,6 +219,194 @@ func TestPauseDrainsSinkBeforePausedAndCanResume(t *testing.T) {
 	_ = manager.Cancel(job.Config.ID)
 }
 
+func TestShutdownDrainsAndRestoresRunningJobAutomatically(t *testing.T) {
+	store := newMemoryJobStore()
+	drainStarted := make(chan struct{}, 1)
+	allowDrain := make(chan struct{})
+	reg, modes := newGracefulPauseTestRegistry(drainStarted, allowDrain)
+	manager := NewJobManager(reg, WithJobStore(store))
+
+	job, err := manager.Submit(newTestJobConfig("job-restart-drain"))
+	if err != nil {
+		t.Fatalf("Submit returned error: %v", err)
+	}
+	waitForCondition(t, "job to reach running", func() bool {
+		return job.GetStatus() == JobStatusRunning
+	})
+	select {
+	case mode := <-modes:
+		if mode != config.JobModeInitial {
+			t.Fatalf("submit mode = %s, want %s", mode, config.JobModeInitial)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for initial mode")
+	}
+
+	shutdownDone := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		shutdownDone <- manager.Shutdown(ctx)
+	}()
+
+	select {
+	case <-drainStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("sink did not start draining during shutdown")
+	}
+	if got := job.GetStatus(); got != JobStatusPausing {
+		t.Fatalf("job status while shutdown drains = %s, want %s", got, JobStatusPausing)
+	}
+	waitForCondition(t, "restart intent to remain running", func() bool {
+		record, ok := store.Get(job.Config.ID)
+		return ok && record.DesiredState == meta.DesiredStateRunning
+	})
+	if _, err := manager.Submit(newTestJobConfig("job-rejected-during-shutdown")); !errors.Is(err, ErrJobManagerShuttingDown) {
+		t.Fatalf("Submit during shutdown error = %v, want %v", err, ErrJobManagerShuttingDown)
+	}
+
+	close(allowDrain)
+	select {
+	case err := <-shutdownDone:
+		if err != nil {
+			t.Fatalf("Shutdown returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Shutdown did not finish after sink drained")
+	}
+	if got := job.GetStatus(); got != JobStatusPaused {
+		t.Fatalf("drained job status = %s, want %s", got, JobStatusPaused)
+	}
+	record, ok := store.Get(job.Config.ID)
+	if !ok {
+		t.Fatal("drained job was not persisted")
+	}
+	if record.DesiredState != meta.DesiredStateRunning {
+		t.Fatalf("drained desired state = %s, want %s", record.DesiredState, meta.DesiredStateRunning)
+	}
+	if record.LastStatus != string(JobStatusPaused) {
+		t.Fatalf("drained last status = %s, want %s", record.LastStatus, JobStatusPaused)
+	}
+
+	restoreReg, restoreModes := newTestRegistry()
+	restoredManager := NewJobManager(restoreReg, WithJobStore(store))
+	if err := restoredManager.RestorePersistedJobs(context.Background()); err != nil {
+		t.Fatalf("RestorePersistedJobs returned error: %v", err)
+	}
+	waitForCondition(t, "restored job to resume", func() bool {
+		restored, getErr := restoredManager.Get(job.Config.ID)
+		return getErr == nil && restored.GetStatus() == JobStatusRunning
+	})
+	select {
+	case mode := <-restoreModes:
+		if mode != config.JobModeResume {
+			t.Fatalf("restored mode = %s, want %s", mode, config.JobModeResume)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for restored resume mode")
+	}
+	_ = restoredManager.Cancel(job.Config.ID)
+}
+
+func TestShutdownDeadlineForcesStopButKeepsRestartIntent(t *testing.T) {
+	release := make(chan struct{})
+	store := newMemoryJobStore()
+	manager := NewJobManager(newStalledRegistry(release), WithJobStore(store))
+	job, err := manager.Submit(newTestJobConfig("job-restart-timeout"))
+	if err != nil {
+		t.Fatalf("Submit returned error: %v", err)
+	}
+	waitForCondition(t, "job to reach running", func() bool {
+		return job.GetStatus() == JobStatusRunning
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	err = manager.Shutdown(ctx)
+	cancel()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Shutdown error = %v, want deadline exceeded", err)
+	}
+	record, ok := store.Get(job.Config.ID)
+	if !ok {
+		t.Fatal("timed out job was not persisted")
+	}
+	if record.DesiredState != meta.DesiredStateRunning {
+		t.Fatalf("timed out desired state = %s, want %s", record.DesiredState, meta.DesiredStateRunning)
+	}
+
+	close(release)
+	if !job.waitRunDone(2 * time.Second) {
+		t.Fatal("pipeline did not finish after release")
+	}
+}
+
+func TestShutdownDoesNotStartQueuedSnapshotJobs(t *testing.T) {
+	store := newMemoryJobStore()
+	drainStarted := make(chan struct{}, 1)
+	allowDrain := make(chan struct{})
+	reg, modes := newGracefulPauseTestRegistry(drainStarted, allowDrain)
+	manager := NewJobManager(
+		reg,
+		WithJobStore(store),
+		WithMaxConcurrentSnapshotJobs(1),
+	)
+
+	first, err := manager.Submit(newTestJobConfig("job-shutdown-active"))
+	if err != nil {
+		t.Fatalf("submit active job: %v", err)
+	}
+	waitForCondition(t, "first snapshot job to run", func() bool {
+		return first.GetStatus() == JobStatusRunning
+	})
+	select {
+	case <-modes:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for active job start")
+	}
+
+	queued, err := manager.Submit(newTestJobConfig("job-shutdown-queued"))
+	if err != nil {
+		t.Fatalf("submit queued job: %v", err)
+	}
+	if got := queued.GetStatus(); got != JobStatusQueued {
+		t.Fatalf("second job status = %s, want %s", got, JobStatusQueued)
+	}
+
+	shutdownDone := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		shutdownDone <- manager.Shutdown(ctx)
+	}()
+	select {
+	case <-drainStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("active sink did not start draining")
+	}
+	close(allowDrain)
+	select {
+	case err := <-shutdownDone:
+		if err != nil {
+			t.Fatalf("Shutdown returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Shutdown did not finish")
+	}
+
+	select {
+	case mode := <-modes:
+		t.Fatalf("queued job started during shutdown with mode %s", mode)
+	default:
+	}
+	record, ok := store.Get(queued.Config.ID)
+	if !ok {
+		t.Fatal("queued job was not persisted")
+	}
+	if record.DesiredState != meta.DesiredStateRunning || record.LastStatus != string(JobStatusQueued) {
+		t.Fatalf("queued record = desired %s status %s", record.DesiredState, record.LastStatus)
+	}
+}
+
 func TestPauseRejectsNonRunningJob(t *testing.T) {
 	manager := NewJobManager(connector.NewRegistry())
 	job := manager.newManagedJob(newTestJobConfig("job-not-running"))

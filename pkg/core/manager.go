@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"sort"
@@ -17,10 +18,11 @@ import (
 )
 
 var (
-	ErrJobNotFound           = errors.New("job not found")
-	ErrJobResubmitNotAllowed = errors.New("job resubmit not allowed")
-	ErrJobStillStopping      = errors.New("job pipeline is still stopping")
-	ErrJobPauseNotAllowed    = errors.New("job pause not allowed")
+	ErrJobNotFound            = errors.New("job not found")
+	ErrJobResubmitNotAllowed  = errors.New("job resubmit not allowed")
+	ErrJobStillStopping       = errors.New("job pipeline is still stopping")
+	ErrJobPauseNotAllowed     = errors.New("job pause not allowed")
+	ErrJobManagerShuttingDown = errors.New("job manager is shutting down")
 )
 
 const defaultMaxConcurrentSnapshotJobs = 2
@@ -44,6 +46,7 @@ type JobInfo struct {
 }
 
 type JobManager struct {
+	lifecycleMu     sync.RWMutex
 	mu              sync.RWMutex
 	jobs            map[string]*Job
 	reg             *connector.Registry
@@ -69,6 +72,8 @@ type JobManager struct {
 	snapshotQueue             []string
 	snapshotQueueModes        map[string]config.JobMode
 	startingSnapshotJobs      map[string]struct{}
+	shuttingDown              bool
+	restartResumeJobs         map[string]struct{}
 }
 
 type JobManagerOption func(*JobManager)
@@ -130,6 +135,7 @@ func NewJobManager(reg *connector.Registry, opts ...JobManagerOption) *JobManage
 		maxConcurrentSnapshotJobs: snapshotJobLimitFromEnv(),
 		snapshotQueueModes:        make(map[string]config.JobMode),
 		startingSnapshotJobs:      make(map[string]struct{}),
+		restartResumeJobs:         make(map[string]struct{}),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -140,6 +146,9 @@ func NewJobManager(reg *connector.Registry, opts ...JobManagerOption) *JobManage
 }
 
 func (m *JobManager) Submit(cfg *config.JobConfig) (*Job, error) {
+	m.lifecycleMu.RLock()
+	defer m.lifecycleMu.RUnlock()
+
 	cfg = m.normalizeConfig(cfg)
 	if cfg == nil {
 		return nil, errors.New("job config is nil")
@@ -147,6 +156,10 @@ func (m *JobManager) Submit(cfg *config.JobConfig) (*Job, error) {
 
 	job := NewJob(cfg, m.reg)
 	m.mu.Lock()
+	if m.shuttingDown {
+		m.mu.Unlock()
+		return nil, ErrJobManagerShuttingDown
+	}
 	if _, exists := m.jobs[cfg.ID]; exists {
 		m.mu.Unlock()
 		return nil, errors.New("job id already exists")
@@ -221,7 +234,14 @@ func (m *JobManager) SubmitMany(configs []*config.JobConfig) []SubmitResult {
 }
 
 func (m *JobManager) Cancel(id string) error {
+	m.lifecycleMu.RLock()
+	defer m.lifecycleMu.RUnlock()
+
 	m.mu.RLock()
+	if m.shuttingDown {
+		m.mu.RUnlock()
+		return ErrJobManagerShuttingDown
+	}
 	job, ok := m.jobs[id]
 	m.mu.RUnlock()
 	if !ok {
@@ -239,7 +259,14 @@ func (m *JobManager) Cancel(id string) error {
 }
 
 func (m *JobManager) Pause(id string) error {
+	m.lifecycleMu.RLock()
+	defer m.lifecycleMu.RUnlock()
+
 	m.mu.RLock()
+	if m.shuttingDown {
+		m.mu.RUnlock()
+		return ErrJobManagerShuttingDown
+	}
 	job, ok := m.jobs[id]
 	m.mu.RUnlock()
 	if !ok {
@@ -252,7 +279,14 @@ func (m *JobManager) Pause(id string) error {
 }
 
 func (m *JobManager) Resubmit(id string) (*Job, error) {
+	m.lifecycleMu.RLock()
+	defer m.lifecycleMu.RUnlock()
+
 	m.mu.RLock()
+	if m.shuttingDown {
+		m.mu.RUnlock()
+		return nil, ErrJobManagerShuttingDown
+	}
 	job, ok := m.jobs[id]
 	m.mu.RUnlock()
 	if !ok {
@@ -404,7 +438,14 @@ func (m *JobManager) RestorePersistedJobs(ctx context.Context) error {
 }
 
 func (m *JobManager) Delete(id string) error {
+	m.lifecycleMu.RLock()
+	defer m.lifecycleMu.RUnlock()
+
 	m.mu.Lock()
+	if m.shuttingDown {
+		m.mu.Unlock()
+		return ErrJobManagerShuttingDown
+	}
 	job, ok := m.jobs[id]
 	if !ok {
 		m.mu.Unlock()
@@ -458,7 +499,8 @@ func (m *JobManager) attachStatusListener(job *Job) {
 			// before asynchronous delivery begins.
 			m.enqueueFailureNotification(job)
 		}
-		if err := m.saveJobRecord(context.Background(), job, desiredStateForStatus(status), status); err != nil {
+		desired := m.desiredStateForJobStatus(job.Config.ID, status)
+		if err := m.saveJobRecord(context.Background(), job, desired, status); err != nil {
 			log.Printf("[job-manager] persist job state failed job=%s status=%s: %v", job.Config.ID, status, err)
 		}
 		if snapshotStatusReleasesSlot(status) {
@@ -471,6 +513,100 @@ func (m *JobManager) attachStatusListener(job *Job) {
 		}
 		m.maybeNotifyJobHealth(job, progress)
 	})
+}
+
+// Shutdown drains active jobs to their latest committed checkpoint while
+// preserving their RUNNING intent in the job registry. A replacement Rivus
+// process can then restore those jobs automatically in resume mode.
+func (m *JobManager) Shutdown(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	// Wait for any accepted lifecycle mutation to finish, then close the gate
+	// before deciding which jobs must resume in the replacement process.
+	m.lifecycleMu.Lock()
+	m.mu.Lock()
+	m.shuttingDown = true
+	jobs := make([]*Job, 0, len(m.jobs))
+	for id, job := range m.jobs {
+		if job == nil {
+			continue
+		}
+		switch job.GetStatus() {
+		case JobStatusCreated, JobStatusQueued, JobStatusPending, JobStatusRunning, JobStatusPausing:
+			m.restartResumeJobs[id] = struct{}{}
+			jobs = append(jobs, job)
+		}
+	}
+	m.mu.Unlock()
+	m.lifecycleMu.Unlock()
+
+	if len(jobs) == 0 {
+		return nil
+	}
+
+	log.Printf("[job-manager] graceful shutdown draining jobs=%d", len(jobs))
+
+	var persistErrs []error
+	for _, job := range jobs {
+		status := job.GetStatus()
+		if err := m.saveJobRecord(ctx, job, meta.DesiredStateRunning, status); err != nil {
+			persistErrs = append(persistErrs, fmt.Errorf("persist restart intent job=%s: %w", job.Config.ID, err))
+		}
+
+		switch status {
+		case JobStatusRunning:
+			if !job.RequestPause() {
+				job.requestStop()
+			}
+		case JobStatusCreated, JobStatusPending:
+			// No source events can be accepted safely until preflight finishes.
+			// Cancel setup and restart it from persisted state in the new process.
+			job.requestStop()
+		case JobStatusQueued, JobStatusPausing:
+			// Queued jobs have no active pipeline. Pausing jobs are already
+			// draining their source and sink.
+		}
+	}
+
+	for _, job := range jobs {
+		done := job.currentRunDone()
+		if done == nil {
+			continue
+		}
+		select {
+		case <-done:
+		case <-ctx.Done():
+			for _, remaining := range jobs {
+				remaining.requestStop()
+			}
+			return errors.Join(
+				errors.Join(persistErrs...),
+				fmt.Errorf("graceful shutdown deadline exceeded: %w", ctx.Err()),
+			)
+		}
+	}
+
+	for _, job := range jobs {
+		status := job.GetStatus()
+		if err := m.saveJobRecord(ctx, job, meta.DesiredStateRunning, status); err != nil {
+			persistErrs = append(persistErrs, fmt.Errorf("persist drained job=%s: %w", job.Config.ID, err))
+		}
+	}
+
+	log.Printf("[job-manager] graceful shutdown drain complete jobs=%d", len(jobs))
+	return errors.Join(persistErrs...)
+}
+
+func (m *JobManager) desiredStateForJobStatus(jobID string, status JobStatus) meta.DesiredState {
+	m.mu.RLock()
+	_, resumeAfterRestart := m.restartResumeJobs[jobID]
+	m.mu.RUnlock()
+	if resumeAfterRestart {
+		return meta.DesiredStateRunning
+	}
+	return desiredStateForStatus(status)
 }
 
 func (m *JobManager) deferFailureNotification(jobID string) {
@@ -915,7 +1051,8 @@ func (m *JobManager) startJob(job *Job, mode config.JobMode, removeOnStartFailur
 	err := job.startWithMode(mode)
 	if err == nil {
 		status := job.GetStatus()
-		if saveErr := m.saveJobRecord(context.Background(), job, desiredStateForStatus(status), status); saveErr != nil {
+		desired := m.desiredStateForJobStatus(job.Config.ID, status)
+		if saveErr := m.saveJobRecord(context.Background(), job, desired, status); saveErr != nil {
 			job.requestStop()
 			err = saveErr
 		}
@@ -956,9 +1093,12 @@ func (m *JobManager) startQueuedSnapshotJobsAsync() {
 }
 
 func (m *JobManager) startQueuedSnapshotJobs() {
+	m.lifecycleMu.RLock()
+	defer m.lifecycleMu.RUnlock()
+
 	for {
 		m.mu.Lock()
-		if !m.hasSnapshotSlotLocked() || len(m.snapshotQueue) == 0 {
+		if m.shuttingDown || !m.hasSnapshotSlotLocked() || len(m.snapshotQueue) == 0 {
 			m.mu.Unlock()
 			return
 		}
@@ -980,7 +1120,8 @@ func (m *JobManager) startQueuedSnapshotJobs() {
 			job.setStatus(JobStatusFailed)
 		}
 		status := job.GetStatus()
-		if err := m.saveJobRecord(context.Background(), job, desiredStateForStatus(status), status); err != nil {
+		desired := m.desiredStateForJobStatus(job.Config.ID, status)
+		if err := m.saveJobRecord(context.Background(), job, desired, status); err != nil {
 			log.Printf("[job-manager] persist queued job start failed job=%s: %v", id, err)
 		}
 		m.mu.Lock()

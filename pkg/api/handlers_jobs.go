@@ -70,6 +70,10 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request) {
 		}
 		job, err := s.jobManager.Submit(cfg)
 		if err != nil {
+			if err == core.ErrJobManagerShuttingDown {
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+				return
+			}
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
@@ -126,6 +130,8 @@ func (s *Server) handleJobByID(w http.ResponseWriter, r *http.Request) {
 		if err := s.jobManager.Cancel(id); err != nil {
 			if err == core.ErrJobNotFound {
 				writeJSON(w, http.StatusNotFound, map[string]string{"error": "job not found"})
+			} else if err == core.ErrJobManagerShuttingDown {
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 			} else {
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			}
@@ -142,6 +148,8 @@ func (s *Server) handleJobByID(w http.ResponseWriter, r *http.Request) {
 				writeJSON(w, http.StatusNotFound, map[string]string{"error": "job not found"})
 			case core.ErrJobPauseNotAllowed:
 				writeJSON(w, http.StatusConflict, map[string]string{"error": "job can only be paused while RUNNING"})
+			case core.ErrJobManagerShuttingDown:
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 			default:
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			}
@@ -161,6 +169,8 @@ func (s *Server) handleJobByID(w http.ResponseWriter, r *http.Request) {
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "job can only be resubmitted from PAUSED, FAILED, or STOPPED"})
 			case core.ErrJobStillStopping:
 				writeJSON(w, http.StatusConflict, map[string]string{"error": "job pipeline is still stopping; retry resubmit shortly"})
+			case core.ErrJobManagerShuttingDown:
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 			default:
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			}
@@ -206,6 +216,8 @@ func (s *Server) handleJobByID(w http.ResponseWriter, r *http.Request) {
 		if err := s.jobManager.Delete(id); err != nil {
 			if err == core.ErrJobNotFound {
 				writeJSON(w, http.StatusNotFound, map[string]string{"error": "job not found"})
+			} else if err == core.ErrJobManagerShuttingDown {
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 			} else {
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			}

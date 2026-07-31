@@ -61,6 +61,25 @@ docker compose pull rivus
 docker compose up -d rivus
 ```
 
+For automation that replaces the entire Compose stack:
+
+```sh
+docker compose pull rivus
+docker compose down --timeout 120
+docker compose up -d
+```
+
+Do not pass `--volumes` or `-v` to `docker compose down`; the metadata MySQL
+named volume contains the job registry and checkpoints needed for automatic
+resume.
+
+On `SIGTERM` or `SIGINT`, Rivus stops starting new work, drains active jobs to
+committed checkpoints, and preserves their desired state as `RUNNING`. The
+replacement container restores those jobs automatically in `resume` mode.
+Keep `stop_grace_period` longer than `RIVUS_SHUTDOWN_TIMEOUT_SECONDS`; the
+provided Compose file defaults to two minutes and 90 seconds respectively.
+Automatic resume requires `RIVUS_META_MYSQL_DSN`.
+
 Run from source during development:
 
 ```sh
@@ -101,6 +120,8 @@ RIVUS_UI_LOGIN_USERNAME=admin
 RIVUS_UI_LOGIN_PASSWORD=change-me
 RIVUS_UI_SESSION_SECRET=change-me
 RIVUS_API_TOKEN=
+RIVUS_SHUTDOWN_TIMEOUT_SECONDS=90
+RIVUS_STOP_GRACE_PERIOD=2m
 RIVUS_LOG_DIR=/app/logs
 RIVUS_LOG_STDERR=true
 ```

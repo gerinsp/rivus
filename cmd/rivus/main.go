@@ -2,12 +2,16 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gerinsp/rivus/pkg/api"
@@ -18,6 +22,8 @@ import (
 	"github.com/gerinsp/rivus/pkg/core"
 	"github.com/gerinsp/rivus/pkg/meta"
 )
+
+const defaultGracefulShutdownTimeout = 90 * time.Second
 
 func main() {
 	addr := flag.String("addr", ":8080", "HTTP listen address")
@@ -61,11 +67,59 @@ func main() {
 
 	apiServer := api.NewServer(jobManager, *uiDir, authConfig)
 	mux := apiServer.Router()
+	httpServer := &http.Server{
+		Addr:              *addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 15 * time.Second,
+	}
 
 	log.Printf("Starting rivus on %s ...", *addr)
-	if err := http.ListenAndServe(*addr, mux); err != nil {
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- httpServer.ListenAndServe()
+	}()
+
+	signalCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+
+	select {
+	case err := <-serverErr:
+		if errors.Is(err, http.ErrServerClosed) {
+			return
+		}
 		log.Fatalf("server error: %v", err)
+	case <-signalCtx.Done():
+		timeout := gracefulShutdownTimeoutFromEnv()
+		log.Printf("Shutdown signal received; draining jobs for up to %s", timeout)
+
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), timeout)
+		drainErr := jobManager.Shutdown(shutdownCtx)
+		shutdownCancel()
+		if drainErr != nil {
+			log.Printf("job drain error: %v", drainErr)
+		}
+
+		httpCtx, httpCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := httpServer.Shutdown(httpCtx); err != nil {
+			log.Printf("HTTP shutdown error: %v", err)
+			_ = httpServer.Close()
+		}
+		httpCancel()
+		log.Printf("Rivus shutdown complete")
 	}
+}
+
+func gracefulShutdownTimeoutFromEnv() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("RIVUS_SHUTDOWN_TIMEOUT_SECONDS"))
+	if raw == "" {
+		return defaultGracefulShutdownTimeout
+	}
+	seconds, err := strconv.Atoi(raw)
+	if err != nil || seconds <= 0 {
+		log.Printf("invalid RIVUS_SHUTDOWN_TIMEOUT_SECONDS=%q; using %s", raw, defaultGracefulShutdownTimeout)
+		return defaultGracefulShutdownTimeout
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 func setupLogging() (io.Closer, error) {
