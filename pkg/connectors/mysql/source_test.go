@@ -362,6 +362,40 @@ func TestCDCHandlerOnPosSyncedEmitsCheckpoint(t *testing.T) {
 	}
 }
 
+func TestCDCHandlerOnPosSyncedDoesNotEmitAfterCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	out := make(chan model.Event)
+	close(out)
+	handler := &cdcHandler{
+		jobID: "job-1",
+		out:   out,
+		ctx:   ctx,
+	}
+
+	err := handler.OnPosSynced(nil, gomysql.Position{Name: "mysql-bin.000123", Pos: 456}, nil, true)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("OnPosSynced error = %v, want context.Canceled", err)
+	}
+}
+
+func TestRunMySQLBackgroundConvertsPanicToPermanentError(t *testing.T) {
+	err := runMySQLBackground("job-1", "CDC Run", func() error {
+		panic("callback crashed")
+	})
+
+	if err == nil {
+		t.Fatal("runMySQLBackground returned nil, want panic error")
+	}
+	if !util.IsPermanent(err) {
+		t.Fatalf("runMySQLBackground error = %T %v, want permanent error", err, err)
+	}
+	if !strings.Contains(err.Error(), "mysql CDC Run panic: callback crashed") {
+		t.Fatalf("runMySQLBackground error = %q, want panic detail", err)
+	}
+}
+
 func TestBinlogFileLag(t *testing.T) {
 	tests := []struct {
 		name       string

@@ -1,4 +1,5 @@
 const ACTIVE = new Set(['RUNNING', 'PAUSING', 'PENDING', 'QUEUED']);
+const RESUMABLE = new Set(['STOPPED', 'PAUSED']);
 const MODAL_IDS = ['submitModal', 'errorsModal'];
 const syncFormatter = new Intl.DateTimeFormat(undefined, {
   hour: '2-digit',
@@ -32,6 +33,7 @@ let previousJobListTab = currentTab === 'job' ? 'doris' : currentTab;
 let latestDorisArchiveJobs = [];
 let latestIcebergArchiveJobs = [];
 let bulkDeleteInFlight = false;
+let bulkResumeInFlight = false;
 
 if (!Number.isFinite(currentLogLineLimit) || currentLogLineLimit <= 0) {
   currentLogLineLimit = 500;
@@ -705,8 +707,22 @@ function updateArchiveBulkButton(scope, jobs) {
   if (!button) return;
 
   const count = jobs.length;
-  button.disabled = count === 0 || bulkDeleteInFlight;
+  button.disabled = count === 0 || bulkDeleteInFlight || bulkResumeInFlight;
   button.textContent = count > 0 ? `Delete archive (${count})` : 'Delete archive';
+}
+
+function updateArchiveResumeButton(scope, jobs) {
+  const button = document.querySelector(`[data-bulk-resume-archive="${scope}"]`);
+  if (!button) return;
+
+  const count = jobs.filter((job) => RESUMABLE.has(job?.status)).length;
+  button.disabled = count === 0 || bulkDeleteInFlight || bulkResumeInFlight;
+  button.textContent = count > 0 ? `Resume all (${count})` : 'Resume all';
+}
+
+function updateArchiveBulkButtons(scope, jobs) {
+  updateArchiveResumeButton(scope, jobs);
+  updateArchiveBulkButton(scope, jobs);
 }
 
 async function loadJobs() {
@@ -736,8 +752,8 @@ async function loadJobs() {
     document.getElementById('icebergActiveEmpty').classList.toggle('hidden', icebergActive.length !== 0);
     document.getElementById('dorisArchiveEmpty').classList.toggle('hidden', dorisArchive.length !== 0);
     document.getElementById('icebergArchiveEmpty').classList.toggle('hidden', icebergArchive.length !== 0);
-    updateArchiveBulkButton('doris', dorisArchive);
-    updateArchiveBulkButton('iceberg', icebergArchive);
+    updateArchiveBulkButtons('doris', dorisArchive);
+    updateArchiveBulkButtons('iceberg', icebergArchive);
 
     setBoundText('active-doris-count', String(dorisActive.length));
     setBoundText('active-iceberg-count', String(icebergActive.length));
@@ -1059,6 +1075,60 @@ async function deleteJobsWithLimit(ids, limit = 6) {
   return failures;
 }
 
+async function resubmitJobWithoutPrompt(id) {
+  const res = await apiFetch('/api/jobs/' + encodeURIComponent(id) + '/resubmit', { method: 'POST' });
+  if (res.ok) return null;
+  return await operationErrorMessage(res, 'Resume');
+}
+
+async function resumeJobsWithLimit(ids, limit = 4) {
+  const failures = [];
+  let next = 0;
+  const workerCount = Math.min(limit, ids.length);
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (next < ids.length) {
+      const id = ids[next];
+      next += 1;
+      const error = await resubmitJobWithoutPrompt(id);
+      if (error) failures.push({ id, error });
+    }
+  });
+  await Promise.all(workers);
+  return failures;
+}
+
+async function bulkResumeArchive(scope) {
+  const jobs = scope === 'iceberg' ? latestIcebergArchiveJobs : latestDorisArchiveJobs;
+  const ids = jobs
+    .filter((job) => RESUMABLE.has(job?.status))
+    .map((job) => job?.id)
+    .filter(Boolean);
+  const label = scope === 'iceberg' ? 'Iceberg' : 'Doris';
+
+  if (ids.length === 0) return;
+  if (!confirm(`Resume ${ids.length} archived ${label} job(s) from their latest saved checkpoints?`)) return;
+
+  bulkResumeInFlight = true;
+  updateArchiveBulkButtons('doris', latestDorisArchiveJobs);
+  updateArchiveBulkButtons('iceberg', latestIcebergArchiveJobs);
+  setJobsNotice(`Resuming ${ids.length} archived ${label} job(s)...`);
+
+  try {
+    const failures = await resumeJobsWithLimit(ids);
+    await refreshDashboard();
+    if (failures.length > 0) {
+      const sample = failures.slice(0, 3).map((item) => item.id).join(', ');
+      setJobsNotice(`Resumed ${ids.length - failures.length} job(s). Failed to resume ${failures.length}: ${sample}.`, 'error');
+      return;
+    }
+    setJobsNotice(`Resumed ${ids.length} archived ${label} job(s).`);
+  } finally {
+    bulkResumeInFlight = false;
+    updateArchiveBulkButtons('doris', latestDorisArchiveJobs);
+    updateArchiveBulkButtons('iceberg', latestIcebergArchiveJobs);
+  }
+}
+
 async function bulkDeleteArchive(scope) {
   const jobs = scope === 'iceberg' ? latestIcebergArchiveJobs : latestDorisArchiveJobs;
   const ids = jobs.map((job) => job?.id).filter(Boolean);
@@ -1068,8 +1138,8 @@ async function bulkDeleteArchive(scope) {
   if (!confirm(`Delete ${ids.length} archived ${label} job(s)? This removes them from the list.`)) return;
 
   bulkDeleteInFlight = true;
-  updateArchiveBulkButton('doris', latestDorisArchiveJobs);
-  updateArchiveBulkButton('iceberg', latestIcebergArchiveJobs);
+  updateArchiveBulkButtons('doris', latestDorisArchiveJobs);
+  updateArchiveBulkButtons('iceberg', latestIcebergArchiveJobs);
   setJobsNotice(`Deleting ${ids.length} archived ${label} job(s)...`);
 
   try {
@@ -1083,8 +1153,8 @@ async function bulkDeleteArchive(scope) {
     setJobsNotice(`Deleted ${ids.length} archived ${label} job(s).`);
   } finally {
     bulkDeleteInFlight = false;
-    updateArchiveBulkButton('doris', latestDorisArchiveJobs);
-    updateArchiveBulkButton('iceberg', latestIcebergArchiveJobs);
+    updateArchiveBulkButtons('doris', latestDorisArchiveJobs);
+    updateArchiveBulkButtons('iceberg', latestIcebergArchiveJobs);
   }
 }
 
@@ -1102,7 +1172,7 @@ async function resubmitJob(id) {
 
 async function refreshDashboard(options = {}) {
   if (options.auto && isAnyModalOpen()) return;
-  if (options.auto && bulkDeleteInFlight) return;
+  if (options.auto && (bulkDeleteInFlight || bulkResumeInFlight)) return;
   if (refreshInFlight) return;
   refreshInFlight = true;
 
@@ -2004,6 +2074,12 @@ document.addEventListener('click', (event) => {
   const bulkArchiveButton = event.target.closest('[data-bulk-delete-archive]');
   if (bulkArchiveButton) {
     bulkDeleteArchive(bulkArchiveButton.dataset.bulkDeleteArchive);
+    return;
+  }
+
+  const bulkResumeButton = event.target.closest('[data-bulk-resume-archive]');
+  if (bulkResumeButton) {
+    bulkResumeArchive(bulkResumeButton.dataset.bulkResumeArchive);
     return;
   }
 

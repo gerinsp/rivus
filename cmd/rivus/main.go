@@ -43,7 +43,8 @@ func main() {
 	doris.Register(reg)
 	iceberg.Register(reg)
 
-	jobManagerOpts := make([]core.JobManagerOption, 0, 2)
+	jobManagerOpts := make([]core.JobManagerOption, 0, 3)
+	jobManagerOpts = append(jobManagerOpts, core.WithAutoResume(envBool("RIVUS_AUTO_RESUME", false)))
 	if dsn := strings.TrimSpace(os.Getenv("RIVUS_META_MYSQL_DSN")); dsn != "" {
 		jobStore, err := meta.NewMySQLJobStore(dsn)
 		if err != nil {

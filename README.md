@@ -74,11 +74,16 @@ named volume contains the job registry and checkpoints needed for automatic
 resume.
 
 On `SIGTERM` or `SIGINT`, Rivus stops starting new work, drains active jobs to
-committed checkpoints, and preserves their desired state as `RUNNING`. The
-replacement container restores those jobs automatically in `resume` mode.
+committed checkpoints, and preserves their desired state as `RUNNING`. When
+automatic resume is enabled, the replacement container restores those jobs in
+`resume` mode.
 Keep `stop_grace_period` longer than `RIVUS_SHUTDOWN_TIMEOUT_SECONDS`; the
 provided Compose file defaults to two minutes and 90 seconds respectively.
-Automatic resume requires `RIVUS_META_MYSQL_DSN`.
+Automatic resume requires `RIVUS_META_MYSQL_DSN`. By default,
+`RIVUS_AUTO_RESUME=false` restores persisted jobs into the UI without starting
+them. Their configurations and checkpoints remain available, and each job can
+be resumed manually. Set `RIVUS_AUTO_RESUME=true` to resume jobs with saved
+`RUNNING` intent automatically.
 
 Run from source during development:
 
@@ -120,6 +125,7 @@ RIVUS_UI_LOGIN_USERNAME=admin
 RIVUS_UI_LOGIN_PASSWORD=change-me
 RIVUS_UI_SESSION_SECRET=change-me
 RIVUS_API_TOKEN=
+RIVUS_AUTO_RESUME=false
 RIVUS_SHUTDOWN_TIMEOUT_SECONDS=90
 RIVUS_STOP_GRACE_PERIOD=2m
 RIVUS_LOG_DIR=/app/logs

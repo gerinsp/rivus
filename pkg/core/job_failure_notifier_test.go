@@ -125,6 +125,12 @@ func TestJobManagerRejectsImmediateStartFailureWithoutNotification(t *testing.T)
 
 func TestJobManagerRecoversAndNotifiesSourcePanic(t *testing.T) {
 	reg := connector.NewRegistry()
+	reg.RegisterSource("steady_source", func(jctx connector.JobContext, cfg any) (connector.Source, error) {
+		return sourceFunc(func(ctx context.Context, out chan<- model.Event) error {
+			<-ctx.Done()
+			return ctx.Err()
+		}), nil
+	})
 	reg.RegisterSource("panic_source", func(jctx connector.JobContext, cfg any) (connector.Source, error) {
 		return sourceFunc(func(ctx context.Context, out chan<- model.Event) error {
 			panic("snapshot worker crashed")
@@ -142,6 +148,14 @@ func TestJobManagerRecoversAndNotifiesSourcePanic(t *testing.T) {
 		reg,
 		withJobFailureNotifier(notifier),
 	)
+	steadyJob, err := manager.Submit(newNotificationTestJobConfig("job-steady", "steady_source", "doris"))
+	if err != nil {
+		t.Fatalf("steady Submit returned error: %v", err)
+	}
+	waitForCondition(t, "steady job to run", func() bool {
+		return steadyJob.GetStatus() == JobStatusRunning
+	})
+	defer steadyJob.Stop()
 
 	job, err := manager.Submit(newNotificationTestJobConfig("job-panic", "panic_source", "doris"))
 	if err != nil {
@@ -151,6 +165,9 @@ func TestJobManagerRecoversAndNotifiesSourcePanic(t *testing.T) {
 	waitForCondition(t, "panic job to fail", func() bool {
 		return job.GetStatus() == JobStatusFailed
 	})
+	if status := steadyJob.GetStatus(); status != JobStatusRunning {
+		t.Fatalf("steady job status = %s after another job panicked, want %s", status, JobStatusRunning)
+	}
 
 	select {
 	case payload := <-notifier.ch:

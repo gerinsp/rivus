@@ -10,9 +10,11 @@ import (
 	"path"
 	"reflect"
 	"regexp"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-mysql-org/go-mysql/canal"
@@ -425,6 +427,12 @@ func (h *cdcHandler) reportLivePosition(file string, pos uint32, force bool) {
 }
 
 func (h *cdcHandler) emit(ev model.Event) error {
+	if h.ctx != nil {
+		if err := h.ctx.Err(); err != nil {
+			return err
+		}
+	}
+
 	timer := time.NewTimer(10 * time.Second)
 	defer timer.Stop()
 
@@ -859,6 +867,15 @@ func (h *cdcHandler) OnRotate(header *replication.EventHeader, rotateEvent *repl
 }
 
 func (h *cdcHandler) OnPosSynced(header *replication.EventHeader, pos gomysql.Position, set gomysql.GTIDSet, force bool) error {
+	// Canal.Close invokes OnPosSynced to publish one final checkpoint. Once the
+	// source context is cancelled, the pipeline may be shutting down and its
+	// output channel must no longer receive events.
+	if h.ctx != nil {
+		if err := h.ctx.Err(); err != nil {
+			return err
+		}
+	}
+
 	if strings.TrimSpace(pos.Name) == "" || pos.Pos == 0 {
 		return nil
 	}
@@ -2159,6 +2176,16 @@ func (v snapshotCursorValue) decode() (interface{}, error) {
 
 const cdcLagMonitorInterval = 30 * time.Second
 
+func runMySQLBackground(jobID, operation string, run func() error) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = util.Permanent(fmt.Errorf("mysql %s panic: %v", operation, recovered))
+			log.Printf("[mysql][job %s] %s panic: %v\n%s", jobID, operation, recovered, debug.Stack())
+		}
+	}()
+	return run()
+}
+
 func (s *Source) monitorCDCLag(ctx context.Context) {
 	if s.offsetSto == nil || s.progress == nil {
 		return
@@ -2262,7 +2289,14 @@ func (s *Source) runBinlogCanal(ctx context.Context, out chan<- model.Event, sta
 	s.reportStreamingProgress(startFrom)
 	lagMonitorCtx, stopLagMonitor := context.WithCancel(ctx)
 	defer stopLagMonitor()
-	go s.monitorCDCLag(lagMonitorCtx)
+	go func() {
+		if err := runMySQLBackground(s.jobID, "CDC lag monitor", func() error {
+			s.monitorCDCLag(lagMonitorCtx)
+			return nil
+		}); err != nil {
+			log.Printf("[mysql][job %s] CDC lag monitor stopped: %v", s.jobID, err)
+		}
+	}()
 
 	cCfg := canal.NewDefaultConfig()
 	cCfg.Addr = s.cfg.Addr
@@ -2307,7 +2341,11 @@ func (s *Source) runBinlogCanal(ctx context.Context, out chan<- model.Event, sta
 			log.Printf("[mysql][job %s] failed to create canal: %v", s.jobID, err)
 			return err
 		}
-		defer c.Close()
+		var closeOnce sync.Once
+		closeCanal := func() {
+			closeOnce.Do(c.Close)
+		}
+		defer closeCanal()
 
 		currentBinlogFile := ""
 		startBinlogFile := ""
@@ -2338,17 +2376,13 @@ func (s *Source) runBinlogCanal(ctx context.Context, out chan<- model.Event, sta
 
 		done := make(chan error, 1)
 
-		go func() {
-			<-ctx.Done()
-			log.Printf("[mysql][job %s] context cancelled, closing canal", s.jobID)
-			c.Close()
-		}()
-
 		if startFrom != nil {
 			s.logBinlogResumeDiagnostics(ctx, startFrom)
 			log.Printf("[mysql][job %s] CDC RunFrom %s:%d", s.jobID, startFrom.Name, startFrom.Pos)
 			go func() {
-				err := c.RunFrom(*startFrom)
+				err := runMySQLBackground(s.jobID, "CDC RunFrom", func() error {
+					return c.RunFrom(*startFrom)
+				})
 				log.Printf("[mysql][job %s] canal RunFrom(%s:%d) returned: %T %v",
 					s.jobID, startFrom.Name, startFrom.Pos, err, err)
 				done <- err
@@ -2356,7 +2390,7 @@ func (s *Source) runBinlogCanal(ctx context.Context, out chan<- model.Event, sta
 		} else {
 			log.Printf("[mysql][job %s] CDC Run() from latest", s.jobID)
 			go func() {
-				err := c.Run()
+				err := runMySQLBackground(s.jobID, "CDC Run", c.Run)
 				log.Printf("[mysql][job %s] canal Run() returned: %T %v", s.jobID, err, err)
 				done <- err
 			}()
@@ -2371,6 +2405,12 @@ func (s *Source) runBinlogCanal(ctx context.Context, out chan<- model.Event, sta
 			}
 			return nil
 		case <-ctx.Done():
+			// Close synchronously and wait for Run/RunFrom to exit before returning.
+			// This guarantees the job cannot close the shared event channel while a
+			// canal callback is still capable of emitting a final checkpoint.
+			log.Printf("[mysql][job %s] context cancelled, closing canal", s.jobID)
+			closeCanal()
+			<-done
 			return ctx.Err()
 		}
 	})

@@ -39,6 +39,7 @@ func TestRestorePersistedJobsLoadsStoppedAndResumesRunning(t *testing.T) {
 	manager := NewJobManager(
 		reg,
 		WithJobStore(store),
+		WithAutoResume(true),
 	)
 
 	if err := manager.RestorePersistedJobs(context.Background()); err != nil {
@@ -76,6 +77,77 @@ func TestRestorePersistedJobsLoadsStoppedAndResumesRunning(t *testing.T) {
 	default:
 	}
 
+	if err := manager.Cancel("job-running"); err != nil {
+		t.Fatalf("Cancel returned error: %v", err)
+	}
+}
+
+func TestRestorePersistedJobsDefaultsToNoAutoResume(t *testing.T) {
+	store := newMemoryJobStore()
+	store.jobs["job-running"] = meta.PersistedJob{
+		ID:           "job-running",
+		Name:         "running",
+		Config:       newTestJobConfig("job-running"),
+		DesiredState: meta.DesiredStateRunning,
+		LastStatus:   string(JobStatusRunning),
+		CreatedAt:    time.Now().Add(-2 * time.Minute),
+		UpdatedAt:    time.Now().Add(-1 * time.Minute),
+	}
+	store.jobs["job-stopped"] = meta.PersistedJob{
+		ID:           "job-stopped",
+		Name:         "stopped",
+		Config:       newTestJobConfig("job-stopped"),
+		DesiredState: meta.DesiredStateStopped,
+		LastStatus:   string(JobStatusStopped),
+		CreatedAt:    time.Now().Add(-4 * time.Minute),
+		UpdatedAt:    time.Now().Add(-3 * time.Minute),
+	}
+
+	reg, modes := newTestRegistry()
+	manager := NewJobManager(
+		reg,
+		WithJobStore(store),
+	)
+
+	if err := manager.RestorePersistedJobs(context.Background()); err != nil {
+		t.Fatalf("RestorePersistedJobs returned error: %v", err)
+	}
+
+	for _, id := range []string{"job-running", "job-stopped"} {
+		job, err := manager.Get(id)
+		if err != nil {
+			t.Fatalf("expected restored job %s: %v", id, err)
+		}
+		if got := job.GetStatus(); got != JobStatusStopped {
+			t.Fatalf("restored job %s status = %s, want %s", id, got, JobStatusStopped)
+		}
+	}
+
+	select {
+	case mode := <-modes:
+		t.Fatalf("job started with auto resume disabled, mode=%s", mode)
+	default:
+	}
+
+	record, ok := store.Get("job-running")
+	if !ok {
+		t.Fatal("expected running-intent record to remain persisted")
+	}
+	if record.DesiredState != meta.DesiredStateRunning {
+		t.Fatalf("persisted desired state = %s, want %s", record.DesiredState, meta.DesiredStateRunning)
+	}
+
+	if _, err := manager.Resubmit("job-running"); err != nil {
+		t.Fatalf("manual Resubmit returned error: %v", err)
+	}
+	select {
+	case mode := <-modes:
+		if mode != config.JobModeResume {
+			t.Fatalf("manual resume mode = %s, want %s", mode, config.JobModeResume)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for manual resume")
+	}
 	if err := manager.Cancel("job-running"); err != nil {
 		t.Fatalf("Cancel returned error: %v", err)
 	}
@@ -289,7 +361,7 @@ func TestShutdownDrainsAndRestoresRunningJobAutomatically(t *testing.T) {
 	}
 
 	restoreReg, restoreModes := newTestRegistry()
-	restoredManager := NewJobManager(restoreReg, WithJobStore(store))
+	restoredManager := NewJobManager(restoreReg, WithJobStore(store), WithAutoResume(true))
 	if err := restoredManager.RestorePersistedJobs(context.Background()); err != nil {
 		t.Fatalf("RestorePersistedJobs returned error: %v", err)
 	}

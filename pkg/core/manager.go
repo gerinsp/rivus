@@ -65,6 +65,7 @@ type JobManager struct {
 
 	jobStore          meta.JobStore
 	defaultMetaMySQL  string
+	autoResume        bool
 	jobStoreReady     bool
 	jobStoreReadyLock sync.Mutex
 
@@ -87,6 +88,15 @@ func WithJobStore(store meta.JobStore) JobManagerOption {
 func WithDefaultMetaMySQLDSN(dsn string) JobManagerOption {
 	return func(m *JobManager) {
 		m.defaultMetaMySQL = strings.TrimSpace(dsn)
+	}
+}
+
+// WithAutoResume controls whether jobs persisted with RUNNING intent are
+// automatically resumed during manager startup. Jobs are always restored and
+// remain available for manual resume when this is disabled.
+func WithAutoResume(enabled bool) JobManagerOption {
+	return func(m *JobManager) {
+		m.autoResume = enabled
 	}
 }
 
@@ -132,6 +142,7 @@ func NewJobManager(reg *connector.Registry, opts ...JobManagerOption) *JobManage
 		completedFailureDelivery:  make(map[string]struct{}),
 		failureRetryInitial:       defaultFailureNotificationRetryInitial,
 		failureRetryMax:           defaultFailureNotificationRetryMax,
+		autoResume:                false,
 		maxConcurrentSnapshotJobs: snapshotJobLimitFromEnv(),
 		snapshotQueueModes:        make(map[string]config.JobMode),
 		startingSnapshotJobs:      make(map[string]struct{}),
@@ -392,6 +403,9 @@ func (m *JobManager) RestorePersistedJobs(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if !m.autoResume {
+		log.Printf("[job-manager] automatic job resume disabled; loading %d persisted job(s) without starting them", len(records))
+	}
 
 	for _, record := range records {
 		cfg := m.normalizeConfig(record.Config)
@@ -411,8 +425,9 @@ func (m *JobManager) RestorePersistedJobs(ctx context.Context) error {
 		}
 
 		job := m.newManagedJob(cfg)
-		shouldResume := strings.EqualFold(string(record.DesiredState), string(meta.DesiredStateRunning))
-		m.restoreJobSnapshot(job, record, shouldResume)
+		resumeRequested := strings.EqualFold(string(record.DesiredState), string(meta.DesiredStateRunning))
+		shouldResume := m.autoResume && resumeRequested
+		m.restoreJobSnapshot(job, record, resumeRequested)
 
 		m.mu.Lock()
 		if _, exists := m.jobs[cfg.ID]; exists {
