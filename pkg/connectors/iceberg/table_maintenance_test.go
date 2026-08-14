@@ -149,6 +149,72 @@ func TestAutomaticCompactionRequiresActiveSmallFilesAndBytes(t *testing.T) {
 	}
 }
 
+func TestTableMaintenanceStatusSummarizesCurrentFileInventory(t *testing.T) {
+	now := time.Date(2026, 8, 14, 10, 0, 0, 0, time.UTC)
+	monitor := &tableMaintenanceMonitor{
+		cfg: config.IcebergConfig{
+			Warehouse: "asmat",
+			TableMaintenance: config.IcebergTableMaintenanceConfig{
+				Enabled:                      true,
+				CatalogName:                  "asmat",
+				RunnerResourceProfile:        "small",
+				MaxConcurrentJobs:            1,
+				DataFilesThreshold:           200,
+				EqualityDeleteFilesThreshold: 50,
+				SmallFileSizeBytes:           64 * 1024 * 1024,
+				SmallFilesMinCount:           10,
+				SmallFilesMinTotalBytes:      256 * 1024 * 1024,
+			},
+		},
+		states: map[string]*tableMaintenanceWatchState{
+			"analytics.orders": {
+				target:              config.IcebergTarget{Namespace: "analytics", Table: "orders"},
+				initialized:         true,
+				newDataFiles:        200,
+				newEqualityDeletes:  35,
+				activeDataFiles:     220,
+				activeSmallFiles:    180,
+				activeSmallBytes:    512 * 1024 * 1024,
+				activeEqDeletes:     35,
+				eligibilityReady:    true,
+				lastCheckedAt:       now.Add(-time.Minute),
+				lastExpireSnapshots: now,
+				lastOrphanCleanup:   now,
+			},
+			"analytics.customers": {
+				target:              config.IcebergTarget{Namespace: "analytics", Table: "customers"},
+				initialized:         true,
+				newDataFiles:        3,
+				activeDataFiles:     90,
+				activeSmallFiles:    25,
+				activeSmallBytes:    64 * 1024 * 1024,
+				activeEqDeletes:     7,
+				eligibilityReady:    true,
+				lastCheckedAt:       now.Add(-2 * time.Minute),
+				lastExpireSnapshots: now,
+				lastOrphanCleanup:   now,
+			},
+		},
+	}
+
+	status := monitor.statusLocked(now)
+	if status.State != "ready" || status.TablesReady != 1 || status.TablesScanned != 2 || status.TablesTotal != 2 {
+		t.Fatalf("status summary = %#v", status)
+	}
+	if status.ActiveDataFiles != 310 || status.ActiveEqualityDeleteFiles != 42 {
+		t.Fatalf("active file totals = data:%d equality:%d", status.ActiveDataFiles, status.ActiveEqualityDeleteFiles)
+	}
+	if status.EligibleSmallFiles != 205 || status.EligibleSmallBytes != 576*1024*1024 {
+		t.Fatalf("eligible totals = files:%d bytes:%d", status.EligibleSmallFiles, status.EligibleSmallBytes)
+	}
+	if len(status.Tables) != 2 || status.Tables[0].Identifier != "analytics.customers" || status.Tables[1].State != "ready" {
+		t.Fatalf("table status = %#v", status.Tables)
+	}
+	if status.CheckedAt != now.Add(-time.Minute).Format(time.RFC3339) {
+		t.Fatalf("checked_at = %q", status.CheckedAt)
+	}
+}
+
 func TestNormalizeIcebergConfigDefaultsAutomaticMaintenancePolicy(t *testing.T) {
 	cfg := normalizeIcebergConfig(config.IcebergConfig{
 		TableMaintenance: config.IcebergTableMaintenanceConfig{Enabled: true},

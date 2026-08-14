@@ -279,6 +279,20 @@ func NewSink(jobID, stateKey, jobName string, cfg config.IcebergConfig, retry co
 	return sink, nil
 }
 
+func (s *Sink) SetTableMaintenanceStatusReporter(reporter connector.TableMaintenanceStatusReporter) {
+	if reporter == nil {
+		return
+	}
+	if s.maintenance == nil {
+		reporter(&connector.TableMaintenanceStatus{
+			Enabled: false,
+			State:   "disabled",
+		})
+		return
+	}
+	s.maintenance.setStatusReporter(reporter)
+}
+
 func (s *Sink) withCommitSlot(ctx context.Context, progress commitProgress, fn func() error) error {
 	release, err := acquireGlobalCommitSlot(ctx, s.cfg.MaxConcurrentCommits, func() func() {
 		return s.startCommitProgressHeartbeat(ctx, "sink_commit_wait", "Waiting for Iceberg commit slot", progress)

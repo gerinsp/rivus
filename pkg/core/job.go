@@ -118,6 +118,7 @@ type Job struct {
 	status           JobStatus
 	errors           []JobError
 	progress         *JobProgress
+	maintenance      *connector.TableMaintenanceStatus
 	cancelFunc       context.CancelFunc
 	sourceCancelFunc context.CancelFunc
 	runDone          chan struct{}
@@ -196,6 +197,31 @@ func (j *Job) Progress() *JobProgress {
 
 	cp := *j.progress
 	return &cp
+}
+
+func (j *Job) TableMaintenanceStatus() *connector.TableMaintenanceStatus {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	return cloneTableMaintenanceStatus(j.maintenance)
+}
+
+func (j *Job) updateTableMaintenanceStatus(status *connector.TableMaintenanceStatus) {
+	j.mu.Lock()
+	j.maintenance = cloneTableMaintenanceStatus(status)
+	j.mu.Unlock()
+}
+
+func cloneTableMaintenanceStatus(status *connector.TableMaintenanceStatus) *connector.TableMaintenanceStatus {
+	if status == nil {
+		return nil
+	}
+	cloned := *status
+	cloned.Tables = make([]connector.TableMaintenanceTableStatus, len(status.Tables))
+	copy(cloned.Tables, status.Tables)
+	for index := range cloned.Tables {
+		cloned.Tables[index].Operations = append([]string(nil), status.Tables[index].Operations...)
+	}
+	return &cloned
 }
 
 func (j *Job) Checkpoint() *Checkpoint {
@@ -1281,6 +1307,10 @@ func (j *Job) startWithMode(mode config.JobMode) (err error) {
 	sink, err := j.registry.NewSink(sinkType, jctx, sinkCfg)
 	if err != nil {
 		return j.failStart("sink", err, cancel)
+	}
+	j.updateTableMaintenanceStatus(nil)
+	if reporter, ok := sink.(connector.TableMaintenanceStatusReporterSetter); ok {
+		reporter.SetTableMaintenanceStatusReporter(j.updateTableMaintenanceStatus)
 	}
 
 	// build minimal graph snapshot (refreshed on-demand by Graph())

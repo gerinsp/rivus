@@ -13,6 +13,7 @@ import (
 	icetable "github.com/apache/iceberg-go/table"
 
 	"github.com/gerinsp/rivus/pkg/config"
+	"github.com/gerinsp/rivus/pkg/connector"
 )
 
 type tableMaintenanceMonitor struct {
@@ -21,10 +22,11 @@ type tableMaintenanceMonitor struct {
 	cfg     config.IcebergConfig
 	sink    *Sink
 
-	mu     sync.Mutex
-	states map[string]*tableMaintenanceWatchState
-	wake   chan struct{}
-	paused bool
+	mu             sync.Mutex
+	states         map[string]*tableMaintenanceWatchState
+	wake           chan struct{}
+	paused         bool
+	statusReporter connector.TableMaintenanceStatusReporter
 }
 
 type tableMaintenanceWatchState struct {
@@ -35,9 +37,12 @@ type tableMaintenanceWatchState struct {
 	newEqualityDeletes  int
 	activeSmallFiles    int
 	activeSmallBytes    int64
+	activeDataFiles     int
 	activeEqDeletes     int
 	eligibilityReady    bool
 	eligibilityDirty    bool
+	lastCheckedAt       time.Time
+	lastInventoryError  string
 	lastExpireSnapshots time.Time
 	lastOrphanCleanup   time.Time
 	active              *activeTableMaintenance
@@ -73,6 +78,7 @@ func (m *tableMaintenanceMonitor) pauseSubmissions() {
 	m.mu.Lock()
 	m.paused = true
 	m.mu.Unlock()
+	m.publishStatus()
 }
 
 func (m *tableMaintenanceMonitor) resumeSubmissions() {
@@ -82,10 +88,21 @@ func (m *tableMaintenanceMonitor) resumeSubmissions() {
 	m.mu.Lock()
 	m.paused = false
 	m.mu.Unlock()
+	m.publishStatus()
 	select {
 	case m.wake <- struct{}{}:
 	default:
 	}
+}
+
+func (m *tableMaintenanceMonitor) setStatusReporter(reporter connector.TableMaintenanceStatusReporter) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.statusReporter = reporter
+	m.mu.Unlock()
+	m.publishStatus()
 }
 
 func validateAutomaticTableMaintenanceConfig(cfg config.IcebergConfig) error {
@@ -122,11 +139,17 @@ func (m *tableMaintenanceMonitor) registerTable(target config.IcebergTarget, tbl
 	state := m.stateLocked(target, now)
 	if !state.initialized {
 		state.initialized = true
+		state.eligibilityDirty = true
 		if tbl != nil && tbl.CurrentSnapshot() != nil {
 			state.lastSequenceNumber = tbl.CurrentSnapshot().SequenceNumber
 		}
 	}
 	m.mu.Unlock()
+	m.publishStatus()
+	select {
+	case m.wake <- struct{}{}:
+	default:
+	}
 }
 
 func (m *tableMaintenanceMonitor) observeTable(target config.IcebergTarget, tbl *icetable.Table, now time.Time) {
@@ -161,6 +184,7 @@ func (m *tableMaintenanceMonitor) observeTable(target config.IcebergTarget, tbl 
 		}
 	}
 	m.mu.Unlock()
+	m.publishStatus()
 
 	select {
 	case m.wake <- struct{}{}:
@@ -237,6 +261,10 @@ func durationOrDisabled(seconds int) string {
 
 func (m *tableMaintenanceMonitor) refreshDirtyEligibility(ctx context.Context) {
 	m.mu.Lock()
+	if m.paused {
+		m.mu.Unlock()
+		return
+	}
 	targets := make([]config.IcebergTarget, 0, len(m.states))
 	for _, state := range m.states {
 		if state != nil && state.eligibilityDirty && state.active == nil {
@@ -251,19 +279,22 @@ func (m *tableMaintenanceMonitor) refreshDirtyEligibility(ctx context.Context) {
 
 	for _, target := range targets {
 		requestCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		var smallFiles, equalityDeletes int
+		var dataFiles, smallFiles, equalityDeletes int
 		var smallBytes int64
 		tbl, err := m.sink.catalog.LoadTable(requestCtx, namespaceIdentifier(target.Namespace, target.Table))
 		if err == nil {
-			smallFiles, smallBytes, equalityDeletes, err = activeFileEligibility(requestCtx, tbl, m.cfg.TableMaintenance.SmallFileSizeBytes)
+			dataFiles, smallFiles, smallBytes, equalityDeletes, err = activeFileEligibility(requestCtx, tbl, m.cfg.TableMaintenance.SmallFileSizeBytes)
 			if err == nil {
 				m.mu.Lock()
 				state := m.states[tableKey(target.Namespace, target.Table)]
 				if state != nil {
+					state.activeDataFiles = dataFiles
 					state.activeSmallFiles = smallFiles
 					state.activeSmallBytes = smallBytes
 					state.activeEqDeletes = equalityDeletes
 					state.eligibilityReady = true
+					state.lastCheckedAt = time.Now().UTC()
+					state.lastInventoryError = ""
 				}
 				m.mu.Unlock()
 			}
@@ -273,31 +304,38 @@ func (m *tableMaintenanceMonitor) refreshDirtyEligibility(ctx context.Context) {
 			m.mu.Lock()
 			if state := m.states[tableKey(target.Namespace, target.Table)]; state != nil {
 				state.eligibilityDirty = true
+				state.lastInventoryError = err.Error()
 			}
 			m.mu.Unlock()
+			m.publishStatus()
 			log.Printf("[iceberg][job %s] maintenance eligibility target=%s error=%v", m.jobID, tableKey(target.Namespace, target.Table), err)
 			continue
 		}
-		log.Printf("[iceberg][job %s] maintenance eligibility target=%s small_files=%d small_bytes=%d equality_deletes=%d",
-			m.jobID, tableKey(target.Namespace, target.Table), smallFiles, smallBytes, equalityDeletes)
+		m.publishStatus()
+		log.Printf("[iceberg][job %s] maintenance eligibility target=%s data_files=%d small_files=%d small_bytes=%d equality_deletes=%d",
+			m.jobID, tableKey(target.Namespace, target.Table), dataFiles, smallFiles, smallBytes, equalityDeletes)
 	}
 }
 
-func activeFileEligibility(ctx context.Context, tbl *icetable.Table, smallFileSizeBytes int64) (int, int64, int, error) {
+func activeFileEligibility(ctx context.Context, tbl *icetable.Table, smallFileSizeBytes int64) (int, int, int64, int, error) {
 	if tbl == nil || tbl.CurrentSnapshot() == nil {
-		return 0, 0, 0, nil
+		return 0, 0, 0, 0, nil
 	}
 	tasks, err := tbl.Scan().PlanFiles(ctx)
 	if err != nil {
-		return 0, 0, 0, err
+		return 0, 0, 0, 0, err
 	}
+	dataFiles := 0
 	smallFiles := 0
 	var smallBytes int64
 	equalityDeletePaths := make(map[string]struct{})
 	for _, task := range tasks {
-		if task.File != nil && task.File.FileSizeBytes() < smallFileSizeBytes {
-			smallFiles++
-			smallBytes += task.File.FileSizeBytes()
+		if task.File != nil {
+			dataFiles++
+			if task.File.FileSizeBytes() < smallFileSizeBytes {
+				smallFiles++
+				smallBytes += task.File.FileSizeBytes()
+			}
 		}
 		for _, deleteFile := range task.EqualityDeleteFiles {
 			if deleteFile != nil {
@@ -305,7 +343,7 @@ func activeFileEligibility(ctx context.Context, tbl *icetable.Table, smallFileSi
 			}
 		}
 	}
-	return smallFiles, smallBytes, len(equalityDeletePaths), nil
+	return dataFiles, smallFiles, smallBytes, len(equalityDeletePaths), nil
 }
 
 func (m *tableMaintenanceMonitor) submitDue(ctx context.Context, now time.Time) {
@@ -365,6 +403,7 @@ func (m *tableMaintenanceMonitor) submitDue(ctx context.Context, now time.Time) 
 			state.active = active
 		}
 		m.mu.Unlock()
+		m.publishStatus()
 		log.Printf("[iceberg][job %s] automatic maintenance submitted target=%s operations=%s spark_submission_id=%s",
 			m.jobID, key, strings.Join(operationNames, ","), submission.SubmissionID)
 	}
@@ -546,12 +585,134 @@ func (m *tableMaintenanceMonitor) finishActive(key, submissionID string, succeed
 	}
 	state.active = nil
 	m.mu.Unlock()
+	m.publishStatus()
 	if refreshEligibility {
 		select {
 		case m.wake <- struct{}{}:
 		default:
 		}
 	}
+}
+
+func (m *tableMaintenanceMonitor) publishStatus() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	reporter := m.statusReporter
+	status := m.statusLocked(time.Now().UTC())
+	m.mu.Unlock()
+	if reporter != nil {
+		reporter(status)
+	}
+}
+
+func (m *tableMaintenanceMonitor) statusLocked(now time.Time) *connector.TableMaintenanceStatus {
+	cfg := m.cfg.TableMaintenance
+	status := &connector.TableMaintenanceStatus{
+		Enabled:                      cfg.Enabled,
+		State:                        "watching",
+		CatalogName:                  maintenanceCatalogName(m.cfg),
+		RunnerResourceProfile:        cfg.RunnerResourceProfile,
+		MaxConcurrentJobs:            cfg.MaxConcurrentJobs,
+		DataFilesThreshold:           cfg.DataFilesThreshold,
+		EqualityDeleteFilesThreshold: cfg.EqualityDeleteFilesThreshold,
+		SmallFileSizeBytes:           cfg.SmallFileSizeBytes,
+		SmallFilesMinCount:           cfg.SmallFilesMinCount,
+		SmallFilesMinTotalBytes:      cfg.SmallFilesMinTotalBytes,
+		Paused:                       m.paused,
+		Tables:                       make([]connector.TableMaintenanceTableStatus, 0, len(m.states)),
+	}
+
+	keys := make([]string, 0, len(m.states))
+	for key := range m.states {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	var latestChecked time.Time
+	for _, key := range keys {
+		state := m.states[key]
+		if state == nil {
+			continue
+		}
+		tableStatus := connector.TableMaintenanceTableStatus{
+			Namespace:                 state.target.Namespace,
+			Table:                     state.target.Table,
+			Identifier:                key,
+			State:                     "healthy",
+			ActiveDataFiles:           state.activeDataFiles,
+			ActiveEqualityDeleteFiles: state.activeEqDeletes,
+			EligibleSmallFiles:        state.activeSmallFiles,
+			EligibleSmallBytes:        state.activeSmallBytes,
+			NewDataFiles:              state.newDataFiles,
+			NewEqualityDeleteFiles:    state.newEqualityDeletes,
+			Error:                     state.lastInventoryError,
+		}
+		if !state.lastCheckedAt.IsZero() {
+			tableStatus.CheckedAt = state.lastCheckedAt.UTC().Format(time.RFC3339)
+			if state.lastCheckedAt.After(latestChecked) {
+				latestChecked = state.lastCheckedAt
+			}
+		}
+		if m.paused {
+			tableStatus.State = "waiting_for_snapshot"
+		} else if state.active != nil {
+			tableStatus.State = "running"
+			tableStatus.SubmissionID = state.active.submissionID
+			tableStatus.Operations = append([]string(nil), state.active.operations...)
+		} else if state.lastInventoryError != "" {
+			tableStatus.State = "error"
+		} else if !state.eligibilityReady {
+			tableStatus.State = "scanning"
+		} else if containsOperation(automaticOperationsDue(state, cfg, now), "rewrite_data_files") {
+			tableStatus.State = "ready"
+			status.TablesReady++
+		} else if state.newDataFiles > 0 || state.newEqualityDeletes > 0 {
+			tableStatus.State = "accumulating"
+		}
+
+		status.ActiveDataFiles += state.activeDataFiles
+		status.ActiveEqualityDeleteFiles += state.activeEqDeletes
+		status.EligibleSmallFiles += state.activeSmallFiles
+		status.EligibleSmallBytes += state.activeSmallBytes
+		if state.eligibilityReady {
+			status.TablesScanned++
+		}
+		if state.active != nil {
+			status.ActiveRuns++
+		}
+		if state.lastInventoryError != "" {
+			status.InventoryErrors++
+		}
+		status.Tables = append(status.Tables, tableStatus)
+	}
+	status.TablesTotal = len(status.Tables)
+	if !latestChecked.IsZero() {
+		status.CheckedAt = latestChecked.UTC().Format(time.RFC3339)
+	}
+
+	switch {
+	case m.paused:
+		status.State = "waiting_for_snapshot"
+	case status.ActiveRuns > 0:
+		status.State = "running"
+	case status.InventoryErrors > 0:
+		status.State = "error"
+	case status.TablesScanned < status.TablesTotal:
+		status.State = "scanning"
+	case status.TablesReady > 0:
+		status.State = "ready"
+	}
+	return status
+}
+
+func containsOperation(operations []TableMaintenanceOperation, wanted string) bool {
+	for _, operation := range operations {
+		if operation.Type == wanted {
+			return true
+		}
+	}
+	return false
 }
 
 func containsString(values []string, wanted string) bool {

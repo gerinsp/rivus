@@ -208,17 +208,18 @@ func (s *Server) handleJobByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"id":         job.Config.ID,
-			"name":       job.Config.Name,
-			"status":     job.GetStatus(),
-			"created":    job.Created,
-			"updated":    job.Updated,
-			"meta_key":   job.MetaKey(),
-			"checkpoint": job.Checkpoint(),
-			"progress":   job.Progress(),
-			"last_error": job.GetLastError(),
-			"errors":     job.GetErrors(),
-			"config":     job.Config,
+			"id":                  job.Config.ID,
+			"name":                job.Config.Name,
+			"status":              job.GetStatus(),
+			"created":             job.Created,
+			"updated":             job.Updated,
+			"meta_key":            job.MetaKey(),
+			"checkpoint":          job.Checkpoint(),
+			"progress":            job.Progress(),
+			"iceberg_maintenance": job.TableMaintenanceStatus(),
+			"last_error":          job.GetLastError(),
+			"errors":              job.GetErrors(),
+			"config":              job.Config,
 		})
 		return
 	}

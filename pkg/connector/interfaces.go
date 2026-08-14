@@ -58,6 +58,57 @@ type ProgressInfo struct {
 
 type ProgressReporter func(ProgressInfo)
 
+// TableMaintenanceStatus is a read-only snapshot of the Iceberg maintenance
+// monitor. Connectors publish it to the job runtime so the API and UI never
+// need to scan object storage or table manifests on every page refresh.
+type TableMaintenanceStatus struct {
+	Enabled                      bool                          `json:"enabled"`
+	State                        string                        `json:"state"`
+	CatalogName                  string                        `json:"catalog_name,omitempty"`
+	RunnerResourceProfile        string                        `json:"runner_resource_profile,omitempty"`
+	MaxConcurrentJobs            int                           `json:"max_concurrent_jobs,omitempty"`
+	DataFilesThreshold           int                           `json:"data_files_threshold,omitempty"`
+	EqualityDeleteFilesThreshold int                           `json:"equality_delete_files_threshold,omitempty"`
+	SmallFileSizeBytes           int64                         `json:"small_file_size_bytes,omitempty"`
+	SmallFilesMinCount           int                           `json:"small_files_min_count,omitempty"`
+	SmallFilesMinTotalBytes      int64                         `json:"small_files_min_total_bytes,omitempty"`
+	ActiveDataFiles              int                           `json:"active_data_files"`
+	ActiveEqualityDeleteFiles    int                           `json:"active_equality_delete_files"`
+	EligibleSmallFiles           int                           `json:"eligible_small_files"`
+	EligibleSmallBytes           int64                         `json:"eligible_small_bytes"`
+	TablesTotal                  int                           `json:"tables_total"`
+	TablesScanned                int                           `json:"tables_scanned"`
+	TablesReady                  int                           `json:"tables_ready"`
+	ActiveRuns                   int                           `json:"active_runs"`
+	InventoryErrors              int                           `json:"inventory_errors"`
+	Paused                       bool                          `json:"paused"`
+	CheckedAt                    string                        `json:"checked_at,omitempty"`
+	Tables                       []TableMaintenanceTableStatus `json:"tables"`
+}
+
+type TableMaintenanceTableStatus struct {
+	Namespace                 string   `json:"namespace"`
+	Table                     string   `json:"table"`
+	Identifier                string   `json:"identifier"`
+	State                     string   `json:"state"`
+	ActiveDataFiles           int      `json:"active_data_files"`
+	ActiveEqualityDeleteFiles int      `json:"active_equality_delete_files"`
+	EligibleSmallFiles        int      `json:"eligible_small_files"`
+	EligibleSmallBytes        int64    `json:"eligible_small_bytes"`
+	NewDataFiles              int      `json:"new_data_files"`
+	NewEqualityDeleteFiles    int      `json:"new_equality_delete_files"`
+	CheckedAt                 string   `json:"checked_at,omitempty"`
+	Error                     string   `json:"error,omitempty"`
+	SubmissionID              string   `json:"submission_id,omitempty"`
+	Operations                []string `json:"operations,omitempty"`
+}
+
+type TableMaintenanceStatusReporter func(*TableMaintenanceStatus)
+
+type TableMaintenanceStatusReporterSetter interface {
+	SetTableMaintenanceStatusReporter(TableMaintenanceStatusReporter)
+}
+
 // Optional capabilities (engine akan cek via type assertion)
 
 type TableRef struct {
