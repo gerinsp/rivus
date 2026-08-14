@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -190,6 +191,16 @@ func (s *Server) handleJobByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if len(parts) == 3 && parts[1] == "iceberg" && parts[2] == "maintenance" && r.Method == http.MethodPost {
+		s.handleJobIcebergMaintenance(w, r, id)
+		return
+	}
+
+	if len(parts) == 4 && parts[1] == "iceberg" && parts[2] == "maintenance" {
+		s.handleJobIcebergMaintenanceSubmission(w, r, id, parts[3])
+		return
+	}
+
 	if r.Method == http.MethodGet {
 		job, err := s.jobManager.Get(id)
 		if err != nil {
@@ -291,4 +302,66 @@ func (s *Server) handleJobIcebergOrphans(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) handleJobIcebergMaintenance(w http.ResponseWriter, r *http.Request, id string) {
+	job, err := s.jobManager.Get(id)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "job not found"})
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	defer r.Body.Close()
+	var req iceberg.TableMaintenanceRequest
+	decoder := json.NewDecoder(r.Body)
+	decoder.UseNumber()
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+
+	status := job.GetStatus()
+	streaming := status == core.JobStatusPending || status == core.JobStatusQueued || status == core.JobStatusRunning || status == core.JobStatusPausing
+	submission, err := iceberg.SubmitTableMaintenanceForJobConfig(r.Context(), job.Config.ID, job.Config, req, streaming)
+	if err != nil {
+		var sparkErr *iceberg.SparkMaintenanceError
+		if errors.As(err, &sparkErr) {
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusAccepted, submission)
+}
+
+func (s *Server) handleJobIcebergMaintenanceSubmission(w http.ResponseWriter, r *http.Request, id, submissionID string) {
+	job, err := s.jobManager.Get(id)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "job not found"})
+		return
+	}
+
+	var status *iceberg.SparkSubmissionStatus
+	switch r.Method {
+	case http.MethodGet:
+		status, err = iceberg.GetTableMaintenanceStatusForJobConfig(r.Context(), job.Config, submissionID)
+	case http.MethodDelete:
+		status, err = iceberg.CancelTableMaintenanceForJobConfig(r.Context(), job.Config, submissionID)
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if err != nil {
+		var sparkErr *iceberg.SparkMaintenanceError
+		if errors.As(err, &sparkErr) {
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
 }

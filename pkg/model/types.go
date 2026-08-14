@@ -5,12 +5,15 @@ import "time"
 type EventType string
 
 const (
-	EventTypeInsert        EventType = "INSERT"
-	EventTypeUpdate        EventType = "UPDATE"
-	EventTypeDelete        EventType = "DELETE"
-	EventTypeDDL           EventType = "DDL"
-	EventTypeCheckpoint    EventType = "CHECKPOINT"
-	EventTypeSnapshotBatch EventType = "SNAPSHOT_BATCH"
+	EventTypeInsert           EventType = "INSERT"
+	EventTypeUpdate           EventType = "UPDATE"
+	EventTypeDelete           EventType = "DELETE"
+	EventTypeDDL              EventType = "DDL"
+	EventTypeCheckpoint       EventType = "CHECKPOINT"
+	EventTypeSnapshotBatch    EventType = "SNAPSHOT_BATCH"
+	EventTypeSnapshotTableEnd EventType = "SNAPSHOT_TABLE_COMPLETE"
+	EventTypeSnapshotStart    EventType = "SNAPSHOT_START"
+	EventTypeSnapshotComplete EventType = "SNAPSHOT_COMPLETE"
 )
 
 type EventOrigin string
@@ -76,8 +79,11 @@ type Event struct {
 	SourceSchema  *TableSchema             `json:"source_schema,omitempty"`
 	SchemaChanges []SchemaChange           `json:"schema_changes,omitempty"`
 	// SnapshotStartOffset is the row offset before this snapshot batch.
-	SnapshotStartOffset int64      `json:"snapshot_start_offset,omitempty"`
-	Ack                 chan error `json:"-"`
+	SnapshotStartOffset int64 `json:"snapshot_start_offset,omitempty"`
+	// SnapshotRolling marks batches that are durably spooled by the sink and
+	// committed together when SnapshotTableEnd arrives.
+	SnapshotRolling bool       `json:"snapshot_rolling,omitempty"`
+	Ack             chan error `json:"-"`
 }
 
 type TableColumn struct {

@@ -54,11 +54,15 @@ const (
 
 // =======================
 
-var dorisColumnNamePattern = regexp.MustCompile(`^[.a-zA-Z0-9_+\-/?@#$%^&*"\s,:]{1,256}$`)
+var (
+	dorisColumnNamePattern = regexp.MustCompile(`^[.a-zA-Z0-9_+\-/?@#$%^&*"\s,:]{1,256}$`)
+)
 
 type columnBinding struct {
-	Source string
-	Target string
+	Source     string
+	Target     string
+	TargetType string
+	Nullable   bool
 }
 
 type Sink struct {
@@ -374,7 +378,12 @@ func (s *Sink) EnsureTable(ctx context.Context, targetDB, targetTable string, sc
 		}
 		colsDef = append(colsDef, col)
 		colsOrder = append(colsOrder, targetColName)
-		bindings = append(bindings, columnBinding{Source: c.Name, Target: targetColName})
+		bindings = append(bindings, columnBinding{
+			Source:     c.Name,
+			Target:     targetColName,
+			TargetType: dorisType,
+			Nullable:   c.IsNullable,
+		})
 	}
 
 	// UNIQUE KEY prefix
@@ -687,7 +696,7 @@ func (s *Sink) writeBatchPayload(
 				}
 			}
 
-			val, ok := normalizeDorisValue(ev.Data[binding.Source])
+			val, ok := normalizeDorisValueForColumn(ev.Data[binding.Source], binding)
 			if !ok {
 				if _, err := bw.WriteString("\\N"); err != nil {
 					return err
@@ -1037,6 +1046,17 @@ func (state *dorisRunState) flushAll(flushCtx context.Context) error {
 }
 
 func (state *dorisRunState) handleEvent(procCtx context.Context, ev model.Event) error {
+	if ev.Type == model.EventTypeSnapshotStart || ev.Type == model.EventTypeSnapshotComplete {
+		var err error
+		if ev.Type == model.EventTypeSnapshotComplete {
+			err = state.flushAll(procCtx)
+		}
+		if ev.Ack != nil {
+			ev.Ack <- err
+			close(ev.Ack)
+		}
+		return err
+	}
 	if ev.Type == model.EventTypeCheckpoint {
 		// Checkpoints can arrive after every binlog event. Coalesce them and
 		// persist only at a normal flush boundary so they do not turn each row
@@ -1262,10 +1282,17 @@ func (s *Sink) getColumnBindingsForTarget(ctx context.Context, targetDB, targetT
 	s.mu.RUnlock()
 
 	// 2) coba ambil dari Doris (DESC) lalu cache
-	if cols, err := s.fetchColumnsFromDoris(ctx, targetDB, targetTable); err == nil && len(cols) > 0 {
-		bindings := make([]columnBinding, 0, len(cols))
-		for _, col := range cols {
-			bindings = append(bindings, columnBinding{Source: col, Target: col})
+	if tableColumns, err := s.fetchDorisTableColumns(ctx, targetDB, targetTable); err == nil && len(tableColumns) > 0 {
+		bindings := make([]columnBinding, 0, len(tableColumns))
+		cols := make([]string, 0, len(tableColumns))
+		for _, col := range tableColumns {
+			cols = append(cols, col.Name)
+			bindings = append(bindings, columnBinding{
+				Source:     col.Name,
+				Target:     col.Name,
+				TargetType: col.Type,
+				Nullable:   col.IsNullable,
+			})
 		}
 		s.mu.Lock()
 		s.columns[key] = cols
@@ -1330,6 +1357,40 @@ func normalizeDorisValue(v any) (string, bool) {
 	}
 
 	return s, true
+}
+
+func normalizeDorisValueForColumn(v any, binding columnBinding) (string, bool) {
+	s, ok := dorisValueText(v)
+	if !ok {
+		return "", false
+	}
+	if !isDorisTemporalType(binding.TargetType) {
+		return normalizeDorisValue(v)
+	}
+
+	fixed, partial := util.NormalizeMySQLPartialDate(s)
+	if !partial {
+		return s, true
+	}
+	if binding.Nullable {
+		return "", false
+	}
+	return fixed, true
+}
+
+func dorisValueText(v any) (string, bool) {
+	if v == nil {
+		return "", false
+	}
+	if raw, ok := v.([]byte); ok {
+		return strings.TrimSpace(string(raw)), true
+	}
+	return strings.TrimSpace(fmt.Sprintf("%v", v)), true
+}
+
+func isDorisTemporalType(raw string) bool {
+	t := strings.ToUpper(strings.TrimSpace(raw))
+	return t == "DATE" || t == "DATEV2" || strings.HasPrefix(t, "DATETIME")
 }
 
 // ---- Stream Load label status polling (Option B) ----

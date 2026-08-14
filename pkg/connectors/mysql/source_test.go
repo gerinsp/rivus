@@ -24,6 +24,48 @@ import (
 	"github.com/gerinsp/rivus/pkg/util"
 )
 
+func TestEmitSnapshotBarrierWaitsForSinkAcknowledgement(t *testing.T) {
+	source := &Source{snapshotBatchEvents: true}
+	out := make(chan model.Event, 1)
+	acknowledged := make(chan struct{})
+
+	go func() {
+		ev := <-out
+		if ev.Type != model.EventTypeSnapshotComplete || ev.Origin != model.EventOriginSnapshot {
+			t.Errorf("barrier = %#v", ev)
+		}
+		ev.Ack <- nil
+		close(ev.Ack)
+		close(acknowledged)
+	}()
+
+	if err := source.emitSnapshotBarrier(context.Background(), out, model.EventTypeSnapshotComplete); err != nil {
+		t.Fatalf("emitSnapshotBarrier returned error: %v", err)
+	}
+	<-acknowledged
+}
+
+func TestEmitSnapshotTableCompleteCarriesRollingCommitBoundary(t *testing.T) {
+	source := &Source{jobID: "job-1"}
+	out := make(chan model.Event, 1)
+
+	go func() {
+		ev := <-out
+		if ev.Type != model.EventTypeSnapshotTableEnd || !ev.SnapshotRolling {
+			t.Errorf("table completion event = %#v", ev)
+		}
+		if ev.Schema != "app" || ev.Table != "orders" || ev.SnapshotStartOffset != 1234 {
+			t.Errorf("table completion scope = %#v", ev)
+		}
+		ev.Ack <- nil
+		close(ev.Ack)
+	}()
+
+	if err := source.emitSnapshotTableComplete(context.Background(), out, "app", "orders", 1234); err != nil {
+		t.Fatalf("emitSnapshotTableComplete returned error: %v", err)
+	}
+}
+
 func TestParseConfiguredTableEntrySupportsWildcardDatabasePatterns(t *testing.T) {
 	dbName, tableName, wildcard, ok := parseConfiguredTableEntry("App.*")
 	if !ok {

@@ -33,6 +33,7 @@ RUN apk add --no-cache tzdata
 
 COPY --from=builder /app/rivus /app/rivus
 COPY ui /app/ui
+COPY spark /app/spark
 
 EXPOSE 8080
 

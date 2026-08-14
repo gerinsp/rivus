@@ -16,6 +16,7 @@ import (
 	icetable "github.com/apache/iceberg-go/table"
 
 	"github.com/gerinsp/rivus/pkg/model"
+	"github.com/gerinsp/rivus/pkg/util"
 )
 
 type pendingRow struct {
@@ -133,9 +134,12 @@ func buildKeyFilter(schema *iceberglib.Schema, keys []map[string]interface{}) (i
 			}
 			ref := iceberglib.Reference(field.Name)
 			var pred iceberglib.BooleanExpression
-			if isMySQLZeroDateForType(field.Type, value) {
+			if normalized, partial := normalizeMySQLPartialTemporalValueForType(field.Type, value, !field.Required); partial && normalized == nil {
 				pred = iceberglib.IsNull(ref)
 			} else {
+				if partial {
+					value = normalized
+				}
 				lit, err := literalForValue(field.Type, value)
 				if err != nil {
 					return nil, fmt.Errorf("field %s: %w", col, err)
@@ -171,7 +175,7 @@ func buildRecordReader(schema *iceberglib.Schema, rows []map[string]interface{})
 	for _, row := range rows {
 		for idx, field := range arrSchema.Fields() {
 			value, _ := lookupColumnValue(row, field.Name)
-			if err := appendBuilderValue(bldr.Field(idx), field.Type, value); err != nil {
+			if err := appendBuilderValue(bldr.Field(idx), field.Type, field.Nullable, value); err != nil {
 				release()
 				return nil, nil, fmt.Errorf("column %s: %w", field.Name, err)
 			}
@@ -193,7 +197,7 @@ func buildRecordReader(schema *iceberglib.Schema, rows []map[string]interface{})
 	}, nil
 }
 
-func appendBuilderValue(builder array.Builder, dataType arrow.DataType, value interface{}) error {
+func appendBuilderValue(builder array.Builder, dataType arrow.DataType, nullable bool, value interface{}) error {
 	if value == nil {
 		builder.AppendNull()
 		return nil
@@ -242,7 +246,10 @@ func appendBuilderValue(builder array.Builder, dataType arrow.DataType, value in
 		builder.(*array.BinaryBuilder).Append(toBytes(value))
 		return nil
 	case *arrow.TimestampType:
-		if isMySQLZeroDateValue(value) {
+		if normalized, partial := normalizeMySQLPartialTemporalValue(value, nullable); partial {
+			value = normalized
+		}
+		if value == nil {
 			builder.AppendNull()
 			return nil
 		}
@@ -257,7 +264,10 @@ func appendBuilderValue(builder array.Builder, dataType arrow.DataType, value in
 		builder.(*array.TimestampBuilder).Append(ts)
 		return nil
 	case *arrow.Date32Type:
-		if isMySQLZeroDateValue(value) {
+		if normalized, partial := normalizeMySQLPartialTemporalValue(value, nullable); partial {
+			value = normalized
+		}
+		if value == nil {
 			builder.AppendNull()
 			return nil
 		}
@@ -571,6 +581,39 @@ func isMySQLZeroDateString(raw string) bool {
 	return raw == "0000-00-00" ||
 		strings.HasPrefix(raw, "0000-00-00 ") ||
 		strings.HasPrefix(raw, "0000-00-00T")
+}
+
+func normalizeMySQLPartialTemporalValue(value interface{}, nullable bool) (interface{}, bool) {
+	var raw string
+	switch v := value.(type) {
+	case string:
+		raw = v
+	case []byte:
+		raw = string(v)
+	default:
+		return value, false
+	}
+	fixed, partial := util.NormalizeMySQLPartialDate(raw)
+	if !partial {
+		return value, false
+	}
+	if nullable {
+		return nil, true
+	}
+	return fixed, true
+}
+
+func normalizeMySQLPartialTemporalValueForType(typ iceberglib.Type, value interface{}, nullable bool) (interface{}, bool) {
+	switch typ.(type) {
+	case iceberglib.DateType,
+		iceberglib.TimestampType,
+		iceberglib.TimestampTzType,
+		iceberglib.TimestampNsType,
+		iceberglib.TimestampTzNsType:
+		return normalizeMySQLPartialTemporalValue(value, nullable)
+	default:
+		return value, false
+	}
 }
 
 func parseTimeString(raw string) (time.Time, error) {

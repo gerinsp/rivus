@@ -41,9 +41,10 @@ type Source struct {
 	offsetSto meta.OffsetStore
 	progress  connector.ProgressReporter
 
-	allowedTables       map[string]bool // key lower "db.table"
-	skipSnapshotTables  map[string]bool
-	snapshotBatchEvents bool
+	allowedTables          map[string]bool // key lower "db.table"
+	skipSnapshotTables     map[string]bool
+	snapshotBatchEvents    bool
+	rollingSnapshotBatches bool
 }
 
 func NewSource(jobID, stateKey string, cfg config.MySQLConfig, retry config.RetryPolicy, offsetSto meta.OffsetStore, progress connector.ProgressReporter) (*Source, error) {
@@ -118,6 +119,10 @@ func NewSource(jobID, stateKey string, cfg config.MySQLConfig, retry config.Retr
 
 func (s *Source) UseSnapshotBatchEvents(enabled bool) {
 	s.snapshotBatchEvents = enabled
+}
+
+func (s *Source) UseRollingSnapshotBatches(enabled bool) {
+	s.rollingSnapshotBatches = enabled
 }
 
 func (s *Source) SetSinkType(sinkType string) {
@@ -298,6 +303,67 @@ func (s *Source) emitSnapshotBatch(ctx context.Context, out chan<- model.Event, 
 			} else {
 				log.Printf("[mysql][job %s] snapshot keepalive ok table=%s rows_emitted=%d", s.jobID, tableName, rowsEmitted)
 			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func (s *Source) emitSnapshotBarrier(ctx context.Context, out chan<- model.Event, eventType model.EventType) error {
+	if !s.snapshotBatchEvents {
+		return nil
+	}
+
+	ack := make(chan error, 1)
+	ev := model.Event{
+		Type:      eventType,
+		Origin:    model.EventOriginSnapshot,
+		Timestamp: time.Now(),
+		Ack:       ack,
+	}
+
+	select {
+	case out <- ev:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	select {
+	case err := <-ack:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *Source) emitSnapshotTableComplete(ctx context.Context, out chan<- model.Event, dbName, tableName string, rowsEmitted int64) error {
+	ack := make(chan error, 1)
+	ev := model.Event{
+		Type:                model.EventTypeSnapshotTableEnd,
+		Schema:              dbName,
+		Table:               tableName,
+		Origin:              model.EventOriginSnapshot,
+		Timestamp:           time.Now(),
+		SnapshotStartOffset: rowsEmitted,
+		SnapshotRolling:     true,
+		Ack:                 ack,
+	}
+
+	select {
+	case out <- ev:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	warnTimer := time.NewTimer(30 * time.Second)
+	defer warnTimer.Stop()
+	for {
+		select {
+		case err := <-ack:
+			return err
+		case <-warnTimer.C:
+			log.Printf("[WARN][mysql][job %s] waiting for rolled snapshot commit table=%s.%s rows=%d", s.jobID, dbName, tableName, rowsEmitted)
+			warnTimer.Reset(30 * time.Second)
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -1451,6 +1517,9 @@ func (s *Source) resumeSnapshotOnlyProgress(ctx context.Context, out chan<- mode
 		CurrentTableRows: progress.NextOffset,
 		TotalTables:      len(s.cfg.Tables),
 	})
+	if err := s.emitSnapshotBarrier(ctx, out, model.EventTypeSnapshotStart); err != nil {
+		return true, fmt.Errorf("start snapshot barrier failed: %w", err)
+	}
 
 	if err := util.RetryWithBackoff(ctx, s.retry, func() error {
 		return resume(ctx, out)
@@ -1459,6 +1528,9 @@ func (s *Source) resumeSnapshotOnlyProgress(ctx context.Context, out chan<- mode
 	}
 
 	_ = s.offsetSto.ClearSnapshotProgress(ctx, s.checkpointKey())
+	if err := s.emitSnapshotBarrier(ctx, out, model.EventTypeSnapshotComplete); err != nil {
+		return true, fmt.Errorf("complete snapshot barrier failed: %w", err)
+	}
 	s.reportProgress(connector.ProgressInfo{
 		Phase:           "snapshot_complete",
 		Summary:         "Snapshot-only resume complete",
@@ -1484,6 +1556,7 @@ func (s *Source) runInitialSnapshotOne(ctx context.Context, out chan<- model.Eve
 	}
 
 	cursor, rowsEmitted, cursorJSON := s.restoreSnapshotCursor(plan, resume)
+	rollingTable := s.rollingSnapshotBatches && rowsEmitted == 0
 
 	log.Printf("[mysql][job %s] snapshot start %s rows_emitted=%d mode=%s",
 		s.jobID,
@@ -1628,6 +1701,7 @@ func (s *Source) runInitialSnapshotOne(ctx context.Context, out chan<- model.Eve
 					Timestamp:           now,
 					Origin:              model.EventOriginSnapshot,
 					SnapshotStartOffset: rowsEmitted,
+					SnapshotRolling:     rollingTable,
 				}
 				keepAlive := func(ctx context.Context) error {
 					_, err := q.ExecContext(ctx, "DO 1")
@@ -1655,7 +1729,7 @@ func (s *Source) runInitialSnapshotOne(ctx context.Context, out chan<- model.Eve
 				}
 			}
 
-			if s.offsetSto != nil {
+			if s.offsetSto != nil && !rollingTable {
 				if err := s.offsetSto.SaveSnapshotProgress(ctx, s.checkpointKey(), plan.fullName, rowsEmitted, cursorJSON); err != nil {
 					return fmt.Errorf("save snapshot progress failed %s rows=%d: %w", plan.fullName, rowsEmitted, err)
 				}
@@ -1666,6 +1740,17 @@ func (s *Source) runInitialSnapshotOne(ctx context.Context, out chan<- model.Eve
 		}
 	}); err != nil {
 		return err
+	}
+
+	if rollingTable {
+		if err := s.emitSnapshotTableComplete(ctx, out, dbName, tblName, rowsEmitted); err != nil {
+			return fmt.Errorf("commit rolled snapshot table %s: %w", plan.fullName, err)
+		}
+		if s.offsetSto != nil {
+			if err := s.offsetSto.SaveSnapshotProgress(ctx, s.checkpointKey(), plan.fullName, rowsEmitted, cursorJSON); err != nil {
+				return fmt.Errorf("save rolled snapshot progress failed %s rows=%d: %w", plan.fullName, rowsEmitted, err)
+			}
+		}
 	}
 
 	log.Printf("[mysql][job %s] snapshot finished %s total=%d", s.jobID, plan.fullName, total)
@@ -2683,6 +2768,9 @@ func (s *Source) runFull(ctx context.Context, out chan<- model.Event, mode confi
 				return fmt.Errorf("save snapshot start failed: %w", err)
 			}
 		}
+		if err := s.emitSnapshotBarrier(ctx, out, model.EventTypeSnapshotStart); err != nil {
+			return fmt.Errorf("start snapshot barrier failed: %w", err)
+		}
 
 		if err := util.RetryWithBackoff(ctx, s.retry, func() error {
 			return s.RunInitialSnapshotAllFromSavedProgress(ctx, out)
@@ -2695,6 +2783,9 @@ func (s *Source) runFull(ctx context.Context, out chan<- model.Event, mode confi
 				return fmt.Errorf("mark snapshot done failed: %w", err)
 			}
 			_ = s.offsetSto.ClearSnapshotProgress(ctx, s.checkpointKey())
+		}
+		if err := s.emitSnapshotBarrier(ctx, out, model.EventTypeSnapshotComplete); err != nil {
+			return fmt.Errorf("complete snapshot barrier failed: %w", err)
 		}
 		s.reportProgress(connector.ProgressInfo{
 			Phase:           "snapshot_complete",
@@ -2722,6 +2813,9 @@ func (s *Source) runFull(ctx context.Context, out chan<- model.Event, mode confi
 			_ = s.offsetSto.DeleteJobState(ctx, s.checkpointKey())
 			_ = s.offsetSto.ClearSnapshotProgress(ctx, s.checkpointKey())
 		}
+		if err := s.emitSnapshotBarrier(ctx, out, model.EventTypeSnapshotStart); err != nil {
+			return fmt.Errorf("start snapshot barrier failed: %w", err)
+		}
 
 		if err := util.RetryWithBackoff(ctx, s.retry, func() error {
 			return s.RunInitialSnapshotAllFromSavedProgress(ctx, out)
@@ -2731,6 +2825,9 @@ func (s *Source) runFull(ctx context.Context, out chan<- model.Event, mode confi
 
 		if s.offsetSto != nil {
 			_ = s.offsetSto.ClearSnapshotProgress(ctx, s.checkpointKey())
+		}
+		if err := s.emitSnapshotBarrier(ctx, out, model.EventTypeSnapshotComplete); err != nil {
+			return fmt.Errorf("complete snapshot barrier failed: %w", err)
 		}
 		s.reportProgress(connector.ProgressInfo{
 			Phase:           "snapshot_complete",
@@ -2783,6 +2880,9 @@ func (s *Source) runFull(ctx context.Context, out chan<- model.Event, mode confi
 			if st.StartFile == "" || st.StartPos == 0 {
 				return fmt.Errorf("resume requested but snapshot start checkpoint is incomplete for job_id=%s", s.jobID)
 			}
+			if err := s.emitSnapshotBarrier(ctx, out, model.EventTypeSnapshotStart); err != nil {
+				return fmt.Errorf("start snapshot barrier failed: %w", err)
+			}
 
 			if err := util.RetryWithBackoff(ctx, s.retry, func() error {
 				return s.ResumeInitialSnapshotAll(ctx, out)
@@ -2794,6 +2894,9 @@ func (s *Source) runFull(ctx context.Context, out chan<- model.Event, mode confi
 				return fmt.Errorf("mark snapshot done failed: %w", err)
 			}
 			_ = s.offsetSto.ClearSnapshotProgress(ctx, s.checkpointKey())
+			if err := s.emitSnapshotBarrier(ctx, out, model.EventTypeSnapshotComplete); err != nil {
+				return fmt.Errorf("complete snapshot barrier failed: %w", err)
+			}
 			s.reportProgress(connector.ProgressInfo{
 				Phase:           "snapshot_complete",
 				Summary:         "Snapshot resume complete",

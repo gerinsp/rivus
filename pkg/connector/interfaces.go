@@ -15,6 +15,7 @@ type JobContext struct {
 	Mode       config.JobMode
 	StoredMode config.JobMode
 	SinkType   string
+	SinkConfig any
 
 	Retry     config.RetryPolicy
 	MetaStore meta.OffsetStore

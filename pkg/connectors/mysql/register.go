@@ -3,6 +3,7 @@ package mysql
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -24,10 +25,37 @@ func Register(reg *connector.Registry) {
 			return nil, err
 		}
 		inner.UseSnapshotBatchEvents(sinkUsesAcknowledgedSnapshotBatches(jctx.SinkType))
+		inner.UseRollingSnapshotBatches(snapshotRollingEnabledForSink(jctx.SinkType, jctx.SinkConfig))
 		inner.SetSinkType(jctx.SinkType)
 
 		return &sourceAdapter{inner: inner, mode: jctx.Mode, storedMode: jctx.StoredMode, tables: inner.tableRefs()}, nil
 	})
+}
+
+func snapshotRollingEnabledForSink(sinkType string, sinkConfig any) bool {
+	if !strings.EqualFold(strings.TrimSpace(sinkType), "iceberg_native") {
+		return false
+	}
+	if typed, ok := sinkConfig.(config.IcebergConfig); ok {
+		return typed.SnapshotRollingEnabled == nil || *typed.SnapshotRollingEnabled
+	}
+	configMap, ok := sinkConfig.(map[string]any)
+	if !ok {
+		return true
+	}
+	value, exists := configMap["snapshot_rolling_enabled"]
+	if !exists || value == nil {
+		return true
+	}
+	switch typed := value.(type) {
+	case bool:
+		return typed
+	case string:
+		parsed, err := strconv.ParseBool(strings.TrimSpace(typed))
+		return err == nil && parsed
+	default:
+		return false
+	}
 }
 
 func sinkUsesAcknowledgedSnapshotBatches(sinkType string) bool {

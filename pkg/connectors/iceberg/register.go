@@ -57,12 +57,74 @@ func normalizeIcebergConfig(c config.IcebergConfig) config.IcebergConfig {
 	c.SnapshotWriteMode = normalizeSnapshotWriteMode(c.SnapshotWriteMode)
 	c.SnapshotReplaceDeleteExecutor = normalizeSnapshotReplaceDeleteExecutor(c.SnapshotReplaceDeleteExecutor)
 	c.CDCDeleteExecutor = normalizeSnapshotReplaceDeleteExecutor(c.CDCDeleteExecutor)
+	c.TableMaintenance.SparkRESTURI = strings.TrimRight(strings.TrimSpace(c.TableMaintenance.SparkRESTURI), "/")
+	c.TableMaintenance.RunnerURI = strings.TrimRight(strings.TrimSpace(c.TableMaintenance.RunnerURI), "/")
+	c.TableMaintenance.RunnerAPIToken = strings.TrimSpace(c.TableMaintenance.RunnerAPIToken)
+	c.TableMaintenance.RunnerResourceProfile = strings.ToLower(strings.TrimSpace(c.TableMaintenance.RunnerResourceProfile))
+	c.TableMaintenance.SparkMaster = strings.TrimSpace(c.TableMaintenance.SparkMaster)
+	c.TableMaintenance.AppResource = strings.TrimSpace(c.TableMaintenance.AppResource)
+	c.TableMaintenance.MainClass = strings.TrimSpace(c.TableMaintenance.MainClass)
+	c.TableMaintenance.ClientSparkVersion = strings.TrimSpace(c.TableMaintenance.ClientSparkVersion)
+	c.TableMaintenance.CatalogName = strings.TrimSpace(c.TableMaintenance.CatalogName)
+	c.TableMaintenance.RESTAuthHeader = strings.TrimSpace(c.TableMaintenance.RESTAuthHeader)
+	c.SnapshotSpoolDirectory = strings.TrimSpace(c.SnapshotSpoolDirectory)
+	if c.TableMaintenance.Enabled {
+		if c.TableMaintenance.RunnerResourceProfile == "" {
+			c.TableMaintenance.RunnerResourceProfile = "small"
+		}
+		if c.TableMaintenance.PollIntervalSeconds <= 0 {
+			c.TableMaintenance.PollIntervalSeconds = 60
+		}
+		if c.TableMaintenance.MaxConcurrentJobs <= 0 {
+			c.TableMaintenance.MaxConcurrentJobs = 1
+		}
+		if c.TableMaintenance.DataFilesThreshold == 0 {
+			c.TableMaintenance.DataFilesThreshold = 200
+		}
+		if c.TableMaintenance.EqualityDeleteFilesThreshold == 0 {
+			c.TableMaintenance.EqualityDeleteFilesThreshold = 50
+		}
+		if c.TableMaintenance.SmallFileSizeBytes == 0 {
+			c.TableMaintenance.SmallFileSizeBytes = 64 * 1024 * 1024
+		}
+		if c.TableMaintenance.SmallFilesMinCount == 0 {
+			c.TableMaintenance.SmallFilesMinCount = 10
+		}
+		if c.TableMaintenance.SmallFilesMinTotalBytes == 0 {
+			c.TableMaintenance.SmallFilesMinTotalBytes = 256 * 1024 * 1024
+		}
+		c.TableMaintenance.CompactOptions = normalizeAutomaticCompactOptions(c.TableMaintenance.CompactOptions)
+		if c.TableMaintenance.ExpireSnapshotsIntervalSeconds == 0 {
+			c.TableMaintenance.ExpireSnapshotsIntervalSeconds = 6 * 60 * 60
+		}
+		if c.TableMaintenance.ExpireSnapshotsOlderThanHours <= 0 {
+			c.TableMaintenance.ExpireSnapshotsOlderThanHours = 7 * 24
+		}
+		if c.TableMaintenance.ExpireSnapshotsRetainLast <= 0 {
+			c.TableMaintenance.ExpireSnapshotsRetainLast = 10
+		}
+		if c.TableMaintenance.OrphanCleanupIntervalSeconds == 0 {
+			c.TableMaintenance.OrphanCleanupIntervalSeconds = 24 * 60 * 60
+		}
+		if c.TableMaintenance.OrphanCleanupOlderThanHours <= 0 {
+			c.TableMaintenance.OrphanCleanupOlderThanHours = 72
+		}
+	}
 
 	if c.BatchSize <= 0 {
 		c.BatchSize = 200
 	}
 	if c.SnapshotBatchSize <= 0 {
 		c.SnapshotBatchSize = 10000
+	}
+	if c.SnapshotTargetFileSizeBytes <= 0 {
+		c.SnapshotTargetFileSizeBytes = 128 * 1024 * 1024
+	}
+	if c.SnapshotParquetRowGroupRows <= 0 {
+		c.SnapshotParquetRowGroupRows = 50000
+	}
+	if c.SnapshotSpoolMaxBytes <= 0 {
+		c.SnapshotSpoolMaxBytes = 20 * 1024 * 1024 * 1024
 	}
 	if c.MaxBatchBytes <= 0 {
 		c.MaxBatchBytes = config.ByteSize(128 * 1024 * 1024)
@@ -177,6 +239,35 @@ func normalizeIcebergConfig(c config.IcebergConfig) config.IcebergConfig {
 	c.MetadataColumns = normalizeMetadataColumnsConfig(c.MetadataColumns)
 
 	return c
+}
+
+func normalizeAutomaticCompactOptions(input map[string]any) map[string]any {
+	options := copyAnyMap(input)
+	if _, exists := options["strategy"]; !exists {
+		options["strategy"] = "binpack"
+	}
+	rewriteOptions := stringAnyMap(options["options"])
+	if rewriteOptions == nil {
+		rewriteOptions = make(map[string]any)
+	}
+	defaults := map[string]any{
+		"target-file-size-bytes":             "134217728",
+		"min-file-size-bytes":                "67108864",
+		"max-file-size-bytes":                "241591910",
+		"min-input-files":                    "10",
+		"max-file-group-size-bytes":          "268435456",
+		"max-concurrent-file-group-rewrites": "1",
+		"partial-progress.enabled":           "true",
+		"partial-progress.max-commits":       "100",
+		"rewrite-job-order":                  "files-desc",
+	}
+	for key, value := range defaults {
+		if _, exists := rewriteOptions[key]; !exists {
+			rewriteOptions[key] = value
+		}
+	}
+	options["options"] = rewriteOptions
+	return options
 }
 
 func normalizeMetadataColumnsConfig(c config.IcebergMetadataColumnsConfig) config.IcebergMetadataColumnsConfig {

@@ -40,14 +40,16 @@ const (
 )
 
 type Sink struct {
-	jobID     string
-	stateKey  string
-	jobName   string
-	cfg       config.IcebergConfig
-	retry     config.RetryPolicy
-	offsetSto meta.OffsetStore
-	progress  connector.ProgressReporter
-	catalog   icecatalog.Catalog
+	jobID            string
+	stateKey         string
+	jobName          string
+	cfg              config.IcebergConfig
+	retry            config.RetryPolicy
+	offsetSto        meta.OffsetStore
+	progress         connector.ProgressReporter
+	catalog          icecatalog.Catalog
+	maintenance      *tableMaintenanceMonitor
+	snapshotSpoolDir string
 
 	equalityCommitter cdcEqualityCommitter
 
@@ -75,6 +77,7 @@ type tableState struct {
 	lastFlushAt             time.Time
 	lastFlushDuration       time.Duration
 	flushCount              uint64
+	snapshotSpool           *snapshotSpool
 }
 
 type reducedBatch struct {
@@ -243,6 +246,9 @@ func NewSink(jobID, stateKey, jobName string, cfg config.IcebergConfig, retry co
 	if err := validateSnapshotTruncateConfig(cfg); err != nil {
 		return nil, err
 	}
+	if err := validateAutomaticTableMaintenanceConfig(cfg); err != nil {
+		return nil, err
+	}
 
 	cat, err := newCatalog(context.Background(), cfg)
 	if err != nil {
@@ -262,6 +268,14 @@ func NewSink(jobID, stateKey, jobName string, cfg config.IcebergConfig, retry co
 		states:        make(map[string]*tableState),
 	}
 	sink.equalityCommitter = rivusEqualityCommitter{sink: sink}
+	sink.maintenance = newTableMaintenanceMonitor(jobID, sink.jobName, cfg, sink)
+	if snapshotRollingEnabled(cfg) {
+		spoolDir, err := prepareSnapshotSpoolDirectory(cfg.SnapshotSpoolDirectory, jobID, stateKey)
+		if err != nil {
+			return nil, err
+		}
+		sink.snapshotSpoolDir = spoolDir
+	}
 	return sink, nil
 }
 
@@ -938,9 +952,11 @@ func (s *Sink) keyDeleteTrinoSQL(state *tableState, keys []map[string]interface{
 				return "", fmt.Errorf("field %s not found in iceberg schema", col)
 			}
 			quotedField := quoteTrinoIdentifier(field.Name)
-			if isMySQLZeroDateForType(field.Type, value) {
+			if normalized, partial := normalizeMySQLPartialTemporalValueForType(field.Type, value, !field.Required); partial && normalized == nil {
 				parts = append(parts, quotedField+" IS NULL")
 				continue
+			} else if partial {
+				value = normalized
 			}
 			lit, err := trinoLiteralForAny(field.Type, value)
 			if err != nil {
@@ -1242,6 +1258,9 @@ func (s *Sink) EnsureTable(ctx context.Context, targetSchema, targetTable string
 	state.lastTouchedAt = now
 	s.updateTargetTableStatesLocked(targetSchema, targetTable, tbl, now)
 	s.mu.Unlock()
+	if s.maintenance != nil {
+		s.maintenance.registerTable(config.IcebergTarget{Namespace: targetSchema, Table: targetTable}, tbl, now)
+	}
 
 	return nil
 }
@@ -1342,8 +1361,12 @@ func (s *Sink) ResetTargetTable(ctx context.Context, targetSchema, targetTable s
 }
 
 func (s *Sink) Run(ctx context.Context, in <-chan model.Event) error {
+	defer s.cleanupSnapshotSpoolDirectory()
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
+	if s.maintenance != nil {
+		go s.maintenance.run(ctx)
+	}
 
 	for {
 		select {
@@ -1366,12 +1389,18 @@ func (s *Sink) Run(ctx context.Context, in <-chan model.Event) error {
 }
 
 func (s *Sink) handleEvent(ctx context.Context, ev model.Event) error {
+	if ev.Type == model.EventTypeSnapshotStart || ev.Type == model.EventTypeSnapshotComplete {
+		return s.handleSnapshotBarrier(ctx, ev)
+	}
 	if ev.Type == model.EventTypeCheckpoint {
 		s.rememberOffset(ev.SourceOffset)
 		return s.commitPendingOffset(ctx)
 	}
 	if ev.Type == model.EventTypeSnapshotBatch {
 		return s.handleSnapshotBatch(ctx, ev)
+	}
+	if ev.Type == model.EventTypeSnapshotTableEnd {
+		return s.handleSnapshotTableComplete(ctx, ev)
 	}
 
 	sourceKey := tableKey(ev.Schema, ev.Table)
@@ -1404,6 +1433,31 @@ func (s *Sink) handleEvent(ctx context.Context, ev model.Event) error {
 	return nil
 }
 
+func (s *Sink) handleSnapshotBarrier(ctx context.Context, ev model.Event) (err error) {
+	if ev.Ack != nil {
+		defer func() {
+			ev.Ack <- err
+			close(ev.Ack)
+		}()
+	}
+
+	switch ev.Type {
+	case model.EventTypeSnapshotStart:
+		s.cleanupSnapshotSpools()
+		if s.maintenance != nil {
+			s.maintenance.pauseSubmissions()
+		}
+	case model.EventTypeSnapshotComplete:
+		if err := s.flushAll(ctx); err != nil {
+			return err
+		}
+		if s.maintenance != nil {
+			s.maintenance.resumeSubmissions()
+		}
+	}
+	return nil
+}
+
 func (s *Sink) handleSnapshotBatch(ctx context.Context, ev model.Event) (err error) {
 	if ev.Ack != nil {
 		defer func() {
@@ -1425,6 +1479,16 @@ func (s *Sink) handleSnapshotBatch(ctx context.Context, ev model.Event) (err err
 	}
 	if err := s.flushState(ctx, state); err != nil {
 		return err
+	}
+	if ev.SnapshotRolling && snapshotRollingEnabled(s.cfg) && supportsRollingSnapshotMode(s.snapshotWriteModeForTableState(state)) {
+		if ev.SnapshotStartOffset == 0 {
+			s.resetSnapshotSpool(state)
+		}
+		if err := s.appendSnapshotSpool(ctx, state, ev.Rows, ev.Timestamp, ev.SnapshotStartOffset); err != nil {
+			return err
+		}
+		clearRows(ev.Rows)
+		return nil
 	}
 
 	startedAt := time.Now()
@@ -2800,6 +2864,9 @@ func (s *Sink) logWriteTiming(state *tableState, result flushResult, err error, 
 
 func (s *Sink) updateStateTableAfterWrite(state *tableState, updated *icetable.Table) {
 	s.recordTableSnapshotMetrics(state, updated)
+	if s.maintenance != nil && state != nil {
+		s.maintenance.observeTable(config.IcebergTarget{Namespace: state.targetNamespace, Table: state.targetTable}, updated, time.Now())
+	}
 	s.mu.Lock()
 	now := time.Now()
 	state.table = updated
@@ -3046,7 +3113,7 @@ func (s *Sink) evictIdle(now time.Time) {
 
 	s.mu.Lock()
 	for _, st := range s.states {
-		if st.table == nil || len(st.pending) > 0 {
+		if st.table == nil || len(st.pending) > 0 || st.snapshotSpool != nil {
 			continue
 		}
 

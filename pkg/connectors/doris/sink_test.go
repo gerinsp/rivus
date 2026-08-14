@@ -140,6 +140,32 @@ func TestWriteBatchPayloadAddsDeleteMarker(t *testing.T) {
 	}
 }
 
+func TestWriteBatchPayloadNormalizesMySQLPartialDates(t *testing.T) {
+	var payload bytes.Buffer
+	err := (&Sink{}).writeBatchPayload(
+		&payload,
+		[]columnBinding{
+			{Source: "nullable_date", Target: "nullable_date", TargetType: "DATE", Nullable: true},
+			{Source: "required_date", Target: "required_date", TargetType: "DATE", Nullable: false},
+			{Source: "date_text", Target: "date_text", TargetType: "VARCHAR(32)", Nullable: true},
+		},
+		[]bool{false, false, true},
+		[]int{0, 0, 32},
+		[]model.Event{{Data: map[string]interface{}{
+			"nullable_date": "2014-05-00",
+			"required_date": "2014-05-00",
+			"date_text":     "2014-05-00",
+		}}},
+	)
+	if err != nil {
+		t.Fatalf("writeBatchPayload() returned error: %v", err)
+	}
+	want := "\\N" + fieldSep + "2014-05-01" + fieldSep + "2014-05-00" + fieldSep + "0\n"
+	if payload.String() != want {
+		t.Fatalf("payload = %q, want %q", payload.String(), want)
+	}
+}
+
 func TestSendBatchUsesMergeDeleteSemantics(t *testing.T) {
 	var gotHeaders http.Header
 	var gotBody string

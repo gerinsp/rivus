@@ -28,6 +28,39 @@ sink:
     max_batch_bytes: 128MB
     flush_seconds: 2
     checkpoint_flush_seconds: 10
+    # Initial snapshot batches are spooled to local disk, then committed as
+    # rolling Parquet files near 128 MiB. Small tables still produce one small file.
+    snapshot_rolling_enabled: true
+    snapshot_target_file_size_bytes: 134217728
+    snapshot_parquet_row_group_rows: 50000
+    snapshot_spool_directory: /tmp/rivus-snapshot-spool
+    snapshot_spool_max_bytes: 21474836480
+    # Optional automatic maintenance through the pipeline Spark orchestrator.
+    # table_maintenance:
+    #   enabled: true
+    #   runner_uri: "http://runner-app:8001"
+    #   runner_api_token: "${RUNNER_API_TOKEN}"
+    #   runner_resource_profile: small
+    #   catalog_name: rivus
+    #   data_files_threshold: 200
+    #   equality_delete_files_threshold: 50
+    #   small_file_size_bytes: 67108864       # active files below 64 MiB
+    #   small_files_min_count: 10
+    #   small_files_min_total_bytes: 268435456 # at least 256 MiB combined
+    #   compact_options:                       # memory-safe defaults shown explicitly
+    #     strategy: binpack
+    #     options:
+    #       target-file-size-bytes: "134217728"
+    #       min-input-files: "10"
+    #       max-file-group-size-bytes: "268435456"
+    #       max-concurrent-file-group-rewrites: "1"
+    #   expire_snapshots_interval_seconds: 21600 # 6 hours
+    #   expire_snapshots_older_than_hours: 168   # 7 days
+    #   expire_snapshots_retain_last: 10
+    #   orphan_cleanup_interval_seconds: 86400   # 1 day
+    #   orphan_cleanup_older_than_hours: 72
+    #   spark_properties:
+    #     spark.jars.packages: "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.10.0,org.apache.iceberg:iceberg-aws-bundle:1.10.0"
 
 retry:
   max_attempts: 10

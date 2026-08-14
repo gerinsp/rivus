@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow/array"
 	iceberglib "github.com/apache/iceberg-go"
 	icerest "github.com/apache/iceberg-go/catalog/rest"
 	"github.com/apache/iceberg-go/table"
@@ -872,6 +873,40 @@ func TestBuildRecordReaderConvertsMySQLZeroDateToNull(t *testing.T) {
 	}
 }
 
+func TestBuildRecordReaderNormalizesMySQLPartialDates(t *testing.T) {
+	schema := iceberglib.NewSchema(1,
+		iceberglib.NestedField{ID: 1, Name: "id", Type: iceberglib.PrimitiveTypes.Int64, Required: true},
+		iceberglib.NestedField{ID: 2, Name: "nullable_date", Type: iceberglib.PrimitiveTypes.Date, Required: false},
+		iceberglib.NestedField{ID: 3, Name: "required_date", Type: iceberglib.PrimitiveTypes.Date, Required: true},
+		iceberglib.NestedField{ID: 4, Name: "date_text", Type: iceberglib.PrimitiveTypes.String, Required: false},
+	)
+	reader, release, err := buildRecordReader(schema, []map[string]interface{}{{
+		"id":            int64(1),
+		"nullable_date": "2014-05-00",
+		"required_date": "2014-05-00",
+		"date_text":     "2014-05-00",
+	}})
+	if err != nil {
+		t.Fatalf("buildRecordReader returned error: %v", err)
+	}
+	defer release()
+	if !reader.Next() {
+		t.Fatal("reader produced no record")
+	}
+	rec := reader.Record()
+	if rec.Column(1).NullN() != 1 {
+		t.Fatalf("nullable_date null count = %d, want 1", rec.Column(1).NullN())
+	}
+	required := rec.Column(2).(*array.Date32)
+	if got, want := required.Value(0).ToTime().UTC().Format("2006-01-02"), "2014-05-01"; got != want {
+		t.Fatalf("required_date = %q, want %q", got, want)
+	}
+	text := rec.Column(3).(*array.String)
+	if got, want := text.Value(0), "2014-05-00"; got != want {
+		t.Fatalf("date_text = %q, want %q", got, want)
+	}
+}
+
 func TestSplitRowsByLimitsHonorsRowLimit(t *testing.T) {
 	rows := []map[string]interface{}{
 		{"id": int64(1)},
@@ -911,6 +946,18 @@ func TestNormalizeIcebergConfigDefaultsSnapshotWriteMode(t *testing.T) {
 	}
 	if got, want := cfg.CheckpointFlushSeconds, 10; got != want {
 		t.Fatalf("CheckpointFlushSeconds = %d, want %d", got, want)
+	}
+	if !snapshotRollingEnabled(cfg) {
+		t.Fatal("SnapshotRollingEnabled should default to true")
+	}
+	if got, want := cfg.SnapshotTargetFileSizeBytes, int64(128*1024*1024); got != want {
+		t.Fatalf("SnapshotTargetFileSizeBytes = %d, want %d", got, want)
+	}
+	if got, want := cfg.SnapshotParquetRowGroupRows, 50000; got != want {
+		t.Fatalf("SnapshotParquetRowGroupRows = %d, want %d", got, want)
+	}
+	if got, want := cfg.SnapshotSpoolMaxBytes, int64(20*1024*1024*1024); got != want {
+		t.Fatalf("SnapshotSpoolMaxBytes = %d, want %d", got, want)
 	}
 
 	cfg = normalizeIcebergConfig(config.IcebergConfig{SnapshotWriteMode: " Delete-Append "})

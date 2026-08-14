@@ -24,6 +24,7 @@ Rivus is a small streaming data engine for moving table data from MySQL into ana
 - MySQL binlog CDC using `go-mysql`.
 - Doris sink with table creation, DDL forwarding, batching, retries, and stream-load support.
 - Native Iceberg REST catalog sink for object storage-backed tables.
+- Automatic Iceberg snapshot watching and Spark-submitted table maintenance.
 - Persistent offsets and job registry in MySQL metadata storage.
 - Multi-job REST API and dashboard UI.
 - Pause/resume behavior that drains buffered events before checkpointing.
@@ -168,6 +169,100 @@ AWS_ACCESS_KEY_ID=change-me
 AWS_SECRET_ACCESS_KEY=change-me
 AWS_DEFAULT_REGION=us-east-1
 ```
+
+## Automatic Iceberg Table Maintenance
+
+An active `iceberg_native` sink can watch snapshots created by its own Rivus
+job and asynchronously submit maintenance through `runner-app` (preferred) or
+directly to Spark Standalone. Automatic Rivus maintenance does not pause CDC.
+Defaults are 200 new data files for compaction,
+50 new equality-delete files for compaction, snapshot expiration every 6 hours,
+and orphan cleanup every day.
+
+During an initial or resumed source snapshot, Rivus keeps counting newly added
+files but suppresses automatic maintenance submissions. An acknowledged
+`SNAPSHOT_COMPLETE` barrier releases the watcher after the final snapshot batch
+is committed; CDC then starts immediately while any due catch-up maintenance is
+submitted asynchronously.
+
+```yaml
+sink:
+  type: iceberg_native
+  config:
+    # normal Iceberg REST/S3 settings...
+    table_maintenance:
+      enabled: true
+      runner_uri: http://runner-app:8001
+      runner_api_token: ${RUNNER_API_TOKEN}
+      runner_resource_profile: small
+      catalog_name: rivus
+      data_files_threshold: 200
+      equality_delete_files_threshold: 50
+      small_file_size_bytes: 67108864
+      small_files_min_count: 10
+      small_files_min_total_bytes: 268435456
+      compact_options:
+        strategy: binpack
+        options:
+          target-file-size-bytes: "134217728"
+          min-input-files: "10"
+          max-file-group-size-bytes: "268435456"
+          max-concurrent-file-group-rewrites: "1"
+      expire_snapshots_interval_seconds: 21600
+      expire_snapshots_older_than_hours: 168
+      expire_snapshots_retain_last: 10
+      orphan_cleanup_interval_seconds: 86400
+      orphan_cleanup_older_than_hours: 72
+```
+
+`runner-app` stages the generated maintenance SQL, applies its configured Spark
+catalog and resource profile, and owns status and cancellation. Direct Spark
+REST remains available as a compatibility fallback using `spark_rest_uri`,
+`spark_master`, and `app_resource`; in that mode, enable Spark's REST submission
+server and mount `spark/iceberg_table_maintenance.py` on the cluster.
+
+Maintenance can also be submitted on demand:
+
+```sh
+curl -X POST -H 'Content-Type: application/json' \
+  -d '{"tables":["analytics.orders"],"operations":[{"type":"rewrite_data_files"}]}' \
+  http://localhost:8080/api/jobs/example-mysql-to-iceberg/iceberg/maintenance
+
+curl http://localhost:8080/api/jobs/example-mysql-to-iceberg/iceberg/maintenance/driver-20260813120000-0000
+```
+
+Use `DELETE` on the submission URL to cancel it. On active streams, Rivus
+rejects non-dry-run orphan cleanup with a cutoff newer than 72 hours.
+
+Before automatic compaction, Rivus plans the current Iceberg snapshot and
+requires both the new-file threshold and the active-small-file thresholds.
+Files retained only by old snapshots or present only in object storage do not
+qualify. Eligibility checks run only for tables changed by the Rivus job.
+The default rewrite profile processes one file group at a time and limits each
+group to 256 MiB, so a small table cannot turn into an unbounded Spark rewrite.
+
+Initial MySQL snapshots use a disk-backed rolling writer by default for
+`iceberg_native`. Each source batch is written to a local Arrow spool and
+acknowledged without advancing the durable table progress. At table completion,
+Rivus streams the spool into Iceberg Parquet files targeting 128 MiB and only
+then advances snapshot progress. This bounds memory to roughly one source batch;
+a crash discards the partial spool and safely replays that table from MySQL.
+
+```yaml
+sink:
+  type: iceberg_native
+  config:
+    snapshot_rolling_enabled: true
+    snapshot_target_file_size_bytes: 134217728 # 128 MiB
+    snapshot_parquet_row_group_rows: 50000     # bounds Parquet writer memory
+    snapshot_spool_directory: /tmp/rivus-snapshot-spool
+    snapshot_spool_max_bytes: 21474836480      # 20 GiB per table safety limit
+```
+
+The spool directory needs enough local disk for the largest table's uncompressed
+Arrow snapshot. Set `snapshot_rolling_enabled: false` to restore per-batch
+snapshot commits. Resuming a legacy snapshot that already has a non-zero row
+offset also keeps the legacy per-batch path for that table.
 
 ## Docker
 

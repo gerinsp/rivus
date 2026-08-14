@@ -1081,19 +1081,58 @@ async function resubmitJobWithoutPrompt(id) {
   return await operationErrorMessage(res, 'Resume');
 }
 
-async function resumeJobsWithLimit(ids, limit = 4) {
-  const failures = [];
-  let next = 0;
-  const workerCount = Math.min(limit, ids.length);
-  const workers = Array.from({ length: workerCount }, async () => {
-    while (next < ids.length) {
-      const id = ids[next];
-      next += 1;
-      const error = await resubmitJobWithoutPrompt(id);
-      if (error) failures.push({ id, error });
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function jobResumeHasSettled(job) {
+  const status = String(job?.status || '').toUpperCase();
+  if (status === 'QUEUED' || status === 'DONE') {
+    return true;
+  }
+  if (status !== 'RUNNING') return false;
+
+  const phase = String(job?.progress?.phase || '').trim().toLowerCase();
+  return phase === 'streaming' || phase === 'cdc_health';
+}
+
+async function waitForJobResumeToSettle(id, timeoutMs = 5 * 60 * 1000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await sleep(2000);
+    const res = await apiFetch('/api/jobs/' + encodeURIComponent(id));
+    if (!res.ok) {
+      return await operationErrorMessage(res, 'Check resumed job');
     }
-  });
-  await Promise.all(workers);
+    const job = await res.json();
+    const status = String(job?.status || '').toUpperCase();
+    if (status === 'FAILED') {
+      return String(job?.last_error?.message || 'job failed during startup');
+    }
+    if (status === 'STOPPED' || status === 'PAUSED') {
+      return `job became ${status} during startup`;
+    }
+    if (jobResumeHasSettled(job)) return null;
+  }
+  return 'startup did not settle within 5 minutes';
+}
+
+async function resumeJobsStaged(ids, onProgress) {
+  const failures = [];
+  for (let index = 0; index < ids.length; index += 1) {
+    const id = ids[index];
+    onProgress?.(index + 1, ids.length, id);
+
+    const resumeError = await resubmitJobWithoutPrompt(id);
+    if (resumeError) {
+      failures.push({ id, error: resumeError });
+      continue;
+    }
+
+    const settleError = await waitForJobResumeToSettle(id);
+    if (settleError) failures.push({ id, error: settleError });
+    await sleep(2000);
+  }
   return failures;
 }
 
@@ -1114,7 +1153,9 @@ async function bulkResumeArchive(scope) {
   setJobsNotice(`Resuming ${ids.length} archived ${label} job(s)...`);
 
   try {
-    const failures = await resumeJobsWithLimit(ids);
+    const failures = await resumeJobsStaged(ids, (current, total, id) => {
+      setJobsNotice(`Resuming archived ${label} jobs ${current}/${total}: ${id}`);
+    });
     await refreshDashboard();
     if (failures.length > 0) {
       const sample = failures.slice(0, 3).map((item) => item.id).join(', ');

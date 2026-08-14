@@ -287,7 +287,7 @@ func equalityDeletePartitionData(schema *iceberglib.Schema, spec iceberglib.Part
 		if !ok {
 			return nil, fmt.Errorf("partitioned equality delete requires source column %s for partition field %s", sourceField.Name, field.Name)
 		}
-		value, err := applyPartitionTransform(field.Transform, sourceField.Type, sourceValue)
+		value, err := applyPartitionTransform(field.Transform, sourceField.Type, !sourceField.Required, sourceValue)
 		if err != nil {
 			return nil, fmt.Errorf("partition field %s: %w", field.Name, err)
 		}
@@ -296,9 +296,15 @@ func equalityDeletePartitionData(schema *iceberglib.Schema, spec iceberglib.Part
 	return out, nil
 }
 
-func applyPartitionTransform(transform iceberglib.Transform, sourceType iceberglib.Type, value interface{}) (any, error) {
-	if value == nil || isMySQLZeroDateForType(sourceType, value) {
+func applyPartitionTransform(transform iceberglib.Transform, sourceType iceberglib.Type, nullable bool, value interface{}) (any, error) {
+	if value == nil {
 		return nil, nil
+	}
+	if normalized, partial := normalizeMySQLPartialTemporalValueForType(sourceType, value, nullable); partial {
+		if normalized == nil {
+			return nil, nil
+		}
+		value = normalized
 	}
 	lit, err := partitionSourceLiteral(sourceType, value)
 	if err != nil {
@@ -477,7 +483,8 @@ func buildEqualityDeleteRecord(schema *iceberglib.Schema, keys []map[string]inte
 	for _, key := range keys {
 		for idx, col := range pkCols {
 			value, _ := lookupColumnValue(key, col)
-			if err := appendBuilderValue(bldr.Field(idx), arrSchema.Field(idx).Type, value); err != nil {
+			field := arrSchema.Field(idx)
+			if err := appendBuilderValue(bldr.Field(idx), field.Type, field.Nullable, value); err != nil {
 				release()
 				return nil, nil, fmt.Errorf("column %s: %w", col, err)
 			}

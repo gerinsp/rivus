@@ -13,6 +13,21 @@ func TestSinkUsesAcknowledgedSnapshotBatches(t *testing.T) {
 	}
 }
 
+func TestSnapshotRollingEnabledForIcebergByDefaultAndCanBeDisabled(t *testing.T) {
+	if !snapshotRollingEnabledForSink("iceberg_native", map[string]any{}) {
+		t.Fatal("Iceberg rolling snapshot should be enabled by default")
+	}
+	if snapshotRollingEnabledForSink("iceberg_native", map[string]any{"snapshot_rolling_enabled": false}) {
+		t.Fatal("explicit false should disable Iceberg rolling snapshots")
+	}
+	if !snapshotRollingEnabledForSink("iceberg_native", map[string]any{"snapshot_rolling_enabled": "true"}) {
+		t.Fatal("string true should enable Iceberg rolling snapshots")
+	}
+	if snapshotRollingEnabledForSink("doris", map[string]any{"snapshot_rolling_enabled": true}) {
+		t.Fatal("non-Iceberg sink should not use rolling snapshots")
+	}
+}
+
 func TestDecodeMySQLConfigNormalizesTableConfigs(t *testing.T) {
 	cfg, err := decodeMySQLConfig(map[string]any{
 		"database": "legacy_db",

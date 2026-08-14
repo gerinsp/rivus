@@ -1263,6 +1263,7 @@ func (j *Job) startWithMode(mode config.JobMode) (err error) {
 		Mode:       effectiveMode,
 		StoredMode: storedMode,
 		SinkType:   sinkType,
+		SinkConfig: sinkCfg,
 		Retry:      j.Config.Retry,
 		MetaStore:  j.metaStore,
 		Metadata:   j.Config.Metadata,
