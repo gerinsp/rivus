@@ -102,8 +102,7 @@ func TestAutomaticMaintenanceDefersSubmissionAcrossInitialSnapshot(t *testing.T)
 			"analytics.orders": {
 				target:           config.IcebergTarget{Namespace: "analytics", Table: "orders"},
 				initialized:      true,
-				newDataFiles:     100,
-				activeSmallFiles: 10,
+				activeSmallFiles: 100,
 				activeSmallBytes: 256 * 1024 * 1024,
 				eligibilityReady: true,
 			},
@@ -135,7 +134,6 @@ func TestAutomaticCompactionRequiresActiveSmallFilesAndBytes(t *testing.T) {
 		SmallFilesMinTotalBytes: 256 * 1024 * 1024,
 	}
 	state := &tableMaintenanceWatchState{
-		newDataFiles:     100,
 		eligibilityReady: true,
 		activeSmallFiles: 100,
 		activeSmallBytes: 32 * 1024 * 1024,
@@ -146,6 +144,32 @@ func TestAutomaticCompactionRequiresActiveSmallFilesAndBytes(t *testing.T) {
 	state.activeSmallBytes = 256 * 1024 * 1024
 	if operations := automaticOperationsDue(state, cfg, time.Now()); len(operations) != 1 || operations[0].Type != "rewrite_data_files" {
 		t.Fatalf("operations = %#v, want active-file compaction", operations)
+	}
+}
+
+func TestAutomaticCompactionUsesActiveCountsAfterMonitorRestart(t *testing.T) {
+	cfg := config.IcebergTableMaintenanceConfig{
+		DataFilesThreshold:           200,
+		EqualityDeleteFilesThreshold: 50,
+		SmallFilesMinCount:           10,
+		SmallFilesMinTotalBytes:      256 * 1024 * 1024,
+	}
+
+	dataState := &tableMaintenanceWatchState{
+		eligibilityReady: true,
+		activeSmallFiles: 200,
+		activeSmallBytes: 256 * 1024 * 1024,
+	}
+	if operations := automaticOperationsDue(dataState, cfg, time.Now()); len(operations) != 1 || operations[0].Type != "rewrite_data_files" {
+		t.Fatalf("data operations after restart = %#v", operations)
+	}
+
+	deleteState := &tableMaintenanceWatchState{
+		eligibilityReady: true,
+		activeEqDeletes:  50,
+	}
+	if operations := automaticOperationsDue(deleteState, cfg, time.Now()); len(operations) != 1 || operations[0].Type != "rewrite_data_files" {
+		t.Fatalf("delete operations after restart = %#v", operations)
 	}
 }
 
@@ -173,7 +197,7 @@ func TestTableMaintenanceStatusSummarizesCurrentFileInventory(t *testing.T) {
 				newDataFiles:        200,
 				newEqualityDeletes:  35,
 				activeDataFiles:     220,
-				activeSmallFiles:    180,
+				activeSmallFiles:    220,
 				activeSmallBytes:    512 * 1024 * 1024,
 				activeEqDeletes:     35,
 				eligibilityReady:    true,
@@ -204,7 +228,7 @@ func TestTableMaintenanceStatusSummarizesCurrentFileInventory(t *testing.T) {
 	if status.ActiveDataFiles != 310 || status.ActiveEqualityDeleteFiles != 42 {
 		t.Fatalf("active file totals = data:%d equality:%d", status.ActiveDataFiles, status.ActiveEqualityDeleteFiles)
 	}
-	if status.EligibleSmallFiles != 205 || status.EligibleSmallBytes != 576*1024*1024 {
+	if status.EligibleSmallFiles != 245 || status.EligibleSmallBytes != 576*1024*1024 {
 		t.Fatalf("eligible totals = files:%d bytes:%d", status.EligibleSmallFiles, status.EligibleSmallBytes)
 	}
 	if len(status.Tables) != 2 || status.Tables[0].Identifier != "analytics.customers" || status.Tables[1].State != "ready" {

@@ -2114,8 +2114,8 @@ function renderIcebergMaintenance(job) {
         </td>
         <td class="mono px-4 py-3 text-right text-xs font-semibold text-slate-800">${fmtWholeNumber(table?.active_equality_delete_files || 0)}</td>
         <td class="px-4 py-3 text-xs text-slate-600">
-          <div>Data: <span class="mono font-semibold text-slate-800">${fmtWholeNumber(table?.new_data_files || 0)} / ${fmtWholeNumber(dataThreshold)}</span></div>
-          <div class="mt-1">Deletes: <span class="mono font-semibold text-slate-800">${fmtWholeNumber(table?.new_equality_delete_files || 0)} / ${fmtWholeNumber(deleteThreshold)}</span></div>
+          <div>Small: <span class="mono font-semibold text-slate-800">${fmtWholeNumber(table?.eligible_small_files || 0)} / ${fmtWholeNumber(dataThreshold)}</span></div>
+          <div class="mt-1">Deletes: <span class="mono font-semibold text-slate-800">${fmtWholeNumber(table?.active_equality_delete_files || 0)} / ${fmtWholeNumber(deleteThreshold)}</span></div>
         </td>
         <td class="px-4 py-3">
           <span class="inline-flex rounded-full border px-2.5 py-1 text-[11px] font-semibold ${maintenanceStateClass(table?.state)}">${escapeHtml(maintenanceStateLabel(table?.state))}</span>
@@ -2175,7 +2175,7 @@ function renderIcebergMaintenance(job) {
                 <th class="px-4 py-3 text-right text-[11px] font-semibold uppercase tracking-[0.14em]">Data files</th>
                 <th class="px-4 py-3 text-right text-[11px] font-semibold uppercase tracking-[0.14em]">Small files</th>
                 <th class="px-4 py-3 text-right text-[11px] font-semibold uppercase tracking-[0.14em]">Equality deletes</th>
-                <th class="min-w-44 px-4 py-3 text-left text-[11px] font-semibold uppercase tracking-[0.14em]">New / trigger</th>
+                <th class="min-w-44 px-4 py-3 text-left text-[11px] font-semibold uppercase tracking-[0.14em]">Current / trigger</th>
                 <th class="min-w-44 px-4 py-3 text-left text-[11px] font-semibold uppercase tracking-[0.14em]">State</th>
               </tr>
             </thead>

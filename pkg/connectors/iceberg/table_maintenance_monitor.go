@@ -436,12 +436,11 @@ func automaticOperationsDue(state *tableMaintenanceWatchState, cfg config.Iceber
 		return nil
 	}
 	dataDue := cfg.DataFilesThreshold > 0 &&
-		state.newDataFiles >= cfg.DataFilesThreshold &&
 		state.eligibilityReady &&
+		state.activeSmallFiles >= cfg.DataFilesThreshold &&
 		state.activeSmallFiles >= cfg.SmallFilesMinCount &&
 		state.activeSmallBytes >= cfg.SmallFilesMinTotalBytes
 	equalityDue := cfg.EqualityDeleteFilesThreshold > 0 &&
-		state.newEqualityDeletes >= cfg.EqualityDeleteFilesThreshold &&
 		state.eligibilityReady &&
 		state.activeEqDeletes >= cfg.EqualityDeleteFilesThreshold
 	operations := make([]TableMaintenanceOperation, 0, 3)

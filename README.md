@@ -175,15 +175,17 @@ AWS_DEFAULT_REGION=us-east-1
 An active `iceberg_native` sink can watch snapshots created by its own Rivus
 job and asynchronously submit maintenance through `runner-app` (preferred) or
 directly to Spark Standalone. Automatic Rivus maintenance does not pause CDC.
-Defaults are 200 new data files for compaction,
-50 new equality-delete files for compaction, snapshot expiration every 6 hours,
-and orphan cleanup every day.
+Defaults are 200 active eligible small data files for compaction,
+50 active equality-delete files for compaction, snapshot expiration every 6
+hours, and orphan cleanup every day. Active counts are rebuilt from the current
+Iceberg snapshot after a Rivus restart, so restarting the service does not reset
+maintenance progress.
 
-During an initial or resumed source snapshot, Rivus keeps counting newly added
-files but suppresses automatic maintenance submissions. An acknowledged
+During an initial or resumed source snapshot, Rivus suppresses automatic
+maintenance scans and submissions. An acknowledged
 `SNAPSHOT_COMPLETE` barrier releases the watcher after the final snapshot batch
-is committed; CDC then starts immediately while any due catch-up maintenance is
-submitted asynchronously.
+is committed; Rivus then scans the active files, CDC starts immediately, and any
+due catch-up maintenance is submitted asynchronously.
 
 ```yaml
 sink:
