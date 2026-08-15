@@ -116,6 +116,9 @@ type IcebergTimestampColumnConfig struct {
 // workers when the direct backend is used.
 type IcebergTableMaintenanceConfig struct {
 	Enabled                        bool              `yaml:"enabled" json:"enabled"`
+	NativeEnabled                  bool              `yaml:"native_enabled" json:"native_enabled"`
+	NativeSignalDelaySeconds       int               `yaml:"native_signal_delay_seconds" json:"native_signal_delay_seconds"`
+	NativeIdleCheckIntervalSeconds int               `yaml:"native_idle_check_interval_seconds" json:"native_idle_check_interval_seconds"`
 	RunnerURI                      string            `yaml:"runner_uri" json:"runner_uri"`
 	RunnerAPIToken                 string            `yaml:"runner_api_token" json:"runner_api_token,omitempty"`
 	RunnerResourceProfile          string            `yaml:"runner_resource_profile" json:"runner_resource_profile"`

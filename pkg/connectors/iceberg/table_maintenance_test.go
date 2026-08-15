@@ -338,8 +338,9 @@ func TestRunnerAppMaintenanceSubmissionStatusAndCancel(t *testing.T) {
 
 	jobCfg := runnerMaintenanceTestJobConfig(server.URL)
 	result, err := SubmitTableMaintenanceForJobConfig(context.Background(), "job-1", jobCfg, TableMaintenanceRequest{
-		Tables:     []string{"analytics.orders"},
-		Operations: []TableMaintenanceOperation{{Type: "rewrite_data_files"}},
+		Tables:         []string{"analytics.orders"},
+		Operations:     []TableMaintenanceOperation{{Type: "rewrite_data_files"}},
+		ExternalRunKey: "stable-maintenance-task-42",
 	}, true)
 	if err != nil {
 		t.Fatalf("submit through runner-app: %v", err)
@@ -349,6 +350,9 @@ func TestRunnerAppMaintenanceSubmissionStatusAndCancel(t *testing.T) {
 	}
 	if !strings.Contains(submitted.Content, "rewrite_data_files") || submitted.ResourceProfile != "small" {
 		t.Fatalf("runner request = %#v", submitted)
+	}
+	if submitted.ExternalRunKey != "stable-maintenance-task-42" {
+		t.Fatalf("external run key = %q", submitted.ExternalRunKey)
 	}
 	maintenance := submitted.JobContext["iceberg_maintenance"].(map[string]any)
 	if submitted.JobContext["maintenance_mode"] != "compaction" || maintenance["mode"] != "compaction" {

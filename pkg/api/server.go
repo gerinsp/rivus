@@ -2,16 +2,21 @@ package api
 
 import (
 	"net/http"
+	"sync"
 
 	"github.com/gerinsp/rivus/pkg/core"
+	"github.com/gerinsp/rivus/pkg/meta"
 )
 
 type Server struct {
-	jobManager   *core.JobManager
-	uiDir        string
-	metrics      *MetricsSampler
-	auth         AuthConfig
-	authSessions *authSessionStore
+	jobManager           *core.JobManager
+	uiDir                string
+	metrics              *MetricsSampler
+	auth                 AuthConfig
+	authSessions         *authSessionStore
+	maintenanceStoreOnce sync.Once
+	maintenanceStore     *meta.IcebergMaintenanceStore
+	maintenanceStoreErr  error
 }
 
 func NewServer(jm *core.JobManager, uiDir string, auth AuthConfig) *Server {

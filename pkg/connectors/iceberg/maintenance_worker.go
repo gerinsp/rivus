@@ -26,9 +26,9 @@ const (
 	defaultMaintenanceLeaseDuration = 15 * time.Minute
 	defaultMaintenanceRetryLimit    = 5
 	defaultMaintenanceRetryBackoff  = time.Minute
-	defaultMaintenanceTaskPageSize  = 50
+	defaultMaintenanceTaskPageSize  = 1
 	defaultMaintenanceDuePageSize   = 100
-	defaultCompactionCheckInterval   = time.Hour
+	defaultCompactionCheckInterval  = 7 * 24 * time.Hour
 )
 
 type MaintenanceWorkerOptions struct {
@@ -55,8 +55,11 @@ func RunMaintenanceWorker(ctx context.Context, dsn string, opts MaintenanceWorke
 	if opts.LeaseDuration <= 0 {
 		opts.LeaseDuration = durationEnv("RIVUS_MAINTENANCE_LEASE_SECONDS", defaultMaintenanceLeaseDuration)
 	}
-	if opts.TaskPageSize <= 0 || opts.TaskPageSize > 100 {
+	if opts.TaskPageSize != 1 {
 		opts.TaskPageSize = intEnv("RIVUS_MAINTENANCE_TASK_PAGE_SIZE", defaultMaintenanceTaskPageSize)
+		if opts.TaskPageSize != 1 {
+			opts.TaskPageSize = 1
+		}
 	}
 	if opts.DuePageSize <= 0 || opts.DuePageSize > 500 {
 		opts.DuePageSize = intEnv("RIVUS_MAINTENANCE_DUE_PAGE_SIZE", defaultMaintenanceDuePageSize)
@@ -167,7 +170,7 @@ func syncMaintenanceStates(ctx context.Context, store *meta.IcebergMaintenanceSt
 		catalogName := maintenanceCatalogName(iceCfg)
 		for _, target := range targets {
 			tableIdentity := canonicalMaintenanceTableKey(catalogName, target.Namespace, target.Table)
-			compactionDue := now.Add(deterministicJitter(tableIdentity+"|compact", minDuration(defaultCompactionCheckInterval, 15*time.Minute)))
+			compactionDue := now.Add(deterministicJitter(tableIdentity+"|compact", settings.IdleCompactionInterval))
 			expireDue := now.Add(deterministicJitter(tableIdentity+"|expire", settings.ExpireInterval))
 			orphanDue := now.Add(deterministicJitter(tableIdentity+"|orphan", settings.OrphanInterval))
 			if err := store.UpsertState(ctx, meta.IcebergMaintenanceState{
@@ -317,13 +320,13 @@ func processMaintenancePage(ctx context.Context, store *meta.IcebergMaintenanceS
 		switch outcome.Result.Status {
 		case "succeeded":
 			successes++
-			_ = store.RecordStateSuccess(ctx, state.TableKey, task.Operation, time.Now().UTC())
+			_ = store.RecordStateSuccess(ctx, state.TableKey, task.Operation, time.Now().UTC(), task.Operation == "compact")
 			if err := store.FinishTask(ctx, task.ID, opts.WorkerID, meta.MaintenanceTaskSucceeded, "", nil); err != nil {
 				return len(tasks), err
 			}
 		case "skipped":
 			skipped++
-			_ = store.RecordStateSuccess(ctx, state.TableKey, task.Operation, time.Now().UTC())
+			_ = store.RecordStateSuccess(ctx, state.TableKey, task.Operation, time.Now().UTC(), false)
 			if err := store.FinishTask(ctx, task.ID, opts.WorkerID, meta.MaintenanceTaskSkipped, "", nil); err != nil {
 				return len(tasks), err
 			}
@@ -376,6 +379,7 @@ func nativeMaintenanceSettingsFromRaw(sinkCfg any) (nativeMaintenanceSettings, e
 	settings.OrphanDryRun = rawBool(maintenance, "native_orphan_dry_run", settings.OrphanDryRun)
 	settings.SparkPollInterval = time.Duration(rawInt(maintenance, "spark_poll_interval_seconds", int(settings.SparkPollInterval/time.Second))) * time.Second
 	settings.SparkTimeout = time.Duration(rawInt(maintenance, "spark_timeout_seconds", int(settings.SparkTimeout/time.Second))) * time.Second
+	settings.IdleCompactionInterval = time.Duration(rawInt(maintenance, "native_idle_check_interval_seconds", int(settings.IdleCompactionInterval/time.Second))) * time.Second
 
 	switch {
 	case settings.MaxSelectedInputBytes <= 0:
@@ -404,6 +408,8 @@ func nativeMaintenanceSettingsFromRaw(sinkCfg any) (nativeMaintenanceSettings, e
 		return settings, fmt.Errorf("native_orphan_interval_seconds must be > 0")
 	case settings.OrphanMinAge < defaultNativeOrphanAge:
 		return settings, fmt.Errorf("native_orphan_min_age_hours must be at least %.0f", defaultNativeOrphanAge.Hours())
+	case settings.IdleCompactionInterval <= 0:
+		return settings, fmt.Errorf("native_idle_check_interval_seconds must be > 0")
 	}
 	return settings, nil
 }
@@ -523,7 +529,10 @@ func deterministicJitter(key string, window time.Duration) time.Duration {
 }
 
 func nextMaintenanceSchedule(tableKey, operation string, now time.Time, settings nativeMaintenanceSettings) time.Time {
-	interval := defaultCompactionCheckInterval
+	interval := settings.IdleCompactionInterval
+	if interval <= 0 {
+		interval = defaultCompactionCheckInterval
+	}
 	switch operation {
 	case "expire_snapshots":
 		interval = settings.ExpireInterval

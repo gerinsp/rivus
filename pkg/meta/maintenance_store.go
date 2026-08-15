@@ -301,23 +301,73 @@ func (s *IcebergMaintenanceStore) UpsertState(ctx context.Context, state Iceberg
 	return err
 }
 
-func (s *IcebergMaintenanceStore) CoalesceSignal(ctx context.Context, tableKey string, snapshotID int64, newDataFiles, newEqDeleteFiles int, snapshotComplete bool, nextCompaction time.Time) error {
+func (s *IcebergMaintenanceStore) CoalesceSignal(
+	ctx context.Context,
+	tableKey string,
+	snapshotID int64,
+	newDataFiles, newEqDeleteFiles int,
+	snapshotComplete bool,
+	dataFilesThreshold, equalityDeleteFilesThreshold int,
+	nextCompaction time.Time,
+) (bool, error) {
 	const stmt = `UPDATE iceberg_maintenance_state
-	SET last_snapshot_id = GREATEST(last_snapshot_id, ?),
-	    new_data_files = new_data_files + GREATEST(?, 0),
-	    new_equality_delete_files = new_equality_delete_files + GREATEST(?, 0),
-	    snapshot_complete = GREATEST(snapshot_complete, ?),
-	    next_compaction_check_at = CASE
-	      WHEN ? IS NULL THEN next_compaction_check_at
-	      WHEN next_compaction_check_at IS NULL OR next_compaction_check_at > ? THEN ?
+	SET next_compaction_check_at = CASE
+	      WHEN GREATEST(snapshot_complete, ?) = 1 AND (
+	        new_data_files + IF(? > last_snapshot_id, GREATEST(?, 0), 0) >= ? OR
+	        new_equality_delete_files + IF(? > last_snapshot_id, GREATEST(?, 0), 0) >= ?
+	      ) THEN CASE
+	        WHEN next_compaction_check_at IS NULL OR next_compaction_check_at > ? THEN ?
+	        ELSE next_compaction_check_at END
 	      ELSE next_compaction_check_at END,
+	    new_data_files = new_data_files + IF(? > last_snapshot_id, GREATEST(?, 0), 0),
+	    new_equality_delete_files = new_equality_delete_files + IF(? > last_snapshot_id, GREATEST(?, 0), 0),
+	    snapshot_complete = GREATEST(snapshot_complete, ?),
+	    last_snapshot_id = GREATEST(last_snapshot_id, ?),
 	    updated_at = UTC_TIMESTAMP(6)
 	WHERE table_key = ?`
-	var due any
-	if !nextCompaction.IsZero() {
-		due = nextCompaction.UTC()
+	if dataFilesThreshold <= 0 {
+		dataFilesThreshold = int(^uint(0) >> 1)
 	}
-	_, err := s.db.ExecContext(ctx, stmt, snapshotID, newDataFiles, newEqDeleteFiles, boolInt(snapshotComplete), due, due, due, tableKey)
+	if equalityDeleteFilesThreshold <= 0 {
+		equalityDeleteFilesThreshold = int(^uint(0) >> 1)
+	}
+	due := nextCompaction.UTC()
+	res, err := s.db.ExecContext(ctx, stmt,
+		boolInt(snapshotComplete),
+		snapshotID, newDataFiles, dataFilesThreshold,
+		snapshotID, newEqDeleteFiles, equalityDeleteFilesThreshold,
+		due, due,
+		snapshotID, newDataFiles,
+		snapshotID, newEqDeleteFiles,
+		boolInt(snapshotComplete), snapshotID,
+		tableKey,
+	)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+func (s *IcebergMaintenanceStore) SetSnapshotCompleteForOwner(
+	ctx context.Context,
+	ownerJobID string,
+	complete bool,
+	dataFilesThreshold, equalityDeleteFilesThreshold int,
+	nextCompaction time.Time,
+) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE iceberg_maintenance_state
+	SET snapshot_complete=?,
+	    next_compaction_check_at=CASE
+	      WHEN ?=1 AND (new_data_files >= ? OR new_equality_delete_files >= ?) THEN CASE
+	        WHEN next_compaction_check_at IS NULL OR next_compaction_check_at > ? THEN ?
+	        ELSE next_compaction_check_at END
+	      ELSE next_compaction_check_at END,
+	    updated_at=UTC_TIMESTAMP(6)
+	WHERE owner_job_id=?`,
+		boolInt(complete), boolInt(complete), dataFilesThreshold, equalityDeleteFilesThreshold,
+		nextCompaction.UTC(), nextCompaction.UTC(), ownerJobID,
+	)
 	return err
 }
 
@@ -474,19 +524,31 @@ func (s *IcebergMaintenanceStore) RenewLease(ctx context.Context, taskID int64, 
 }
 
 func (s *IcebergMaintenanceStore) FinishTask(ctx context.Context, taskID int64, workerID, status, lastError string, retryAt *time.Time) error {
+	var res sql.Result
+	var err error
 	if status == MaintenanceTaskRetry {
 		if retryAt == nil {
 			return fmt.Errorf("retry task %d requires retry time", taskID)
 		}
-		_, err := s.db.ExecContext(ctx, `UPDATE iceberg_maintenance_tasks
+		res, err = s.db.ExecContext(ctx, `UPDATE iceberg_maintenance_tasks
 		SET status='retry', lease_owner=NULL, lease_until=NULL, not_before=?, last_error=?, updated_at=UTC_TIMESTAMP(6)
 		WHERE id=? AND status='leased' AND lease_owner=?`, retryAt.UTC(), nullString(lastError), taskID, workerID)
+	} else {
+		res, err = s.db.ExecContext(ctx, `UPDATE iceberg_maintenance_tasks
+		SET status=?, lease_owner=NULL, lease_until=NULL, last_error=?, updated_at=UTC_TIMESTAMP(6)
+		WHERE id=? AND status='leased' AND lease_owner=?`, status, nullString(lastError), taskID, workerID)
+	}
+	if err != nil {
 		return err
 	}
-	_, err := s.db.ExecContext(ctx, `UPDATE iceberg_maintenance_tasks
-	SET status=?, lease_owner=NULL, lease_until=NULL, last_error=?, updated_at=UTC_TIMESTAMP(6)
-	WHERE id=? AND status='leased' AND lease_owner=?`, status, nullString(lastError), taskID, workerID)
-	return err
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return fmt.Errorf("maintenance task %d lease is no longer owned by %s", taskID, workerID)
+	}
+	return nil
 }
 
 func (s *IcebergMaintenanceStore) UpdateInventory(ctx context.Context, tableKey string, snapshotID int64, dataFiles, smallFiles int, smallBytes int64, equalityDeletes, positionDeletes int) error {
@@ -497,7 +559,7 @@ func (s *IcebergMaintenanceStore) UpdateInventory(ctx context.Context, tableKey 
 	return err
 }
 
-func (s *IcebergMaintenanceStore) RecordStateSuccess(ctx context.Context, tableKey, operation string, at time.Time) error {
+func (s *IcebergMaintenanceStore) RecordStateSuccess(ctx context.Context, tableKey, operation string, at time.Time, resetCompactionCounters bool) error {
 	column := ""
 	switch operation {
 	case "compact":
@@ -510,7 +572,7 @@ func (s *IcebergMaintenanceStore) RecordStateSuccess(ctx context.Context, tableK
 		return fmt.Errorf("unsupported maintenance operation %q", operation)
 	}
 	extra := ""
-	if operation == "compact" {
+	if operation == "compact" && resetCompactionCounters {
 		extra = ", new_data_files=0, new_equality_delete_files=0"
 	}
 	query := fmt.Sprintf(`UPDATE iceberg_maintenance_state SET %s=?, attempt_count=0, last_error=NULL%s, updated_at=UTC_TIMESTAMP(6) WHERE table_key=?`, column, extra)

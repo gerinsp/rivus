@@ -37,24 +37,25 @@ const (
 )
 
 type nativeMaintenanceSettings struct {
-	Enabled               bool
-	MaxSelectedInputBytes int64
-	MaxSelectedFiles      int
-	TargetFileSizeBytes   int64
-	SmallFileSizeBytes    int64
-	MinSmallFiles         int
-	MinSmallBytes         int64
-	ScanConcurrency       int
-	Timeout               time.Duration
-	TempDirectory         string
-	ExpireInterval        time.Duration
-	SnapshotMaxAge        time.Duration
-	SnapshotRetainLast    int
-	OrphanInterval        time.Duration
-	OrphanMinAge          time.Duration
-	OrphanDryRun          bool
-	SparkPollInterval     time.Duration
-	SparkTimeout          time.Duration
+	Enabled                bool
+	MaxSelectedInputBytes  int64
+	MaxSelectedFiles       int
+	TargetFileSizeBytes    int64
+	SmallFileSizeBytes     int64
+	MinSmallFiles          int
+	MinSmallBytes          int64
+	ScanConcurrency        int
+	Timeout                time.Duration
+	TempDirectory          string
+	ExpireInterval         time.Duration
+	SnapshotMaxAge         time.Duration
+	SnapshotRetainLast     int
+	OrphanInterval         time.Duration
+	OrphanMinAge           time.Duration
+	OrphanDryRun           bool
+	SparkPollInterval      time.Duration
+	SparkTimeout           time.Duration
+	IdleCompactionInterval time.Duration
 }
 
 type nativeTaskOutcome struct {
@@ -73,23 +74,24 @@ type compactionWorkload struct {
 
 func defaultNativeMaintenanceSettings() nativeMaintenanceSettings {
 	return nativeMaintenanceSettings{
-		MaxSelectedInputBytes: defaultNativeMaxInputBytes,
-		MaxSelectedFiles:      defaultNativeMaxInputFiles,
-		TargetFileSizeBytes:   defaultNativeTargetBytes,
-		SmallFileSizeBytes:    defaultNativeSmallBytes,
-		MinSmallFiles:         defaultNativeMinSmallFiles,
-		MinSmallBytes:         defaultNativeMinSmallBytes,
-		ScanConcurrency:       1,
-		Timeout:               defaultNativeTimeout,
-		TempDirectory:         "/tmp/rivus-maintenance",
-		ExpireInterval:        24 * time.Hour,
-		SnapshotMaxAge:        7 * 24 * time.Hour,
-		SnapshotRetainLast:    10,
-		OrphanInterval:        30 * 24 * time.Hour,
-		OrphanMinAge:          defaultNativeOrphanAge,
-		OrphanDryRun:          false,
-		SparkPollInterval:     5 * time.Second,
-		SparkTimeout:          2 * time.Hour,
+		MaxSelectedInputBytes:  defaultNativeMaxInputBytes,
+		MaxSelectedFiles:       defaultNativeMaxInputFiles,
+		TargetFileSizeBytes:    defaultNativeTargetBytes,
+		SmallFileSizeBytes:     defaultNativeSmallBytes,
+		MinSmallFiles:          defaultNativeMinSmallFiles,
+		MinSmallBytes:          defaultNativeMinSmallBytes,
+		ScanConcurrency:        1,
+		Timeout:                defaultNativeTimeout,
+		TempDirectory:          "/tmp/rivus-maintenance",
+		ExpireInterval:         24 * time.Hour,
+		SnapshotMaxAge:         7 * 24 * time.Hour,
+		SnapshotRetainLast:     10,
+		OrphanInterval:         30 * 24 * time.Hour,
+		OrphanMinAge:           defaultNativeOrphanAge,
+		OrphanDryRun:           false,
+		SparkPollInterval:      5 * time.Second,
+		SparkTimeout:           2 * time.Hour,
+		IdleCompactionInterval: 7 * 24 * time.Hour,
 	}
 }
 
@@ -120,35 +122,40 @@ func executeNativeMaintenanceTask(
 		result.Error = "owner job configuration is unavailable"
 		return finish(nativeTaskOutcome{Result: result})
 	}
+	setupCtx, setupCancel := context.WithTimeout(ctx, settings.Timeout)
 	iceCfg, err := icebergConfigForNativeWorker(jobCfg)
 	if err != nil {
+		setupCancel()
 		result.Error = err.Error()
 		return finish(nativeTaskOutcome{Result: result})
 	}
-	cat, err := newCatalog(ctx, iceCfg)
+	cat, err := newCatalog(setupCtx, iceCfg)
 	if err != nil {
+		setupCancel()
 		result.Error = err.Error()
 		return finish(nativeTaskOutcome{Result: result, Retryable: true})
 	}
-	tbl, err := cat.LoadTable(ctx, namespaceIdentifier(state.Namespace, state.Table))
+	tbl, err := cat.LoadTable(setupCtx, namespaceIdentifier(state.Namespace, state.Table))
+	setupCancel()
 	if err != nil {
 		result.Error = fmt.Sprintf("load table: %v", err)
 		return finish(nativeTaskOutcome{Result: result, Retryable: !errorsIsNoSuchIcebergTable(err)})
 	}
 
-	taskCtx, cancel := context.WithTimeout(ctx, settings.Timeout)
-	defer cancel()
-
 	switch task.Operation {
 	case "compact":
-		outcome := executeHybridCompaction(taskCtx, jobID, jobCfg, iceCfg, tbl, state, task, settings)
+		outcome := executeHybridCompaction(ctx, jobID, jobCfg, iceCfg, tbl, state, task, settings)
 		outcome.Result.DurationMillis = time.Since(started).Milliseconds()
 		return outcome
 	case "expire_snapshots":
+		taskCtx, cancel := context.WithTimeout(ctx, settings.Timeout)
+		defer cancel()
 		outcome := executeNativeSnapshotExpiration(taskCtx, tbl, result, settings)
 		outcome.Result.DurationMillis = time.Since(started).Milliseconds()
 		return outcome
 	case "remove_orphan_files":
+		taskCtx, cancel := context.WithTimeout(ctx, settings.Timeout)
+		defer cancel()
 		outcome := executeBoundedOrphanCleanup(taskCtx, tbl, result, settings)
 		outcome.Result.DurationMillis = time.Since(started).Milliseconds()
 		return outcome
@@ -179,6 +186,8 @@ func executeHybridCompaction(
 	task meta.IcebergMaintenanceTask,
 	settings nativeMaintenanceSettings,
 ) nativeTaskOutcome {
+	nativeCtx, nativeCancel := context.WithTimeout(ctx, settings.Timeout)
+	defer nativeCancel()
 	result := meta.IcebergMaintenanceResult{
 		TaskID:    task.ID,
 		TableKey:  state.TableKey,
@@ -203,7 +212,7 @@ func executeHybridCompaction(
 	cfg.DeleteFileThreshold = 1
 	cfg.PreserveDeadEqualityDeletes = false
 
-	plan, err := compaction.Analyze(ctx, tbl, cfg)
+	plan, err := compaction.Analyze(nativeCtx, tbl, cfg)
 	if err != nil {
 		result.Error = fmt.Sprintf("analyze compaction: %v", err)
 		return nativeTaskOutcome{Result: result, Retryable: true}
@@ -231,12 +240,13 @@ func executeHybridCompaction(
 
 	routeSpark, reason := shouldRouteCompactionToSpark(work, settings)
 	if routeSpark {
+		nativeCancel()
 		result.Engine = "spark"
 		result.RoutingReason = reason
 		return executeSparkCompactionFallback(ctx, jobID, jobCfg, state, task, result, settings)
 	}
 
-	if err := tbl.Refresh(ctx); err != nil {
+	if err := tbl.Refresh(nativeCtx); err != nil {
 		result.Error = fmt.Sprintf("refresh before compaction: %v", err)
 		return nativeTaskOutcome{Result: result, Retryable: true}
 	}
@@ -253,19 +263,19 @@ func executeHybridCompaction(
 			}
 		}
 	}
-	fs, err := tbl.FS(ctx)
+	fs, err := tbl.FS(nativeCtx)
 	if err != nil {
 		result.Error = fmt.Sprintf("get table filesystem: %v", err)
 		return nativeTaskOutcome{Result: result, Retryable: true}
 	}
-	deadEqDeletes, err := compaction.CollectDeadEqualityDeletes(ctx, fs, tbl.CurrentSnapshot(), rewrittenPaths)
+	deadEqDeletes, err := compaction.CollectDeadEqualityDeletes(nativeCtx, fs, tbl.CurrentSnapshot(), rewrittenPaths)
 	if err != nil {
 		result.Error = fmt.Sprintf("collect dead equality deletes: %v", err)
 		return nativeTaskOutcome{Result: result, Retryable: true}
 	}
 
 	tx := tbl.NewTransaction()
-	rewriteResult, err := tx.RewriteDataFiles(ctx, work.Groups, icetable.RewriteDataFilesOptions{
+	rewriteResult, err := tx.RewriteDataFiles(nativeCtx, work.Groups, icetable.RewriteDataFilesOptions{
 		PartialProgress:          false,
 		ExtraDeleteFilesToRemove: deadEqDeletes,
 		SnapshotProps: iceberglib.Properties{
@@ -288,10 +298,10 @@ func executeHybridCompaction(
 		result.RoutingReason = "compaction planner produced no rewrite output"
 		return nativeTaskOutcome{Result: result}
 	}
-	committed, err := tx.Commit(ctx)
+	committed, err := tx.Commit(nativeCtx)
 	if err != nil {
 		result.Error = fmt.Sprintf("commit native compaction: %v", err)
-		return nativeTaskOutcome{Result: result, Retryable: errors.Is(err, icetable.ErrCommitFailed) || ctx.Err() != nil}
+		return nativeTaskOutcome{Result: result, Retryable: errors.Is(err, icetable.ErrCommitFailed) || nativeCtx.Err() != nil}
 	}
 	result.Status = "succeeded"
 	result.RoutingReason = "selected workload is within native file and byte limits"
@@ -364,7 +374,8 @@ func executeSparkCompactionFallback(
 	settings nativeMaintenanceSettings,
 ) nativeTaskOutcome {
 	request := TableMaintenanceRequest{
-		Tables: []string{tableKey(state.Namespace, state.Table)},
+		Tables:         []string{tableKey(state.Namespace, state.Table)},
+		ExternalRunKey: fmt.Sprintf("rivus-native-maintenance:%d", task.ID),
 		Operations: []TableMaintenanceOperation{{
 			Type: "rewrite_data_files",
 			Options: map[string]any{
@@ -597,7 +608,7 @@ func executeBoundedOrphanCleanup(ctx context.Context, tbl *icetable.Table, resul
 	result.DeletedFiles = deleted
 	result.DeletedBytes = deletedBytes
 	result.Details = map[string]any{
-		"dry_run":            settings.OrphanDryRun,
+		"dry_run":           settings.OrphanDryRun,
 		"minimum_age_hours": settings.OrphanMinAge.Hours(),
 		"scan_bytes":        scannedBytes,
 		"disk_buckets":      orphanHashBuckets,

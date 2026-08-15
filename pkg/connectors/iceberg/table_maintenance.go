@@ -55,8 +55,9 @@ func (e *SparkMaintenanceError) Unwrap() error {
 // TableMaintenanceRequest describes one Spark job. Each operation is run for
 // every selected table in the order supplied.
 type TableMaintenanceRequest struct {
-	Tables     []string                    `json:"tables,omitempty"`
-	Operations []TableMaintenanceOperation `json:"operations"`
+	Tables         []string                    `json:"tables,omitempty"`
+	Operations     []TableMaintenanceOperation `json:"operations"`
+	ExternalRunKey string                      `json:"-"`
 }
 
 type TableMaintenanceOperation struct {
@@ -173,7 +174,7 @@ func SubmitTableMaintenanceForJobConfig(
 	if err != nil {
 		return nil, err
 	}
-	return submitPreparedTableMaintenance(ctx, jobID, jobCfg.Name, iceCfg, targets, operations, statements)
+	return submitPreparedTableMaintenance(ctx, jobID, jobCfg.Name, iceCfg, targets, operations, statements, req.ExternalRunKey)
 }
 
 func submitPreparedTableMaintenance(
@@ -184,9 +185,10 @@ func submitPreparedTableMaintenance(
 	targets []config.IcebergTarget,
 	operations []string,
 	statements []maintenanceStatement,
+	externalRunKey string,
 ) (*TableMaintenanceSubmission, error) {
 	if maintenanceUsesRunner(iceCfg.TableMaintenance) {
-		return submitRunnerTableMaintenance(ctx, jobID, jobName, iceCfg, targets, operations, statements)
+		return submitRunnerTableMaintenance(ctx, jobID, jobName, iceCfg, targets, operations, statements, externalRunKey)
 	}
 	payload, err := json.Marshal(maintenancePayload{JobID: jobID, Statements: statements})
 	if err != nil {
@@ -232,6 +234,7 @@ func submitRunnerTableMaintenance(
 	targets []config.IcebergTarget,
 	operations []string,
 	statements []maintenanceStatement,
+	externalRunKey string,
 ) (*TableMaintenanceSubmission, error) {
 	tableNames := make([]string, 0, len(targets))
 	for _, target := range targets {
@@ -245,6 +248,10 @@ func submitRunnerTableMaintenance(
 	}
 
 	now := time.Now().UTC().UnixNano()
+	externalRunKey = strings.TrimSpace(externalRunKey)
+	if externalRunKey == "" {
+		externalRunKey = fmt.Sprintf("rivus-maintenance:%s:%d", jobID, now)
+	}
 	mode := maintenanceDisplayMode(operations)
 	request := runnerMaintenanceRequest{
 		Filename:        fmt.Sprintf("rivus_iceberg_maintenance_%d.sql", now),
@@ -253,7 +260,7 @@ func submitRunnerTableMaintenance(
 		JobName:         maintenanceAppName(jobID, jobName),
 		RequestedBy:     "service",
 		RequestedByRef:  jobID,
-		ExternalRunKey:  fmt.Sprintf("rivus-maintenance:%s:%d", jobID, now),
+		ExternalRunKey:  externalRunKey,
 		Catalog:         maintenanceCatalogName(iceCfg),
 		ResourceProfile: iceCfg.TableMaintenance.RunnerResourceProfile,
 		JobContext: map[string]any{

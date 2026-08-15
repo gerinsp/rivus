@@ -372,7 +372,7 @@ func (m *tableMaintenanceMonitor) submitDue(ctx context.Context, now time.Time) 
 		}
 
 		requestCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		submission, err := submitPreparedTableMaintenance(requestCtx, m.jobID, m.jobName, m.cfg, []config.IcebergTarget{target}, operationNames, statements)
+		submission, err := submitPreparedTableMaintenance(requestCtx, m.jobID, m.jobName, m.cfg, []config.IcebergTarget{target}, operationNames, statements, "")
 		cancel()
 		if err != nil {
 			log.Printf("[iceberg][job %s] automatic maintenance submit target=%s operations=%s error=%v", m.jobID, key, strings.Join(operationNames, ","), err)

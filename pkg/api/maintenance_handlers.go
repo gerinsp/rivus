@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"strconv"
@@ -13,12 +14,10 @@ import (
 )
 
 func (s *Server) handleMaintenanceSummary(w http.ResponseWriter, r *http.Request) {
-	store, cancel, ok := maintenanceAPIStore(w)
+	store, ok := s.maintenanceAPIStore(w)
 	if !ok {
 		return
 	}
-	defer cancel()
-	defer store.Close()
 	summary, err := store.Summary(r.Context(), time.Now().UTC())
 	if err != nil {
 		maintenanceAPIError(w, err, http.StatusInternalServerError)
@@ -28,12 +27,10 @@ func (s *Server) handleMaintenanceSummary(w http.ResponseWriter, r *http.Request
 }
 
 func (s *Server) handleMaintenanceRuns(w http.ResponseWriter, r *http.Request) {
-	store, cancel, ok := maintenanceAPIStore(w)
+	store, ok := s.maintenanceAPIStore(w)
 	if !ok {
 		return
 	}
-	defer cancel()
-	defer store.Close()
 	limit := maintenanceQueryInt(r, "limit", 50, 1, 200)
 	offset := maintenanceQueryInt(r, "offset", 0, 0, 1_000_000)
 	runs, err := store.ListRuns(r.Context(), limit, offset)
@@ -54,12 +51,10 @@ func (s *Server) handleMaintenanceRun(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid maintenance run id", http.StatusBadRequest)
 		return
 	}
-	store, cancel, ok := maintenanceAPIStore(w)
+	store, ok := s.maintenanceAPIStore(w)
 	if !ok {
 		return
 	}
-	defer cancel()
-	defer store.Close()
 	limit := maintenanceQueryInt(r, "limit", 100, 1, 500)
 	results, err := store.ListResultsForRun(r.Context(), runID, limit)
 	if err != nil {
@@ -78,12 +73,10 @@ func (s *Server) handleMaintenanceTableState(w http.ResponseWriter, r *http.Requ
 		http.Error(w, "maintenance table key is required", http.StatusBadRequest)
 		return
 	}
-	store, cancel, ok := maintenanceAPIStore(w)
+	store, ok := s.maintenanceAPIStore(w)
 	if !ok {
 		return
 	}
-	defer cancel()
-	defer store.Close()
 	state, err := store.GetState(r.Context(), tableKey)
 	if err != nil {
 		maintenanceAPIError(w, err, http.StatusInternalServerError)
@@ -96,27 +89,36 @@ func (s *Server) handleMaintenanceTableState(w http.ResponseWriter, r *http.Requ
 	maintenanceAPIJSON(w, http.StatusOK, state)
 }
 
-func maintenanceAPIStore(w http.ResponseWriter) (*meta.IcebergMaintenanceStore, context.CancelFunc, bool) {
-	dsn := strings.TrimSpace(os.Getenv("RIVUS_META_MYSQL_DSN"))
-	if dsn == "" {
-		http.Error(w, "maintenance metadata store is not configured", http.StatusServiceUnavailable)
-		return nil, func() {}, false
+func (s *Server) maintenanceAPIStore(w http.ResponseWriter) (*meta.IcebergMaintenanceStore, bool) {
+	s.maintenanceStoreOnce.Do(func() {
+		dsn := strings.TrimSpace(os.Getenv("RIVUS_META_MYSQL_DSN"))
+		if dsn == "" {
+			s.maintenanceStoreErr = fmt.Errorf("maintenance metadata store is not configured")
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		store, err := meta.NewIcebergMaintenanceStore(dsn)
+		if err != nil {
+			s.maintenanceStoreErr = err
+			return
+		}
+		if err := store.Init(ctx); err != nil {
+			store.Close()
+			s.maintenanceStoreErr = err
+			return
+		}
+		s.maintenanceStore = store
+	})
+	if s.maintenanceStoreErr != nil {
+		status := http.StatusInternalServerError
+		if strings.Contains(s.maintenanceStoreErr.Error(), "not configured") {
+			status = http.StatusServiceUnavailable
+		}
+		maintenanceAPIError(w, s.maintenanceStoreErr, status)
+		return nil, false
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	store, err := meta.NewIcebergMaintenanceStore(dsn)
-	if err != nil {
-		cancel()
-		maintenanceAPIError(w, err, http.StatusInternalServerError)
-		return nil, func() {}, false
-	}
-	if err := store.Init(ctx); err != nil {
-		store.Close()
-		cancel()
-		maintenanceAPIError(w, err, http.StatusInternalServerError)
-		return nil, func() {}, false
-	}
-	cancel()
-	return store, func() {}, true
+	return s.maintenanceStore, true
 }
 
 func maintenanceQueryInt(r *http.Request, key string, fallback, minValue, maxValue int) int {

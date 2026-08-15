@@ -45,6 +45,18 @@ func TestNativeMaintenanceSettingsDefaults(t *testing.T) {
 	if settings.OrphanInterval != 30*24*time.Hour {
 		t.Fatalf("unexpected orphan interval: %s", settings.OrphanInterval)
 	}
+	if settings.IdleCompactionInterval != 7*24*time.Hour {
+		t.Fatalf("unexpected idle compaction interval: %s", settings.IdleCompactionInterval)
+	}
+}
+
+func TestMaintenanceStartsCompleteOnlyForStreamingResumeModes(t *testing.T) {
+	if maintenanceStartsComplete("initial") || maintenanceStartsComplete("snapshot_only") {
+		t.Fatal("initial snapshot modes must keep maintenance blocked")
+	}
+	if !maintenanceStartsComplete("resume") || !maintenanceStartsComplete("latest") || !maintenanceStartsComplete("latest-offset") {
+		t.Fatal("resume/latest modes must allow maintenance immediately")
+	}
 }
 
 func TestNativeMaintenanceRejectsUnsafeOrphanAge(t *testing.T) {

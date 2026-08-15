@@ -17,9 +17,25 @@ func Register(reg *connector.Registry) {
 			return nil, err
 		}
 
-		return NewSink(jctx.JobID, jctx.MetaKey, jctx.JobName, icfg, jctx.Retry, jctx.MetaStore, jctx.ReportProgress)
+		sink, err := NewSink(jctx.JobID, jctx.MetaKey, jctx.JobName, icfg, jctx.Retry, jctx.MetaStore, jctx.ReportProgress)
+		if err != nil {
+			return nil, err
+		}
+		if sink.maintenanceSignals != nil {
+			sink.maintenanceSignals.setInitialSnapshotComplete(maintenanceStartsComplete(jctx.Mode))
+		}
+		return sink, nil
 	})
 
+}
+
+func maintenanceStartsComplete(mode config.JobMode) bool {
+	switch mode {
+	case config.JobModeResume, config.JobModeLatest, config.JobModeLatestOffset:
+		return true
+	default:
+		return false
+	}
 }
 
 func decodeIcebergConfig(v any) (config.IcebergConfig, error) {
@@ -68,7 +84,7 @@ func normalizeIcebergConfig(c config.IcebergConfig) config.IcebergConfig {
 	c.TableMaintenance.CatalogName = strings.TrimSpace(c.TableMaintenance.CatalogName)
 	c.TableMaintenance.RESTAuthHeader = strings.TrimSpace(c.TableMaintenance.RESTAuthHeader)
 	c.SnapshotSpoolDirectory = strings.TrimSpace(c.SnapshotSpoolDirectory)
-	if c.TableMaintenance.Enabled {
+	if c.TableMaintenance.Enabled || c.TableMaintenance.NativeEnabled {
 		if c.TableMaintenance.RunnerResourceProfile == "" {
 			c.TableMaintenance.RunnerResourceProfile = "small"
 		}
@@ -93,6 +109,14 @@ func normalizeIcebergConfig(c config.IcebergConfig) config.IcebergConfig {
 		if c.TableMaintenance.SmallFilesMinTotalBytes == 0 {
 			c.TableMaintenance.SmallFilesMinTotalBytes = 256 * 1024 * 1024
 		}
+		if c.TableMaintenance.NativeSignalDelaySeconds <= 0 {
+			c.TableMaintenance.NativeSignalDelaySeconds = 5 * 60
+		}
+		if c.TableMaintenance.NativeIdleCheckIntervalSeconds <= 0 {
+			c.TableMaintenance.NativeIdleCheckIntervalSeconds = 7 * 24 * 60 * 60
+		}
+	}
+	if c.TableMaintenance.Enabled {
 		c.TableMaintenance.CompactOptions = normalizeAutomaticCompactOptions(c.TableMaintenance.CompactOptions)
 		if c.TableMaintenance.ExpireSnapshotsIntervalSeconds == 0 {
 			c.TableMaintenance.ExpireSnapshotsIntervalSeconds = 6 * 60 * 60

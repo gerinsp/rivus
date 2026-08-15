@@ -109,6 +109,8 @@ sink:
     # normal Iceberg REST/S3 settings...
     table_maintenance:
       native_enabled: true
+      native_signal_delay_seconds: 300
+      native_idle_check_interval_seconds: 604800
 
       # existing runner/Spark integration is retained for heavy compaction
       runner_uri: http://runner-app:8001

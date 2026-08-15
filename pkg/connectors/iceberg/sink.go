@@ -40,16 +40,17 @@ const (
 )
 
 type Sink struct {
-	jobID            string
-	stateKey         string
-	jobName          string
-	cfg              config.IcebergConfig
-	retry            config.RetryPolicy
-	offsetSto        meta.OffsetStore
-	progress         connector.ProgressReporter
-	catalog          icecatalog.Catalog
-	maintenance      *tableMaintenanceMonitor
-	snapshotSpoolDir string
+	jobID              string
+	stateKey           string
+	jobName            string
+	cfg                config.IcebergConfig
+	retry              config.RetryPolicy
+	offsetSto          meta.OffsetStore
+	progress           connector.ProgressReporter
+	catalog            icecatalog.Catalog
+	maintenance        *tableMaintenanceMonitor
+	maintenanceSignals *nativeMaintenanceSignaler
+	snapshotSpoolDir   string
 
 	equalityCommitter cdcEqualityCommitter
 
@@ -269,6 +270,10 @@ func NewSink(jobID, stateKey, jobName string, cfg config.IcebergConfig, retry co
 	}
 	sink.equalityCommitter = rivusEqualityCommitter{sink: sink}
 	sink.maintenance = newTableMaintenanceMonitor(jobID, sink.jobName, cfg, sink)
+	sink.maintenanceSignals, err = newNativeMaintenanceSignaler(jobID, cfg)
+	if err != nil {
+		return nil, err
+	}
 	if snapshotRollingEnabled(cfg) {
 		spoolDir, err := prepareSnapshotSpoolDirectory(cfg.SnapshotSpoolDirectory, jobID, stateKey)
 		if err != nil {
@@ -1381,6 +1386,9 @@ func (s *Sink) Run(ctx context.Context, in <-chan model.Event) error {
 	if s.maintenance != nil {
 		go s.maintenance.run(ctx)
 	}
+	if s.maintenanceSignals != nil {
+		go s.maintenanceSignals.run(ctx)
+	}
 
 	for {
 		select {
@@ -1458,6 +1466,9 @@ func (s *Sink) handleSnapshotBarrier(ctx context.Context, ev model.Event) (err e
 	switch ev.Type {
 	case model.EventTypeSnapshotStart:
 		s.cleanupSnapshotSpools()
+		if s.maintenanceSignals != nil {
+			s.maintenanceSignals.setSnapshotComplete(false)
+		}
 		if s.maintenance != nil {
 			s.maintenance.pauseSubmissions()
 		}
@@ -1467,6 +1478,9 @@ func (s *Sink) handleSnapshotBarrier(ctx context.Context, ev model.Event) (err e
 		}
 		if s.maintenance != nil {
 			s.maintenance.resumeSubmissions()
+		}
+		if s.maintenanceSignals != nil {
+			s.maintenanceSignals.setSnapshotComplete(true)
 		}
 	}
 	return nil
@@ -2878,6 +2892,9 @@ func (s *Sink) logWriteTiming(state *tableState, result flushResult, err error, 
 
 func (s *Sink) updateStateTableAfterWrite(state *tableState, updated *icetable.Table) {
 	s.recordTableSnapshotMetrics(state, updated)
+	if s.maintenanceSignals != nil && state != nil {
+		s.maintenanceSignals.observeTable(config.IcebergTarget{Namespace: state.targetNamespace, Table: state.targetTable}, updated)
+	}
 	if s.maintenance != nil && state != nil {
 		s.maintenance.observeTable(config.IcebergTarget{Namespace: state.targetNamespace, Table: state.targetTable}, updated, time.Now())
 	}

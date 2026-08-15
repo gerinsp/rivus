@@ -45,6 +45,11 @@ Native maintenance is opt-in. During the first rollout, set `native_enabled: tru
 table_maintenance:
   native_enabled: true
 
+  # CDC signals compact work after a short quiet period; inactive tables get
+  # only a weekly safety check.
+  native_signal_delay_seconds: 300
+  native_idle_check_interval_seconds: 604800
+
   # existing Spark/runner configuration remains the heavy fallback
   runner_uri: http://runner-app:8001
   runner_api_token: ${RUNNER_API_TOKEN}
@@ -88,7 +93,7 @@ RIVUS_META_MYSQL_DSN=rivus:change-me@tcp(meta-mysql:3306)/rivus_meta?parseTime=t
 RIVUS_MAINTENANCE_GOMAXPROCS=1
 RIVUS_MAINTENANCE_POLL_INTERVAL_SECONDS=30
 RIVUS_MAINTENANCE_LEASE_SECONDS=900
-RIVUS_MAINTENANCE_TASK_PAGE_SIZE=50
+RIVUS_MAINTENANCE_TASK_PAGE_SIZE=1
 RIVUS_MAINTENANCE_DUE_PAGE_SIZE=100
 GOMEMLIMIT=256MiB
 ```
@@ -100,7 +105,7 @@ Command flags override the corresponding worker defaults:
   --queue \
   --poll-interval-seconds 30 \
   --lease-seconds 900 \
-  --task-page-size 50 \
+  --task-page-size 1 \
   --due-page-size 100
 ```
 
@@ -119,7 +124,9 @@ Compaction is routed to Spark when any of these first-rollout conditions apply:
 
 Sort/Z-order and other Spark-specific rewrite strategies remain Spark-only. The worker records `engine` and `routing_reason` for every result.
 
-CDC has priority over maintenance. Native compaction validates that the starting snapshot has not changed before staging work, and Iceberg REST commit conflicts are treated as retryable maintenance failures. CDC is never paused for maintenance.
+CDC has priority over maintenance. Each successful Rivus commit sends only its snapshot id and added-file counters to a bounded asynchronous queue. Reaching the configured data-file or equality-delete threshold brings the table's next check forward; inactive tables are checked only every seven days by default. Snapshot commits are counted but remain blocked until the snapshot-complete barrier. Native compaction validates that the starting snapshot has not changed before staging work, and Iceberg REST commit conflicts are treated as retryable maintenance failures. CDC is never paused for maintenance.
+
+Heavy Spark submissions use a stable task idempotency key when runner-app is configured. A retry therefore reuses the existing runner job instead of starting a duplicate. The native ten-minute timeout applies only to native planning and execution; Spark uses its separate two-hour default timeout.
 
 ## Snapshot expiration
 
@@ -165,5 +172,5 @@ Keep one CDC/API container. Scale maintenance workers independently only after t
 - Native sort/Z-order is not implemented; use Spark.
 - Tables whose selected compaction groups contain position deletes route to Spark.
 - Heavy Spark fallback keeps the existing per-table runner/Spark submission behavior; runner batching is not added in this phase.
-- The scheduler periodically seeds/refreshes table state from persisted Rivus jobs. A later optimization can add direct CDC commit-signal upserts to make hot-table compaction checks more event-driven without changing the durable queue contract.
+- The scheduler periodically seeds/refreshes table state from persisted Rivus jobs, while CDC commit signals wake hot tables without scanning every inactive table hourly.
 - Native rewrite output is committed atomically, but this phase does not yet expose exact per-attempt output-file cleanup from the high-level `iceberg-go` rewrite API; failed uncommitted files remain protected by the seven-day orphan-cleanup safety window.
