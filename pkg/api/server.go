@@ -49,6 +49,11 @@ func (s *Server) Router() http.Handler {
 	mux.HandleFunc("/api/jobs", s.requireAPIAuth(s.handleJobs))
 	mux.HandleFunc("/api/jobs/", s.requireAPIAuth(s.handleJobByID))
 
+	mux.HandleFunc("GET /api/iceberg/maintenance/summary", s.requireAPIAuth(s.handleMaintenanceSummary))
+	mux.HandleFunc("GET /api/iceberg/maintenance/runs", s.requireAPIAuth(s.handleMaintenanceRuns))
+	mux.HandleFunc("GET /api/iceberg/maintenance/runs/{id}", s.requireAPIAuth(s.handleMaintenanceRun))
+	mux.HandleFunc("GET /api/iceberg/maintenance/tables/{key...}", s.requireAPIAuth(s.handleMaintenanceTableState))
+
 	mux.HandleFunc("/api/metrics", s.requireAPIAuth(s.handleMetrics))
 	mux.HandleFunc("/api/table-metrics", s.requireAPIAuth(s.handleTableMetrics))
 	mux.HandleFunc("GET /api/logs", s.requireAPIAuth(s.handleLogs))
