@@ -26,16 +26,64 @@ import (
 const defaultGracefulShutdownTimeout = 90 * time.Second
 
 func main() {
-	addr := flag.String("addr", ":8080", "HTTP listen address")
-	uiDir := flag.String("ui-dir", "./ui", "UI directory")
-	flag.Parse()
-
 	logCloser, err := setupLogging()
 	if err != nil {
 		log.Fatalf("logging setup error: %v", err)
 	}
 	if logCloser != nil {
 		defer logCloser.Close()
+	}
+
+	if len(os.Args) > 1 && os.Args[1] == "maintenance-worker" {
+		if err := runMaintenanceWorkerCommand(os.Args[2:]); err != nil {
+			log.Fatalf("maintenance worker error: %v", err)
+		}
+		return
+	}
+
+	if err := runServer(os.Args[1:]); err != nil {
+		log.Fatalf("server error: %v", err)
+	}
+}
+
+func runMaintenanceWorkerCommand(args []string) error {
+	fs := flag.NewFlagSet("maintenance-worker", flag.ContinueOnError)
+	queue := fs.Bool("queue", false, "continue polling the durable maintenance queue")
+	pollSeconds := fs.Int("poll-interval-seconds", 0, "worker poll interval in seconds (0 uses env/default)")
+	leaseSeconds := fs.Int("lease-seconds", 0, "task lease duration in seconds (0 uses env/default)")
+	taskPageSize := fs.Int("task-page-size", 0, "maximum tasks claimed per parent run")
+	duePageSize := fs.Int("due-page-size", 0, "maximum due table states read per operation")
+	workerID := fs.String("worker-id", "", "stable worker identity (defaults to hostname-pid)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	var pollInterval, leaseDuration time.Duration
+	if *pollSeconds > 0 {
+		pollInterval = time.Duration(*pollSeconds) * time.Second
+	}
+	if *leaseSeconds > 0 {
+		leaseDuration = time.Duration(*leaseSeconds) * time.Second
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return iceberg.RunMaintenanceWorker(ctx, strings.TrimSpace(os.Getenv("RIVUS_META_MYSQL_DSN")), iceberg.MaintenanceWorkerOptions{
+		Queue:         *queue,
+		PollInterval:  pollInterval,
+		LeaseDuration: leaseDuration,
+		TaskPageSize:  *taskPageSize,
+		DuePageSize:   *duePageSize,
+		WorkerID:      strings.TrimSpace(*workerID),
+	})
+}
+
+func runServer(args []string) error {
+	fs := flag.NewFlagSet("rivus", flag.ContinueOnError)
+	addr := fs.String("addr", ":8080", "HTTP listen address")
+	uiDir := fs.String("ui-dir", "./ui", "UI directory")
+	if err := fs.Parse(args); err != nil {
+		return err
 	}
 
 	reg := connector.NewRegistry()
@@ -48,7 +96,7 @@ func main() {
 	if dsn := strings.TrimSpace(os.Getenv("RIVUS_META_MYSQL_DSN")); dsn != "" {
 		jobStore, err := meta.NewMySQLJobStore(dsn)
 		if err != nil {
-			log.Fatalf("job store error: %v", err)
+			return err
 		}
 		jobManagerOpts = append(jobManagerOpts,
 			core.WithJobStore(jobStore),
@@ -59,18 +107,17 @@ func main() {
 	restoreCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	if err := jobManager.RestorePersistedJobs(restoreCtx); err != nil {
-		log.Fatalf("restore persisted jobs failed: %v", err)
+		return err
 	}
 	authConfig, err := api.LoadAuthConfigFromEnv()
 	if err != nil {
-		log.Fatalf("auth config error: %v", err)
+		return err
 	}
 
 	apiServer := api.NewServer(jobManager, *uiDir, authConfig)
-	mux := apiServer.Router()
 	httpServer := &http.Server{
 		Addr:              *addr,
-		Handler:           mux,
+		Handler:           apiServer.Router(),
 		ReadHeaderTimeout: 15 * time.Second,
 	}
 
@@ -86,9 +133,9 @@ func main() {
 	select {
 	case err := <-serverErr:
 		if errors.Is(err, http.ErrServerClosed) {
-			return
+			return nil
 		}
-		log.Fatalf("server error: %v", err)
+		return err
 	case <-signalCtx.Done():
 		timeout := gracefulShutdownTimeoutFromEnv()
 		log.Printf("Shutdown signal received; draining jobs for up to %s", timeout)
@@ -107,6 +154,7 @@ func main() {
 		}
 		httpCancel()
 		log.Printf("Rivus shutdown complete")
+		return nil
 	}
 }
 

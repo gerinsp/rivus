@@ -24,7 +24,7 @@ Rivus is a small streaming data engine for moving table data from MySQL into ana
 - MySQL binlog CDC using `go-mysql`.
 - Doris sink with table creation, DDL forwarding, batching, retries, and stream-load support.
 - Native Iceberg REST catalog sink for object storage-backed tables.
-- Automatic Iceberg snapshot watching and Spark-submitted table maintenance.
+- Hybrid Iceberg maintenance with a durable MySQL scheduler, native `iceberg-go` operations, and Spark fallback for heavy compaction.
 - Persistent offsets and job registry in MySQL metadata storage.
 - Multi-job REST API and dashboard UI.
 - Pause/resume behavior that drains buffered events before checkpointing.
@@ -35,10 +35,10 @@ Rivus is a small streaming data engine for moving table data from MySQL into ana
 
 Prerequisites:
 
-- Docker, if you want to run Rivus from the published container image.
-- Go 1.25 or newer, if you want to develop from source.
+- Docker for the published image.
+- Go 1.25 or newer for source development.
 
-Run Rivus with the published GHCR image:
+Run the normal CDC/API server:
 
 ```sh
 docker pull ghcr.io/gerinsp/rivus:latest
@@ -47,77 +47,171 @@ docker run --rm -p 8080:8080 ghcr.io/gerinsp/rivus:latest
 
 Then open `http://localhost:8080`.
 
-To run with a local metadata MySQL:
-
-```sh
-cp .env.example .env
-docker compose pull
-docker compose up -d
-```
-
-To update an existing Compose deployment:
-
-```sh
-docker compose pull rivus
-docker compose up -d rivus
-```
-
-For automation that replaces the entire Compose stack:
-
-```sh
-docker compose pull rivus
-docker compose down --timeout 120
-docker compose up -d
-```
-
-Do not pass `--volumes` or `-v` to `docker compose down`; the metadata MySQL
-named volume contains the job registry and checkpoints needed for automatic
-resume.
-
-On `SIGTERM` or `SIGINT`, Rivus stops starting new work, drains active jobs to
-committed checkpoints, and preserves their desired state as `RUNNING`. When
-automatic resume is enabled, the replacement container restores those jobs in
-`resume` mode.
-Keep `stop_grace_period` longer than `RIVUS_SHUTDOWN_TIMEOUT_SECONDS`; the
-provided Compose file defaults to two minutes and 90 seconds respectively.
-Automatic resume requires `RIVUS_META_MYSQL_DSN`. By default,
-`RIVUS_AUTO_RESUME=false` restores persisted jobs into the UI without starting
-them. Their configurations and checkpoints remain available, and each job can
-be resumed manually. Set `RIVUS_AUTO_RESUME=true` to resume jobs with saved
-`RUNNING` intent automatically.
-
-Run from source during development:
+Run from source:
 
 ```sh
 go run ./cmd/rivus -addr :8080 -ui-dir ./ui
 ```
 
+## Two-container Iceberg maintenance
+
+The same Rivus image supports two independent process modes. Do not run both processes in one container.
+
+```text
+                    same rivus image
+                          |
+             +------------+------------+
+             |                         |
+             v                         v
+      rivus-streaming            rivus-maintenance
+      /app/rivus                 /app/rivus
+        -addr :8080                maintenance-worker --queue
+             |                         |
+      MySQL CDC -> Iceberg       durable MySQL queue
+                                       |
+                                +------+------+
+                                |             |
+                             native          Spark
+                          tiny/cleanup       heavy
+```
+
+Example Compose service split:
+
+```yaml
+services:
+  rivus-streaming:
+    image: ghcr.io/gerinsp/rivus:latest
+    command: ["/app/rivus", "-addr", ":8080", "-ui-dir", "./ui"]
+    environment:
+      RIVUS_META_MYSQL_DSN: ${RIVUS_META_MYSQL_DSN}
+
+  rivus-maintenance:
+    image: ghcr.io/gerinsp/rivus:latest
+    command: ["/app/rivus", "maintenance-worker", "--queue"]
+    environment:
+      RIVUS_META_MYSQL_DSN: ${RIVUS_META_MYSQL_DSN}
+      RIVUS_MAINTENANCE_GOMAXPROCS: "1"
+      GOMEMLIMIT: 256MiB
+```
+
+Both containers need the same Iceberg REST/object-storage credentials. The maintenance worker must also be able to reach runner-app/Spark when heavy compaction fallback is configured.
+
+The default Docker command is still the normal Rivus server; the image does not start a maintenance process automatically.
+
+## Hybrid Iceberg maintenance
+
+Native maintenance is explicitly opt-in per Iceberg job. During the first rollout, use `native_enabled: true` **without** legacy `enabled: true`; the legacy flag starts the old CDC-side automatic Spark monitor and should remain disabled when the separate worker owns scheduling.
+
+```yaml
+sink:
+  type: iceberg_native
+  config:
+    # normal Iceberg REST/S3 settings...
+    table_maintenance:
+      native_enabled: true
+
+      # existing runner/Spark integration is retained for heavy compaction
+      runner_uri: http://runner-app:8001
+      runner_api_token: ${RUNNER_API_TOKEN}
+      runner_resource_profile: small
+      catalog_name: rivus
+
+      # native tiny-compaction boundary
+      small_file_size_bytes: 67108864
+      small_files_min_count: 10
+      small_files_min_total_bytes: 268435456
+      native_max_selected_input_bytes: 536870912
+      native_max_selected_files: 100
+      native_target_file_size_bytes: 134217728
+      native_scan_concurrency: 1
+      native_timeout_seconds: 600
+
+      # metadata cleanup
+      native_expire_interval_seconds: 86400
+      native_snapshot_max_age_hours: 168
+      native_snapshot_retain_last: 10
+      native_orphan_interval_seconds: 2592000
+      native_orphan_min_age_hours: 168
+      native_orphan_dry_run: true
+      worker_temp_directory: /tmp/rivus-maintenance
+```
+
+The worker plans compaction with `iceberg-go` before choosing an executor. Total table size is not the routing metric: Rivus sums only selected rewrite groups. By default, selected work up to 512 MiB and 100 files can run natively. Larger rewrites, position-delete workloads, and multiple substantial groups route to the existing Spark maintenance integration.
+
+Native compaction uses atomic `RewriteDataFiles`, applies equality deletes while reading, and uses Iceberg's dead-equality-delete logic before removing equality-delete files. Snapshot expiration is native and keeps at least ten snapshots with a seven-day default maximum age. Orphan cleanup is native and disk-bucketed so the complete referenced/candidate sets do not need to live in memory at once.
+
+CDC is not paused for maintenance. The worker checks the initial snapshot barrier before scheduling a table; commit conflicts are maintenance retries, so CDC wins concurrent writes.
+
+For the complete scheduler schema, routing rules, safety model, API and rollout guide, see [`docs/iceberg-maintenance.md`](docs/iceberg-maintenance.md).
+
+## Durable scheduler
+
+Maintenance state is stored in metadata MySQL rather than a 6,000-table in-memory priority queue. The worker creates:
+
+- `iceberg_maintenance_state`
+- `iceberg_maintenance_tasks`
+- `iceberg_maintenance_runs`
+- `iceberg_maintenance_results`
+
+Due state is read in bounded pages, tasks use idempotency keys, MySQL 8 leases use `FOR UPDATE SKIP LOCKED`, expired leases are reclaimable, and deterministic jitter prevents every table from waking at the same time.
+
+Useful worker environment variables:
+
+```env
+RIVUS_META_MYSQL_DSN=rivus:change-me@tcp(meta-mysql:3306)/rivus_meta?parseTime=true
+RIVUS_MAINTENANCE_GOMAXPROCS=1
+RIVUS_MAINTENANCE_POLL_INTERVAL_SECONDS=30
+RIVUS_MAINTENANCE_LEASE_SECONDS=900
+RIVUS_MAINTENANCE_TASK_PAGE_SIZE=50
+RIVUS_MAINTENANCE_DUE_PAGE_SIZE=100
+GOMEMLIMIT=256MiB
+```
+
+One-shot and queue modes:
+
+```sh
+/app/rivus maintenance-worker
+/app/rivus maintenance-worker --queue
+```
+
+## Maintenance API
+
+The API is protected by the same Rivus API authentication as other protected endpoints:
+
+```text
+GET /api/iceberg/maintenance/summary
+GET /api/iceberg/maintenance/runs?limit=50&offset=0
+GET /api/iceberg/maintenance/runs/{id}?limit=100
+GET /api/iceberg/maintenance/tables/{catalog.namespace.table}
+```
+
+The existing per-job manual maintenance endpoint remains available for compatibility:
+
+```sh
+curl -X POST -H 'Content-Type: application/json'   -d '{"tables":["analytics.orders"],"operations":[{"type":"rewrite_data_files"}]}'   http://localhost:8080/api/jobs/example-mysql-to-iceberg/iceberg/maintenance
+```
+
 ## Configuration
 
-Rivus jobs are submitted as YAML or JSON through the UI or API. A job defines a source, a sink, retry policy, buffer size, and metadata storage.
-
-Generic examples are available in:
+Rivus jobs are submitted as YAML or JSON through the UI or API. Generic examples are available in:
 
 - `examples/mysql-to-doris.yaml`
 - `examples/mysql-to-iceberg.yaml`
 
-Submit a job through the API:
+Submit a job:
 
 ```sh
-curl -X POST \
-  -H 'Content-Type: application/x-yaml' \
-  --data-binary @examples/mysql-to-doris.yaml \
-  http://localhost:8080/api/jobs
+curl -X POST   -H 'Content-Type: application/x-yaml'   --data-binary @examples/mysql-to-doris.yaml   http://localhost:8080/api/jobs
 ```
 
-If `RIVUS_API_TOKEN` is set, pass one of these headers:
+If `RIVUS_API_TOKEN` is set, pass either:
 
 ```text
 X-Rivus-Token: <token>
 Authorization: Bearer <token>
 ```
 
-## Important Environment Variables
+Important server environment variables:
 
 ```env
 RIVUS_META_MYSQL_DSN=rivus:change-me@tcp(meta-mysql:3306)/rivus_meta?parseTime=true
@@ -128,34 +222,11 @@ RIVUS_UI_SESSION_SECRET=change-me
 RIVUS_API_TOKEN=
 RIVUS_AUTO_RESUME=false
 RIVUS_SHUTDOWN_TIMEOUT_SECONDS=90
-RIVUS_STOP_GRACE_PERIOD=2m
 RIVUS_LOG_DIR=/app/logs
 RIVUS_LOG_STDERR=true
 ```
 
-Telegram can alert when a job fails, its committed checkpoint falls behind the
-latest MySQL binlog, or the event buffer remains full for at least 10 seconds:
-
-```env
-RIVUS_TELEGRAM_ENABLED=true
-TELEGRAM_BOT_TOKEN=change-me
-TELEGRAM_CHAT_ID=change-me
-RIVUS_UI_BASE_URL=https://rivus.example.com
-RIVUS_TELEGRAM_NOTIFY_JOB_FAILED=true
-RIVUS_TELEGRAM_NOTIFY_CDC_LAG=true
-RIVUS_TELEGRAM_NOTIFY_BACKPRESSURE=true
-RIVUS_CDC_LAG_FILES_THRESHOLD=2
-RIVUS_ALERT_COOLDOWN_SECONDS=600
-```
-
-The lag monitor checks every 30 seconds. The cooldown is applied independently
-per job and alert type to avoid repeated Telegram messages during one incident.
-When `RIVUS_META_MYSQL_DSN` is configured, failed-job alerts are persisted in
-the `job_failure_notifications` outbox, retried with exponential backoff for
-transient delivery errors, and resumed after Rivus restarts. Permanent Telegram
-4xx responses are recorded as failed instead of retried indefinitely.
-
-Iceberg sink integrations can also use:
+Iceberg integrations can use:
 
 ```env
 ICEBERG_REST_URI=http://iceberg-rest:8181
@@ -170,101 +241,22 @@ AWS_SECRET_ACCESS_KEY=change-me
 AWS_DEFAULT_REGION=us-east-1
 ```
 
-## Automatic Iceberg Table Maintenance
+## Snapshots and shutdown
 
-An active `iceberg_native` sink can watch snapshots created by its own Rivus
-job and asynchronously submit maintenance through `runner-app` (preferred) or
-directly to Spark Standalone. Automatic Rivus maintenance does not pause CDC.
-Defaults are 200 active eligible small data files for compaction,
-50 active equality-delete files for compaction, snapshot expiration every 6
-hours, and orphan cleanup every day. Active counts are rebuilt from the current
-Iceberg snapshot after a Rivus restart, so restarting the service does not reset
-maintenance progress.
+On `SIGTERM` or `SIGINT`, the server stops starting new work, drains active jobs to committed checkpoints, and preserves their desired state as `RUNNING`. Set `RIVUS_AUTO_RESUME=true` with `RIVUS_META_MYSQL_DSN` to resume saved running jobs after replacement.
 
-During an initial or resumed source snapshot, Rivus suppresses automatic
-maintenance scans and submissions. An acknowledged
-`SNAPSHOT_COMPLETE` barrier releases the watcher after the final snapshot batch
-is committed; Rivus then scans the active files, CDC starts immediately, and any
-due catch-up maintenance is submitted asynchronously.
-
-```yaml
-sink:
-  type: iceberg_native
-  config:
-    # normal Iceberg REST/S3 settings...
-    table_maintenance:
-      enabled: true
-      runner_uri: http://runner-app:8001
-      runner_api_token: ${RUNNER_API_TOKEN}
-      runner_resource_profile: small
-      catalog_name: rivus
-      data_files_threshold: 200
-      equality_delete_files_threshold: 50
-      small_file_size_bytes: 67108864
-      small_files_min_count: 10
-      small_files_min_total_bytes: 268435456
-      compact_options:
-        strategy: binpack
-        options:
-          target-file-size-bytes: "134217728"
-          min-input-files: "10"
-          max-file-group-size-bytes: "268435456"
-          max-concurrent-file-group-rewrites: "1"
-      expire_snapshots_interval_seconds: 21600
-      expire_snapshots_older_than_hours: 168
-      expire_snapshots_retain_last: 10
-      orphan_cleanup_interval_seconds: 86400
-      orphan_cleanup_older_than_hours: 72
-```
-
-`runner-app` stages the generated maintenance SQL, applies its configured Spark
-catalog and resource profile, and owns status and cancellation. Direct Spark
-REST remains available as a compatibility fallback using `spark_rest_uri`,
-`spark_master`, and `app_resource`; in that mode, enable Spark's REST submission
-server and mount `spark/iceberg_table_maintenance.py` on the cluster.
-
-Maintenance can also be submitted on demand:
-
-```sh
-curl -X POST -H 'Content-Type: application/json' \
-  -d '{"tables":["analytics.orders"],"operations":[{"type":"rewrite_data_files"}]}' \
-  http://localhost:8080/api/jobs/example-mysql-to-iceberg/iceberg/maintenance
-
-curl http://localhost:8080/api/jobs/example-mysql-to-iceberg/iceberg/maintenance/driver-20260813120000-0000
-```
-
-Use `DELETE` on the submission URL to cancel it. On active streams, Rivus
-rejects non-dry-run orphan cleanup with a cutoff newer than 72 hours.
-
-Before automatic compaction, Rivus plans the current Iceberg snapshot and
-requires both the new-file threshold and the active-small-file thresholds.
-Files retained only by old snapshots or present only in object storage do not
-qualify. Eligibility checks run only for tables changed by the Rivus job.
-The default rewrite profile processes one file group at a time and limits each
-group to 256 MiB, so a small table cannot turn into an unbounded Spark rewrite.
-
-Initial MySQL snapshots use a disk-backed rolling writer by default for
-`iceberg_native`. Each source batch is written to a local Arrow spool and
-acknowledged without advancing the durable table progress. At table completion,
-Rivus streams the spool into Iceberg Parquet files targeting 128 MiB and only
-then advances snapshot progress. This bounds memory to roughly one source batch;
-a crash discards the partial spool and safely replays that table from MySQL.
+Initial MySQL snapshots for `iceberg_native` use a disk-backed rolling writer by default. Each source batch is spooled locally and acknowledged without advancing durable table progress; at table completion Rivus streams the spool into Iceberg Parquet files and then advances snapshot progress.
 
 ```yaml
 sink:
   type: iceberg_native
   config:
     snapshot_rolling_enabled: true
-    snapshot_target_file_size_bytes: 134217728 # 128 MiB
-    snapshot_parquet_row_group_rows: 50000     # bounds Parquet writer memory
+    snapshot_target_file_size_bytes: 134217728
+    snapshot_parquet_row_group_rows: 50000
     snapshot_spool_directory: /tmp/rivus-snapshot-spool
-    snapshot_spool_max_bytes: 21474836480      # 20 GiB per table safety limit
+    snapshot_spool_max_bytes: 21474836480
 ```
-
-The spool directory needs enough local disk for the largest table's uncompressed
-Arrow snapshot. Set `snapshot_rolling_enabled: false` to restore per-batch
-snapshot commits. Resuming a legacy snapshot that already has a non-zero row
-offset also keeps the legacy per-batch path for that table.
 
 ## Docker
 
@@ -275,45 +267,17 @@ docker pull ghcr.io/gerinsp/rivus:latest
 docker run --rm -p 8080:8080 ghcr.io/gerinsp/rivus:latest
 ```
 
-The publish workflow pushes images on `main`, version tags such as `v1.0.0`, and manual workflow runs.
+The publish workflow pushes images on `main` and version tags. The default `CMD` remains:
 
-Common tags:
-
-- `latest`: latest build from the default branch.
-- `main`: latest build from the `main` branch.
-- `sha-<commit>`: exact build for a commit.
-
-Run the local Compose stack from GHCR:
-
-```sh
-cp .env.example .env
-docker compose pull
-docker compose up -d
-```
-
-Build an image locally for development:
-
-```sh
-docker build \
-  --build-arg VERSION=dev \
-  --build-arg COMMIT="$(git rev-parse --short HEAD)" \
-  --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  -t rivus:dev .
-```
-
-Or use the development Compose override:
-
-```sh
-docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+```text
+/app/rivus -addr :8080 -ui-dir ./ui
 ```
 
 ## Development
 
-Useful commands:
-
 ```sh
 go test ./...
-go test ./pkg/connectors/mysql
+go test ./pkg/connectors/iceberg
 go run ./cmd/rivus -addr :8080 -ui-dir ./ui
 ```
 
@@ -321,7 +285,7 @@ Please see `CONTRIBUTING.md` before opening a pull request.
 
 ## Security
 
-Do not commit real database credentials, object storage credentials, API tokens, logs, or production job configs. Use `.env` locally and keep publishable configs under `examples/` with placeholder values only.
+Do not commit real database credentials, object-storage credentials, API tokens, logs, or production job configs. Use environment placeholders in publishable examples.
 
 To report a vulnerability, see `SECURITY.md`.
 
