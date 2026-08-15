@@ -32,6 +32,7 @@ type IcebergMaintenanceState struct {
 	OwnerJobID                string     `json:"owner_job_id"`
 	SnapshotComplete          bool       `json:"snapshot_complete"`
 	LastSnapshotID            int64      `json:"last_snapshot_id"`
+	LastWriteAt               *time.Time `json:"last_write_at,omitempty"`
 	NewDataFiles              int        `json:"new_data_files"`
 	NewEqualityDeleteFiles    int        `json:"new_equality_delete_files"`
 	ActiveDataFiles           int        `json:"active_data_files"`
@@ -162,6 +163,7 @@ func (s *IcebergMaintenanceStore) Init(ctx context.Context) error {
 		  owner_job_id VARCHAR(255) NOT NULL,
 		  snapshot_complete TINYINT(1) NOT NULL DEFAULT 0,
 		  last_snapshot_id BIGINT NOT NULL DEFAULT 0,
+		  last_write_at DATETIME(6) NULL,
 		  new_data_files INT NOT NULL DEFAULT 0,
 		  new_equality_delete_files INT NOT NULL DEFAULT 0,
 		  active_data_files INT NOT NULL DEFAULT 0,
@@ -258,7 +260,26 @@ func (s *IcebergMaintenanceStore) Init(ctx context.Context) error {
 			return err
 		}
 	}
+	if err := s.ensureColumn(ctx, "iceberg_maintenance_state", "last_write_at", "DATETIME(6) NULL AFTER last_snapshot_id"); err != nil {
+		return err
+	}
 	return nil
+}
+
+// ensureColumn keeps the durable state schema forward-compatible for existing
+// Rivus deployments, where CREATE TABLE IF NOT EXISTS does not add new fields.
+func (s *IcebergMaintenanceStore) ensureColumn(ctx context.Context, table, column, definition string) error {
+	var found int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?`, table, column).Scan(&found)
+	if err != nil {
+		return err
+	}
+	if found != 0 {
+		return nil
+	}
+	_, err = s.db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, definition))
+	return err
 }
 
 func (s *IcebergMaintenanceStore) SnapshotDone(ctx context.Context, metaKey string) (bool, bool, error) {
@@ -279,15 +300,16 @@ func (s *IcebergMaintenanceStore) UpsertState(ctx context.Context, state Iceberg
 	}
 	const stmt = `INSERT INTO iceberg_maintenance_state (
 	  table_key, catalog, namespace_name, table_name, owner_type, owner_job_id,
-	  snapshot_complete, last_snapshot_id,
+	  snapshot_complete, last_snapshot_id, last_write_at,
 	  next_compaction_check_at, next_expire_check_at, next_orphan_check_at,
 	  created_at, updated_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6))
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6))
 	ON DUPLICATE KEY UPDATE
 	  catalog = VALUES(catalog), namespace_name = VALUES(namespace_name), table_name = VALUES(table_name),
 	  owner_type = VALUES(owner_type), owner_job_id = VALUES(owner_job_id),
 	  snapshot_complete = GREATEST(snapshot_complete, VALUES(snapshot_complete)),
 	  last_snapshot_id = GREATEST(last_snapshot_id, VALUES(last_snapshot_id)),
+	  last_write_at = COALESCE(last_write_at, VALUES(last_write_at)),
 	  next_compaction_check_at = COALESCE(next_compaction_check_at, VALUES(next_compaction_check_at)),
 	  next_expire_check_at = COALESCE(next_expire_check_at, VALUES(next_expire_check_at)),
 	  next_orphan_check_at = COALESCE(next_orphan_check_at, VALUES(next_orphan_check_at)),
@@ -295,7 +317,7 @@ func (s *IcebergMaintenanceStore) UpsertState(ctx context.Context, state Iceberg
 	_, err := s.db.ExecContext(ctx, stmt,
 		state.TableKey, state.Catalog, state.Namespace, state.Table,
 		firstNonEmptyMeta(state.OwnerType, "job"), state.OwnerJobID,
-		boolInt(state.SnapshotComplete), state.LastSnapshotID,
+		boolInt(state.SnapshotComplete), state.LastSnapshotID, state.LastWriteAt,
 		initialCompaction.UTC(), initialExpire.UTC(), initialOrphan.UTC(),
 	)
 	return err
@@ -309,6 +331,7 @@ func (s *IcebergMaintenanceStore) CoalesceSignal(
 	snapshotComplete bool,
 	dataFilesThreshold, equalityDeleteFilesThreshold int,
 	nextCompaction time.Time,
+	nextOrphan time.Time,
 ) (bool, error) {
 	const stmt = `UPDATE iceberg_maintenance_state
 	SET next_compaction_check_at = CASE
@@ -321,6 +344,14 @@ func (s *IcebergMaintenanceStore) CoalesceSignal(
 	      ELSE next_compaction_check_at END,
 	    new_data_files = new_data_files + IF(? > last_snapshot_id, GREATEST(?, 0), 0),
 	    new_equality_delete_files = new_equality_delete_files + IF(? > last_snapshot_id, GREATEST(?, 0), 0),
+	    last_write_at = CASE
+	      WHEN ? > last_snapshot_id AND (GREATEST(?, 0) > 0 OR GREATEST(?, 0) > 0)
+	      THEN UTC_TIMESTAMP(6) ELSE last_write_at END,
+	    next_orphan_check_at = CASE
+	      WHEN ? > last_snapshot_id AND (GREATEST(?, 0) > 0 OR GREATEST(?, 0) > 0) THEN CASE
+	        WHEN next_orphan_check_at IS NULL OR next_orphan_check_at > ? THEN ?
+	        ELSE next_orphan_check_at END
+	      ELSE next_orphan_check_at END,
 	    snapshot_complete = GREATEST(snapshot_complete, ?),
 	    last_snapshot_id = GREATEST(last_snapshot_id, ?),
 	    updated_at = UTC_TIMESTAMP(6)
@@ -339,6 +370,8 @@ func (s *IcebergMaintenanceStore) CoalesceSignal(
 		due, due,
 		snapshotID, newDataFiles,
 		snapshotID, newEqDeleteFiles,
+		snapshotID, newDataFiles, newEqDeleteFiles,
+		snapshotID, newDataFiles, newEqDeleteFiles, nextOrphan.UTC(), nextOrphan.UTC(),
 		boolInt(snapshotComplete), snapshotID,
 		tableKey,
 	)
@@ -380,7 +413,7 @@ func (s *IcebergMaintenanceStore) DueStates(ctx context.Context, operation strin
 		return nil, err
 	}
 	query := fmt.Sprintf(`SELECT table_key, catalog, namespace_name, table_name, owner_type, owner_job_id,
-	 snapshot_complete, last_snapshot_id, new_data_files, new_equality_delete_files,
+	 snapshot_complete, last_snapshot_id, last_write_at, new_data_files, new_equality_delete_files,
 	 active_data_files, active_small_files, active_small_bytes, active_equality_delete_files,
 	 active_position_delete_files, next_compaction_check_at, next_expire_check_at, next_orphan_check_at,
 	 last_compaction_at, last_expire_at, last_orphan_at, lease_owner, lease_until,
@@ -707,7 +740,7 @@ func (s *IcebergMaintenanceStore) ListResultsForRun(ctx context.Context, runID i
 
 func (s *IcebergMaintenanceStore) GetState(ctx context.Context, tableKey string) (*IcebergMaintenanceState, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT table_key, catalog, namespace_name, table_name, owner_type, owner_job_id,
-	 snapshot_complete, last_snapshot_id, new_data_files, new_equality_delete_files,
+	 snapshot_complete, last_snapshot_id, last_write_at, new_data_files, new_equality_delete_files,
 	 active_data_files, active_small_files, active_small_bytes, active_equality_delete_files,
 	 active_position_delete_files, next_compaction_check_at, next_expire_check_at, next_orphan_check_at,
 	 last_compaction_at, last_expire_at, last_orphan_at, lease_owner, lease_until,
@@ -729,10 +762,10 @@ type rowScanner interface {
 func scanMaintenanceState(row rowScanner) (IcebergMaintenanceState, error) {
 	var state IcebergMaintenanceState
 	var snapshotComplete int
-	var nextCompaction, nextExpire, nextOrphan, lastCompaction, lastExpire, lastOrphan, leaseUntil sql.NullTime
+	var lastWrite, nextCompaction, nextExpire, nextOrphan, lastCompaction, lastExpire, lastOrphan, leaseUntil sql.NullTime
 	var leaseOwner, lastError sql.NullString
 	err := row.Scan(&state.TableKey, &state.Catalog, &state.Namespace, &state.Table, &state.OwnerType, &state.OwnerJobID,
-		&snapshotComplete, &state.LastSnapshotID, &state.NewDataFiles, &state.NewEqualityDeleteFiles,
+		&snapshotComplete, &state.LastSnapshotID, &lastWrite, &state.NewDataFiles, &state.NewEqualityDeleteFiles,
 		&state.ActiveDataFiles, &state.ActiveSmallFiles, &state.ActiveSmallBytes, &state.ActiveEqualityDeleteFiles,
 		&state.ActivePositionDeleteFiles, &nextCompaction, &nextExpire, &nextOrphan,
 		&lastCompaction, &lastExpire, &lastOrphan, &leaseOwner, &leaseUntil,
@@ -741,6 +774,7 @@ func scanMaintenanceState(row rowScanner) (IcebergMaintenanceState, error) {
 		return state, err
 	}
 	state.SnapshotComplete = snapshotComplete != 0
+	state.LastWriteAt = nullTimePtr(lastWrite)
 	state.NextCompactionCheckAt = nullTimePtr(nextCompaction)
 	state.NextExpireCheckAt = nullTimePtr(nextExpire)
 	state.NextOrphanCheckAt = nullTimePtr(nextOrphan)

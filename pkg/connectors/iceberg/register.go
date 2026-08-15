@@ -115,6 +115,12 @@ func normalizeIcebergConfig(c config.IcebergConfig) config.IcebergConfig {
 		if c.TableMaintenance.NativeIdleCheckIntervalSeconds <= 0 {
 			c.TableMaintenance.NativeIdleCheckIntervalSeconds = 7 * 24 * 60 * 60
 		}
+		if c.TableMaintenance.NativeOrphanIntervalSeconds <= 0 {
+			c.TableMaintenance.NativeOrphanIntervalSeconds = 30 * 24 * 60 * 60
+		}
+		if c.TableMaintenance.NativeOrphanInactiveIntervalSeconds <= 0 {
+			c.TableMaintenance.NativeOrphanInactiveIntervalSeconds = 90 * 24 * 60 * 60
+		}
 	}
 	if c.TableMaintenance.Enabled {
 		c.TableMaintenance.CompactOptions = normalizeAutomaticCompactOptions(c.TableMaintenance.CompactOptions)

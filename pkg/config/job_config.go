@@ -115,35 +115,37 @@ type IcebergTimestampColumnConfig struct {
 // Standalone compatibility backend. AppResource must be reachable by Spark
 // workers when the direct backend is used.
 type IcebergTableMaintenanceConfig struct {
-	Enabled                        bool              `yaml:"enabled" json:"enabled"`
-	NativeEnabled                  bool              `yaml:"native_enabled" json:"native_enabled"`
-	NativeSignalDelaySeconds       int               `yaml:"native_signal_delay_seconds" json:"native_signal_delay_seconds"`
-	NativeIdleCheckIntervalSeconds int               `yaml:"native_idle_check_interval_seconds" json:"native_idle_check_interval_seconds"`
-	RunnerURI                      string            `yaml:"runner_uri" json:"runner_uri"`
-	RunnerAPIToken                 string            `yaml:"runner_api_token" json:"runner_api_token,omitempty"`
-	RunnerResourceProfile          string            `yaml:"runner_resource_profile" json:"runner_resource_profile"`
-	SparkRESTURI                   string            `yaml:"spark_rest_uri" json:"spark_rest_uri"`
-	SparkMaster                    string            `yaml:"spark_master" json:"spark_master"`
-	AppResource                    string            `yaml:"app_resource" json:"app_resource"`
-	MainClass                      string            `yaml:"main_class" json:"main_class"`
-	ClientSparkVersion             string            `yaml:"client_spark_version" json:"client_spark_version"`
-	CatalogName                    string            `yaml:"catalog_name" json:"catalog_name"`
-	RESTAuthHeader                 string            `yaml:"rest_auth_header" json:"rest_auth_header"`
-	PollIntervalSeconds            int               `yaml:"poll_interval_seconds" json:"poll_interval_seconds"`
-	MaxConcurrentJobs              int               `yaml:"max_concurrent_jobs" json:"max_concurrent_jobs"`
-	DataFilesThreshold             int               `yaml:"data_files_threshold" json:"data_files_threshold"`
-	EqualityDeleteFilesThreshold   int               `yaml:"equality_delete_files_threshold" json:"equality_delete_files_threshold"`
-	SmallFileSizeBytes             int64             `yaml:"small_file_size_bytes" json:"small_file_size_bytes"`
-	SmallFilesMinCount             int               `yaml:"small_files_min_count" json:"small_files_min_count"`
-	SmallFilesMinTotalBytes        int64             `yaml:"small_files_min_total_bytes" json:"small_files_min_total_bytes"`
-	ExpireSnapshotsIntervalSeconds int               `yaml:"expire_snapshots_interval_seconds" json:"expire_snapshots_interval_seconds"`
-	ExpireSnapshotsOlderThanHours  float64           `yaml:"expire_snapshots_older_than_hours" json:"expire_snapshots_older_than_hours"`
-	ExpireSnapshotsRetainLast      int               `yaml:"expire_snapshots_retain_last" json:"expire_snapshots_retain_last"`
-	OrphanCleanupIntervalSeconds   int               `yaml:"orphan_cleanup_interval_seconds" json:"orphan_cleanup_interval_seconds"`
-	OrphanCleanupOlderThanHours    float64           `yaml:"orphan_cleanup_older_than_hours" json:"orphan_cleanup_older_than_hours"`
-	CompactOptions                 map[string]any    `yaml:"compact_options" json:"compact_options"`
-	SparkProperties                map[string]string `yaml:"spark_properties" json:"spark_properties"`
-	EnvironmentVariables           map[string]string `yaml:"environment_variables" json:"environment_variables"`
+	Enabled                             bool              `yaml:"enabled" json:"enabled"`
+	NativeEnabled                       bool              `yaml:"native_enabled" json:"native_enabled"`
+	NativeSignalDelaySeconds            int               `yaml:"native_signal_delay_seconds" json:"native_signal_delay_seconds"`
+	NativeIdleCheckIntervalSeconds      int               `yaml:"native_idle_check_interval_seconds" json:"native_idle_check_interval_seconds"`
+	NativeOrphanIntervalSeconds         int               `yaml:"native_orphan_interval_seconds" json:"native_orphan_interval_seconds"`
+	NativeOrphanInactiveIntervalSeconds int               `yaml:"native_orphan_inactive_interval_seconds" json:"native_orphan_inactive_interval_seconds"`
+	RunnerURI                           string            `yaml:"runner_uri" json:"runner_uri"`
+	RunnerAPIToken                      string            `yaml:"runner_api_token" json:"runner_api_token,omitempty"`
+	RunnerResourceProfile               string            `yaml:"runner_resource_profile" json:"runner_resource_profile"`
+	SparkRESTURI                        string            `yaml:"spark_rest_uri" json:"spark_rest_uri"`
+	SparkMaster                         string            `yaml:"spark_master" json:"spark_master"`
+	AppResource                         string            `yaml:"app_resource" json:"app_resource"`
+	MainClass                           string            `yaml:"main_class" json:"main_class"`
+	ClientSparkVersion                  string            `yaml:"client_spark_version" json:"client_spark_version"`
+	CatalogName                         string            `yaml:"catalog_name" json:"catalog_name"`
+	RESTAuthHeader                      string            `yaml:"rest_auth_header" json:"rest_auth_header"`
+	PollIntervalSeconds                 int               `yaml:"poll_interval_seconds" json:"poll_interval_seconds"`
+	MaxConcurrentJobs                   int               `yaml:"max_concurrent_jobs" json:"max_concurrent_jobs"`
+	DataFilesThreshold                  int               `yaml:"data_files_threshold" json:"data_files_threshold"`
+	EqualityDeleteFilesThreshold        int               `yaml:"equality_delete_files_threshold" json:"equality_delete_files_threshold"`
+	SmallFileSizeBytes                  int64             `yaml:"small_file_size_bytes" json:"small_file_size_bytes"`
+	SmallFilesMinCount                  int               `yaml:"small_files_min_count" json:"small_files_min_count"`
+	SmallFilesMinTotalBytes             int64             `yaml:"small_files_min_total_bytes" json:"small_files_min_total_bytes"`
+	ExpireSnapshotsIntervalSeconds      int               `yaml:"expire_snapshots_interval_seconds" json:"expire_snapshots_interval_seconds"`
+	ExpireSnapshotsOlderThanHours       float64           `yaml:"expire_snapshots_older_than_hours" json:"expire_snapshots_older_than_hours"`
+	ExpireSnapshotsRetainLast           int               `yaml:"expire_snapshots_retain_last" json:"expire_snapshots_retain_last"`
+	OrphanCleanupIntervalSeconds        int               `yaml:"orphan_cleanup_interval_seconds" json:"orphan_cleanup_interval_seconds"`
+	OrphanCleanupOlderThanHours         float64           `yaml:"orphan_cleanup_older_than_hours" json:"orphan_cleanup_older_than_hours"`
+	CompactOptions                      map[string]any    `yaml:"compact_options" json:"compact_options"`
+	SparkProperties                     map[string]string `yaml:"spark_properties" json:"spark_properties"`
+	EnvironmentVariables                map[string]string `yaml:"environment_variables" json:"environment_variables"`
 }
 
 type IcebergConfig struct {

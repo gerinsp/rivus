@@ -133,6 +133,7 @@ sink:
       native_snapshot_max_age_hours: 168
       native_snapshot_retain_last: 10
       native_orphan_interval_seconds: 2592000
+      native_orphan_inactive_interval_seconds: 7776000
       native_orphan_min_age_hours: 168
       native_orphan_dry_run: true
       worker_temp_directory: /tmp/rivus-maintenance

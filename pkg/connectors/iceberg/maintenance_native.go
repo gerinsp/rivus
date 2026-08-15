@@ -25,15 +25,16 @@ import (
 )
 
 const (
-	defaultNativeMaxInputBytes = int64(512 * 1024 * 1024)
-	defaultNativeMaxInputFiles = 100
-	defaultNativeTargetBytes   = int64(128 * 1024 * 1024)
-	defaultNativeSmallBytes    = int64(64 * 1024 * 1024)
-	defaultNativeMinSmallFiles = 10
-	defaultNativeMinSmallBytes = int64(256 * 1024 * 1024)
-	defaultNativeTimeout       = 10 * time.Minute
-	defaultNativeOrphanAge     = 7 * 24 * time.Hour
-	orphanHashBuckets          = 256
+	defaultNativeMaxInputBytes          = int64(512 * 1024 * 1024)
+	defaultNativeMaxInputFiles          = 100
+	defaultNativeTargetBytes            = int64(128 * 1024 * 1024)
+	defaultNativeSmallBytes             = int64(64 * 1024 * 1024)
+	defaultNativeMinSmallFiles          = 10
+	defaultNativeMinSmallBytes          = int64(256 * 1024 * 1024)
+	defaultNativeTimeout                = 10 * time.Minute
+	defaultNativeOrphanAge              = 7 * 24 * time.Hour
+	defaultNativeOrphanInactiveInterval = 90 * 24 * time.Hour
+	orphanHashBuckets                   = 256
 )
 
 type nativeMaintenanceSettings struct {
@@ -51,6 +52,7 @@ type nativeMaintenanceSettings struct {
 	SnapshotMaxAge         time.Duration
 	SnapshotRetainLast     int
 	OrphanInterval         time.Duration
+	OrphanInactiveInterval time.Duration
 	OrphanMinAge           time.Duration
 	OrphanDryRun           bool
 	SparkPollInterval      time.Duration
@@ -87,6 +89,7 @@ func defaultNativeMaintenanceSettings() nativeMaintenanceSettings {
 		SnapshotMaxAge:         7 * 24 * time.Hour,
 		SnapshotRetainLast:     10,
 		OrphanInterval:         30 * 24 * time.Hour,
+		OrphanInactiveInterval: defaultNativeOrphanInactiveInterval,
 		OrphanMinAge:           defaultNativeOrphanAge,
 		OrphanDryRun:           false,
 		SparkPollInterval:      5 * time.Second,

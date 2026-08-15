@@ -73,6 +73,8 @@ table_maintenance:
 
   # native orphan cleanup
   native_orphan_interval_seconds: 2592000
+  # tables with no Rivus write in 30 days are checked only every 90 days
+  native_orphan_inactive_interval_seconds: 7776000
   native_orphan_min_age_hours: 168
   native_orphan_dry_run: false
   worker_temp_directory: /tmp/rivus-maintenance
@@ -84,7 +86,7 @@ table_maintenance:
   spark_timeout_seconds: 7200
 ```
 
-Defaults are deliberately conservative: native compaction is limited to 512 MiB and 100 selected files, snapshot expiration is checked daily and keeps at least ten snapshots while using a seven-day maximum age, orphan cleanup is scheduled every 30 days with a mandatory seven-day minimum age, and the worker uses one Go CPU with a 256 MiB soft memory limit unless overridden.
+Defaults are deliberately conservative: native compaction is limited to 512 MiB and 100 selected files, snapshot expiration is checked daily and keeps at least ten snapshots while using a seven-day maximum age. Orphan cleanup runs every 30 days only for tables that received a Rivus write in those 30 days; inactive tables are deferred to a 90-day schedule. The worker uses one Go CPU with a 256 MiB soft memory limit unless overridden.
 
 ### Worker environment
 

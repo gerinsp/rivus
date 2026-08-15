@@ -3,6 +3,8 @@ package iceberg
 import (
 	"testing"
 	"time"
+
+	"github.com/gerinsp/rivus/pkg/meta"
 )
 
 func TestDeterministicJitterStableAndBounded(t *testing.T) {
@@ -45,8 +47,34 @@ func TestNativeMaintenanceSettingsDefaults(t *testing.T) {
 	if settings.OrphanInterval != 30*24*time.Hour {
 		t.Fatalf("unexpected orphan interval: %s", settings.OrphanInterval)
 	}
+	if settings.OrphanInactiveInterval != 90*24*time.Hour {
+		t.Fatalf("unexpected inactive orphan interval: %s", settings.OrphanInactiveInterval)
+	}
 	if settings.IdleCompactionInterval != 7*24*time.Hour {
 		t.Fatalf("unexpected idle compaction interval: %s", settings.IdleCompactionInterval)
+	}
+}
+
+func TestOrphanCleanupSkipsInactiveTables(t *testing.T) {
+	now := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	settings := defaultNativeMaintenanceSettings()
+	inactive := meta.IcebergMaintenanceState{TableKey: "rivus.ns.idle"}
+	if orphanCleanupActive(inactive, now, settings.OrphanInterval) {
+		t.Fatal("table without a write signal must be inactive")
+	}
+	next := nextMaintenanceSchedule(inactive, "remove_orphan_files", now, settings)
+	if next.Before(now.Add(settings.OrphanInactiveInterval)) || next.After(now.Add(settings.OrphanInactiveInterval+time.Hour)) {
+		t.Fatalf("inactive orphan schedule=%s, want around %s", next, now.Add(settings.OrphanInactiveInterval))
+	}
+
+	recent := now.Add(-24 * time.Hour)
+	active := meta.IcebergMaintenanceState{TableKey: "rivus.ns.hot", LastWriteAt: &recent}
+	if !orphanCleanupActive(active, now, settings.OrphanInterval) {
+		t.Fatal("recent write must keep orphan cleanup active")
+	}
+	next = nextMaintenanceSchedule(active, "remove_orphan_files", now, settings)
+	if next.Before(now.Add(settings.OrphanInterval)) || next.After(now.Add(settings.OrphanInterval+time.Hour)) {
+		t.Fatalf("active orphan schedule=%s, want around %s", next, now.Add(settings.OrphanInterval))
 	}
 }
 

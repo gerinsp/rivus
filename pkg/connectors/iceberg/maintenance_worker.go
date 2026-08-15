@@ -172,7 +172,10 @@ func syncMaintenanceStates(ctx context.Context, store *meta.IcebergMaintenanceSt
 			tableIdentity := canonicalMaintenanceTableKey(catalogName, target.Namespace, target.Table)
 			compactionDue := now.Add(deterministicJitter(tableIdentity+"|compact", settings.IdleCompactionInterval))
 			expireDue := now.Add(deterministicJitter(tableIdentity+"|expire", settings.ExpireInterval))
-			orphanDue := now.Add(deterministicJitter(tableIdentity+"|orphan", settings.OrphanInterval))
+			// A table without a Rivus write signal is inactive. Do not spend an
+			// object-storage scan on it every month; seed its first orphan check
+			// in the longer inactive interval instead.
+			orphanDue := now.Add(deterministicJitter(tableIdentity+"|orphan", settings.OrphanInactiveInterval))
 			if err := store.UpsertState(ctx, meta.IcebergMaintenanceState{
 				TableKey:         tableIdentity,
 				Catalog:          catalogName,
@@ -234,6 +237,13 @@ func enqueueDueMaintenance(ctx context.Context, store *meta.IcebergMaintenanceSt
 			if due == nil {
 				continue
 			}
+			if operation.name == "remove_orphan_files" && !orphanCleanupActive(state, now, job.Settings.OrphanInterval) {
+				next := nextMaintenanceSchedule(state, operation.name, now, job.Settings)
+				if err := store.AdvanceSchedule(ctx, state.TableKey, operation.name, next); err != nil {
+					return fmt.Errorf("defer inactive orphan cleanup for %s: %w", state.TableKey, err)
+				}
+				continue
+			}
 			window := due.UTC().Format(time.RFC3339Nano)
 			_, err := store.EnqueueTask(ctx, state, operation.name, operation.priority, window, now, map[string]any{
 				"scheduled_at": due.UTC().Format(time.RFC3339Nano),
@@ -242,7 +252,7 @@ func enqueueDueMaintenance(ctx context.Context, store *meta.IcebergMaintenanceSt
 			if err != nil {
 				return fmt.Errorf("enqueue %s for %s: %w", operation.name, state.TableKey, err)
 			}
-			next := nextMaintenanceSchedule(state.TableKey, operation.name, now, job.Settings)
+			next := nextMaintenanceSchedule(state, operation.name, now, job.Settings)
 			if err := store.AdvanceSchedule(ctx, state.TableKey, operation.name, next); err != nil {
 				return fmt.Errorf("advance %s schedule for %s: %w", operation.name, state.TableKey, err)
 			}
@@ -375,6 +385,7 @@ func nativeMaintenanceSettingsFromRaw(sinkCfg any) (nativeMaintenanceSettings, e
 	settings.SnapshotMaxAge = time.Duration(rawFloat64(maintenance, "native_snapshot_max_age_hours", settings.SnapshotMaxAge.Hours()) * float64(time.Hour))
 	settings.SnapshotRetainLast = rawInt(maintenance, "native_snapshot_retain_last", settings.SnapshotRetainLast)
 	settings.OrphanInterval = time.Duration(rawInt(maintenance, "native_orphan_interval_seconds", int(settings.OrphanInterval/time.Second))) * time.Second
+	settings.OrphanInactiveInterval = time.Duration(rawInt(maintenance, "native_orphan_inactive_interval_seconds", int(settings.OrphanInactiveInterval/time.Second))) * time.Second
 	settings.OrphanMinAge = time.Duration(rawFloat64(maintenance, "native_orphan_min_age_hours", settings.OrphanMinAge.Hours()) * float64(time.Hour))
 	settings.OrphanDryRun = rawBool(maintenance, "native_orphan_dry_run", settings.OrphanDryRun)
 	settings.SparkPollInterval = time.Duration(rawInt(maintenance, "spark_poll_interval_seconds", int(settings.SparkPollInterval/time.Second))) * time.Second
@@ -406,6 +417,8 @@ func nativeMaintenanceSettingsFromRaw(sinkCfg any) (nativeMaintenanceSettings, e
 		return settings, fmt.Errorf("native_snapshot_retain_last must be >= 1")
 	case settings.OrphanInterval <= 0:
 		return settings, fmt.Errorf("native_orphan_interval_seconds must be > 0")
+	case settings.OrphanInactiveInterval < settings.OrphanInterval:
+		return settings, fmt.Errorf("native_orphan_inactive_interval_seconds must be >= native_orphan_interval_seconds")
 	case settings.OrphanMinAge < defaultNativeOrphanAge:
 		return settings, fmt.Errorf("native_orphan_min_age_hours must be at least %.0f", defaultNativeOrphanAge.Hours())
 	case settings.IdleCompactionInterval <= 0:
@@ -528,7 +541,8 @@ func deterministicJitter(key string, window time.Duration) time.Duration {
 	return time.Duration(value % uint64(window))
 }
 
-func nextMaintenanceSchedule(tableKey, operation string, now time.Time, settings nativeMaintenanceSettings) time.Time {
+func nextMaintenanceSchedule(state meta.IcebergMaintenanceState, operation string, now time.Time, settings nativeMaintenanceSettings) time.Time {
+	tableKey := state.TableKey
 	interval := settings.IdleCompactionInterval
 	if interval <= 0 {
 		interval = defaultCompactionCheckInterval
@@ -538,12 +552,23 @@ func nextMaintenanceSchedule(tableKey, operation string, now time.Time, settings
 		interval = settings.ExpireInterval
 	case "remove_orphan_files":
 		interval = settings.OrphanInterval
+		if !orphanCleanupActive(state, now, settings.OrphanInterval) {
+			interval = settings.OrphanInactiveInterval
+		}
 	}
 	jitterWindow := interval / 10
 	if jitterWindow > time.Hour {
 		jitterWindow = time.Hour
 	}
 	return now.Add(interval).Add(deterministicJitter(tableKey+"|"+operation+"|next", jitterWindow))
+}
+
+func orphanCleanupActive(state meta.IcebergMaintenanceState, now time.Time, activeInterval time.Duration) bool {
+	if state.LastWriteAt == nil || activeInterval <= 0 {
+		return false
+	}
+	lastWrite := state.LastWriteAt.UTC()
+	return !lastWrite.After(now) && now.Sub(lastWrite) < activeInterval
 }
 
 func stateDueTime(state meta.IcebergMaintenanceState, operation string) *time.Time {
