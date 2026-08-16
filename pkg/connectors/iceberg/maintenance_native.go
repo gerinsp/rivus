@@ -66,6 +66,15 @@ type nativeTaskOutcome struct {
 	Retryable bool
 }
 
+type activeFileInventory struct {
+	SnapshotID      int64
+	DataFiles       int
+	SmallFiles      int
+	SmallBytes      int64
+	EqualityDeletes int
+	PositionDeletes int
+}
+
 type compactionWorkload struct {
 	Groups          []icetable.CompactionTaskGroup
 	SelectedFiles   int
@@ -102,6 +111,7 @@ func defaultNativeMaintenanceSettings() nativeMaintenanceSettings {
 
 func executeNativeMaintenanceTask(
 	ctx context.Context,
+	store *meta.IcebergMaintenanceStore,
 	jobID string,
 	jobCfg *config.JobConfig,
 	state meta.IcebergMaintenanceState,
@@ -141,33 +151,135 @@ func executeNativeMaintenanceTask(
 		return finish(nativeTaskOutcome{Result: result, Retryable: true})
 	}
 	tbl, err := cat.LoadTable(setupCtx, namespaceIdentifier(state.Namespace, state.Table))
-	setupCancel()
 	if err != nil {
+		if errorsIsNoSuchIcebergTable(err) {
+			if storeErr := store.MarkInventoryMissing(setupCtx, state.TableKey); storeErr != nil {
+				setupCancel()
+				result.Error = fmt.Sprintf("mark missing table inventory: %v", storeErr)
+				return finish(nativeTaskOutcome{Result: result, Retryable: true})
+			}
+			setupCancel()
+			result.Status = "skipped"
+			result.RoutingReason = "table does not exist yet"
+			return finish(nativeTaskOutcome{Result: result})
+		}
+		setupCancel()
 		result.Error = fmt.Sprintf("load table: %v", err)
-		return finish(nativeTaskOutcome{Result: result, Retryable: !errorsIsNoSuchIcebergTable(err)})
+		return finish(nativeTaskOutcome{Result: result, Retryable: true})
 	}
+	if task.Operation == "compact" {
+		inventory, inventoryErr := scanActiveFileInventory(setupCtx, tbl, settings.SmallFileSizeBytes)
+		if inventoryErr != nil {
+			setupCancel()
+			result.Error = fmt.Sprintf("scan active file inventory: %v", inventoryErr)
+			return finish(nativeTaskOutcome{Result: result, Retryable: true})
+		}
+		if err := saveActiveFileInventory(setupCtx, store, state.TableKey, inventory); err != nil {
+			setupCancel()
+			result.Error = fmt.Sprintf("save active file inventory: %v", err)
+			return finish(nativeTaskOutcome{Result: result, Retryable: true})
+		}
+	}
+	setupCancel()
 
+	var outcome nativeTaskOutcome
 	switch task.Operation {
 	case "compact":
-		outcome := executeHybridCompaction(ctx, jobID, jobCfg, iceCfg, tbl, state, task, settings)
-		outcome.Result.DurationMillis = time.Since(started).Milliseconds()
-		return outcome
+		outcome = executeHybridCompaction(ctx, jobID, jobCfg, iceCfg, tbl, state, task, settings)
 	case "expire_snapshots":
 		taskCtx, cancel := context.WithTimeout(ctx, settings.Timeout)
-		defer cancel()
-		outcome := executeNativeSnapshotExpiration(taskCtx, tbl, result, settings)
-		outcome.Result.DurationMillis = time.Since(started).Milliseconds()
-		return outcome
+		outcome = executeNativeSnapshotExpiration(taskCtx, tbl, result, settings)
+		cancel()
 	case "remove_orphan_files":
 		taskCtx, cancel := context.WithTimeout(ctx, settings.Timeout)
-		defer cancel()
-		outcome := executeBoundedOrphanCleanup(taskCtx, tbl, result, settings)
-		outcome.Result.DurationMillis = time.Since(started).Milliseconds()
-		return outcome
+		outcome = executeBoundedOrphanCleanup(taskCtx, tbl, result, settings)
+		cancel()
 	default:
 		result.Error = fmt.Sprintf("unsupported maintenance operation %q", task.Operation)
 		return finish(nativeTaskOutcome{Result: result})
 	}
+
+	if task.Operation == "compact" && outcome.Result.Status == "succeeded" {
+		refreshCtx, refreshCancel := context.WithTimeout(ctx, settings.Timeout)
+		if err := tbl.Refresh(refreshCtx); err == nil {
+			if inventory, inventoryErr := scanActiveFileInventory(refreshCtx, tbl, settings.SmallFileSizeBytes); inventoryErr == nil {
+				if saveErr := saveActiveFileInventory(refreshCtx, store, state.TableKey, inventory); saveErr != nil {
+					addInventoryWarning(&outcome.Result, saveErr)
+				}
+			} else {
+				addInventoryWarning(&outcome.Result, inventoryErr)
+			}
+		} else {
+			addInventoryWarning(&outcome.Result, err)
+		}
+		refreshCancel()
+	}
+	outcome.Result.DurationMillis = time.Since(started).Milliseconds()
+	return outcome
+}
+
+func scanActiveFileInventory(ctx context.Context, tbl *icetable.Table, smallFileSizeBytes int64) (activeFileInventory, error) {
+	var inventory activeFileInventory
+	if tbl == nil || tbl.CurrentSnapshot() == nil {
+		return inventory, nil
+	}
+	inventory.SnapshotID = tbl.CurrentSnapshot().SnapshotID
+	fsys, err := tbl.FS(ctx)
+	if err != nil {
+		return inventory, fmt.Errorf("open table filesystem: %w", err)
+	}
+	manifests, err := tbl.CurrentSnapshot().Manifests(fsys)
+	if err != nil {
+		return inventory, fmt.Errorf("read current manifest list: %w", err)
+	}
+	for _, manifest := range manifests {
+		if err := ctx.Err(); err != nil {
+			return inventory, err
+		}
+		for entry, entryErr := range manifest.Entries(fsys, true) {
+			if entryErr != nil {
+				return inventory, fmt.Errorf("read manifest %s: %w", manifest.FilePath(), entryErr)
+			}
+			if entry == nil || entry.DataFile() == nil {
+				continue
+			}
+			accumulateActiveFile(&inventory, entry.DataFile(), smallFileSizeBytes)
+		}
+	}
+	return inventory, nil
+}
+
+func accumulateActiveFile(inventory *activeFileInventory, file iceberglib.DataFile, smallFileSizeBytes int64) {
+	if inventory == nil || file == nil {
+		return
+	}
+	switch file.ContentType() {
+	case iceberglib.EntryContentData:
+		inventory.DataFiles++
+		if smallFileSizeBytes > 0 && file.FileSizeBytes() < smallFileSizeBytes {
+			inventory.SmallFiles++
+			inventory.SmallBytes += file.FileSizeBytes()
+		}
+	case iceberglib.EntryContentEqDeletes:
+		inventory.EqualityDeletes++
+	case iceberglib.EntryContentPosDeletes:
+		inventory.PositionDeletes++
+	}
+}
+
+func saveActiveFileInventory(ctx context.Context, store *meta.IcebergMaintenanceStore, tableKey string, inventory activeFileInventory) error {
+	return store.UpdateInventory(ctx, tableKey, inventory.SnapshotID, inventory.DataFiles, inventory.SmallFiles,
+		inventory.SmallBytes, inventory.EqualityDeletes, inventory.PositionDeletes)
+}
+
+func addInventoryWarning(result *meta.IcebergMaintenanceResult, err error) {
+	if result == nil || err == nil {
+		return
+	}
+	if result.Details == nil {
+		result.Details = map[string]any{}
+	}
+	result.Details["inventory_refresh_warning"] = err.Error()
 }
 
 func icebergConfigForNativeWorker(jobCfg *config.JobConfig) (config.IcebergConfig, error) {
@@ -240,15 +352,15 @@ func executeHybridCompaction(
 	result.InputBytes = work.SelectedBytes
 	result.DeleteFiles = work.EqualityDeletes + work.PositionDeletes
 	result.Details = map[string]any{
-		"executor":                settings.Executor,
-		"groups":                  work.GroupCount,
-		"equality_delete_files":   work.EqualityDeletes,
-		"position_delete_files":   work.PositionDeletes,
-		"starting_snapshot_id":    startSnapshotID,
-		"estimated_output_files":  plan.EstOutputFiles,
-		"estimated_output_bytes":  plan.EstOutputBytes,
-		"max_native_input_bytes":  settings.MaxSelectedInputBytes,
-		"max_native_input_files":  settings.MaxSelectedFiles,
+		"executor":               settings.Executor,
+		"groups":                 work.GroupCount,
+		"equality_delete_files":  work.EqualityDeletes,
+		"position_delete_files":  work.PositionDeletes,
+		"starting_snapshot_id":   startSnapshotID,
+		"estimated_output_files": plan.EstOutputFiles,
+		"estimated_output_bytes": plan.EstOutputBytes,
+		"max_native_input_bytes": settings.MaxSelectedInputBytes,
+		"max_native_input_files": settings.MaxSelectedFiles,
 	}
 
 	if work.SelectedFiles == 0 || work.SelectedBytes < settings.MinSmallBytes {

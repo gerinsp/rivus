@@ -38,3 +38,15 @@ func TestMaintenanceRunFilterWhereOwnerScoped(t *testing.T) {
 		t.Fatalf("filter args = %#v, want %#v", args, want)
 	}
 }
+
+func TestSnapshotIDsDifferTreatsIDsAsOpaque(t *testing.T) {
+	if !snapshotIDsDiffer(9187669318630075949, 7281588297543022022) {
+		t.Fatal("a numerically smaller current snapshot must still be treated as new")
+	}
+	if snapshotIDsDiffer(7281588297543022022, 7281588297543022022) {
+		t.Fatal("the same snapshot must not be counted twice")
+	}
+	if snapshotIDsDiffer(7281588297543022022, 0) {
+		t.Fatal("zero is not a valid current snapshot signal")
+	}
+}

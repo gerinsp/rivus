@@ -208,7 +208,6 @@ func (m *tableMaintenanceMonitor) publishDurableStatus(parent context.Context, s
 		SmallFilesMinCount:           m.cfg.TableMaintenance.SmallFilesMinCount,
 		SmallFilesMinTotalBytes:      m.cfg.TableMaintenance.SmallFilesMinTotalBytes,
 		TablesTotal:                  summary.Tables,
-		TablesScanned:                len(states),
 		ActiveRuns:                   summary.ActiveLeases,
 	}
 
@@ -225,6 +224,11 @@ func (m *tableMaintenanceMonitor) publishDurableStatus(parent context.Context, s
 				operations = append(operations, "route:"+result.RoutingReason)
 			}
 		}
+		checkedAt := ""
+		if state.LastInventoryAt != nil {
+			checkedAt = state.LastInventoryAt.UTC().Format(time.RFC3339)
+			status.TablesScanned++
+		}
 		status.Tables = append(status.Tables, connector.TableMaintenanceTableStatus{
 			Namespace:                 state.Namespace,
 			Table:                     state.Table,
@@ -236,7 +240,7 @@ func (m *tableMaintenanceMonitor) publishDurableStatus(parent context.Context, s
 			EligibleSmallBytes:        state.ActiveSmallBytes,
 			NewDataFiles:              state.NewDataFiles,
 			NewEqualityDeleteFiles:    state.NewEqualityDeleteFiles,
-			CheckedAt:                 state.UpdatedAt.UTC().Format(time.RFC3339),
+			CheckedAt:                 checkedAt,
 			Error:                     state.LastError,
 			Operations:                operations,
 		})
@@ -250,18 +254,20 @@ func (m *tableMaintenanceMonitor) publishDurableStatus(parent context.Context, s
 		if state.LastError != "" {
 			status.InventoryErrors++
 		}
-		if state.UpdatedAt.After(latest) {
-			latest = state.UpdatedAt
+		if state.LastInventoryAt != nil && state.LastInventoryAt.After(latest) {
+			latest = *state.LastInventoryAt
 		}
 	}
 
 	switch {
 	case summary.ActiveLeases > 0:
 		status.State = "running"
-	case summary.FailedTasks > 0 || status.InventoryErrors > 0:
+	case status.InventoryErrors > 0:
 		status.State = "error"
 	case summary.Blocked > 0 && summary.Blocked == summary.Tables:
 		status.State = "waiting_for_snapshot"
+	case status.TablesTotal > 0 && status.TablesScanned == 0:
+		status.State = "inventory_pending"
 	case summary.QueuedTasks > 0 || summary.RetryTasks > 0 || status.TablesReady > 0:
 		status.State = "ready"
 	}
@@ -287,6 +293,9 @@ func durableMaintenanceTableState(state meta.IcebergMaintenanceState, cfg config
 	}
 	if state.LastError != "" {
 		return "error"
+	}
+	if state.LastInventoryAt == nil {
+		return "inventory_pending"
 	}
 	dataReady := cfg.DataFilesThreshold > 0 && state.NewDataFiles >= cfg.DataFilesThreshold
 	deleteReady := cfg.EqualityDeleteFilesThreshold > 0 && state.NewEqualityDeleteFiles >= cfg.EqualityDeleteFilesThreshold

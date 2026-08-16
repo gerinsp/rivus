@@ -30,7 +30,7 @@ func (s *IcebergMaintenanceStore) ListStatesForOwner(ctx context.Context, ownerJ
 		limit = 5000
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT table_key, catalog, namespace_name, table_name, owner_type, owner_job_id,
-	 snapshot_complete, last_snapshot_id, last_write_at, new_data_files, new_equality_delete_files,
+	 snapshot_complete, last_snapshot_id, inventory_snapshot_id, last_inventory_at, last_write_at, new_data_files, new_equality_delete_files,
 	 active_data_files, active_small_files, active_small_bytes, active_equality_delete_files,
 	 active_position_delete_files, next_compaction_check_at, next_expire_check_at, next_orphan_check_at,
 	 last_compaction_at, last_expire_at, last_orphan_at, lease_owner, lease_until,

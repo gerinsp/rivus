@@ -328,7 +328,7 @@ func processMaintenancePage(ctx context.Context, store *meta.IcebergMaintenanceS
 			}
 		}(task.ID)
 
-		outcome := executeNativeMaintenanceTask(ctx, task.OwnerJobID, job.Job.Config, *state, task, job.Settings)
+		outcome := executeNativeMaintenanceTask(ctx, store, task.OwnerJobID, job.Job.Config, *state, task, job.Settings)
 		leaseCancel()
 		leaseWG.Wait()
 		outcome.Result.RunID = runID

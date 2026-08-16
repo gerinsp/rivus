@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	iceberg "github.com/apache/iceberg-go"
 	"github.com/gerinsp/rivus/pkg/meta"
 )
 
@@ -55,6 +56,35 @@ func TestNativeMaintenanceSettingsDefaults(t *testing.T) {
 	}
 	if settings.IdleCompactionInterval != 7*24*time.Hour {
 		t.Fatalf("unexpected idle compaction interval: %s", settings.IdleCompactionInterval)
+	}
+}
+
+func TestAccumulateActiveFileInventory(t *testing.T) {
+	const megabyte = int64(1024 * 1024)
+	inventory := activeFileInventory{SnapshotID: 123}
+	file := func(path string, size int64, content iceberg.ManifestEntryContent) iceberg.DataFile {
+		builder, err := iceberg.NewDataFileBuilder(*iceberg.UnpartitionedSpec, content, path, iceberg.ParquetFile,
+			map[int]any{}, map[int]string{}, map[int]int{}, 1, size)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return builder.Build()
+	}
+	files := []iceberg.DataFile{
+		file("small-a.parquet", 10*megabyte, iceberg.EntryContentData),
+		file("small-b.parquet", 63*megabyte, iceberg.EntryContentData),
+		file("large.parquet", 64*megabyte, iceberg.EntryContentData),
+		file("eq-delete.parquet", megabyte, iceberg.EntryContentEqDeletes),
+		file("pos-delete.parquet", megabyte, iceberg.EntryContentPosDeletes),
+	}
+	for _, file := range files {
+		accumulateActiveFile(&inventory, file, 64*megabyte)
+	}
+	if inventory.DataFiles != 3 || inventory.SmallFiles != 2 || inventory.SmallBytes != 73*megabyte {
+		t.Fatalf("data inventory = %#v", inventory)
+	}
+	if inventory.EqualityDeletes != 1 || inventory.PositionDeletes != 1 {
+		t.Fatalf("delete inventory = %#v", inventory)
 	}
 }
 
