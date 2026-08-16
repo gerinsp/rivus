@@ -19,5 +19,25 @@ jobs:
           go-version: "1.25.x"
           cache: true
 
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.x"
+
+      - name: Check UI modules
+        run: |
+          for file in \
+            ui/app.js \
+            ui/core/api.js \
+            ui/jobs.js \
+            ui/logs.js \
+            ui/job-detail.js \
+            ui/iceberg-maintenance.js \
+            ui/errors.js; do
+            node --input-type=module --check < "$file"
+          done
+          grep -q '<script type="module" src="app.js?v=8"></script>' ui/index.html
+          ! grep -q 'maintenance-ui.js' ui/index.html
+
       - name: Test
         run: go test ./...
