@@ -41,10 +41,11 @@
     ].join('');
 
     const header = panel.querySelector('a[href*="/ui/admin/iceberg-maintenance/runs"]')?.closest('.border-b');
-    if (header) {
-      header.insertAdjacentElement('afterend', strip);
+    const anchor = header || panel.firstElementChild;
+    if (anchor) {
+      anchor.insertAdjacentElement('afterend', strip);
     } else {
-      panel.prepend(strip);
+      panel.append(strip);
     }
   }
 
