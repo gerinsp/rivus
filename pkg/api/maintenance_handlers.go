@@ -18,6 +18,17 @@ func (s *Server) handleMaintenanceSummary(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
+	jobID := maintenanceJobID(r)
+	if jobID != "" {
+		summary, err := store.SummaryForOwner(r.Context(), jobID)
+		if err != nil {
+			maintenanceAPIError(w, err, http.StatusInternalServerError)
+			return
+		}
+		maintenanceAPIJSON(w, http.StatusOK, summary)
+		return
+	}
+
 	summary, err := store.Summary(r.Context(), time.Now().UTC())
 	if err != nil {
 		maintenanceAPIError(w, err, http.StatusInternalServerError)
@@ -33,7 +44,17 @@ func (s *Server) handleMaintenanceRuns(w http.ResponseWriter, r *http.Request) {
 	}
 	limit := maintenanceQueryInt(r, "limit", 50, 1, 200)
 	offset := maintenanceQueryInt(r, "offset", 0, 0, 1_000_000)
-	runs, err := store.ListRuns(r.Context(), limit, offset)
+	jobID := maintenanceJobID(r)
+
+	var (
+		runs []meta.IcebergMaintenanceRun
+		err  error
+	)
+	if jobID != "" {
+		runs, err = store.ListRunsForOwner(r.Context(), jobID, limit, offset)
+	} else {
+		runs, err = store.ListRuns(r.Context(), limit, offset)
+	}
 	if err != nil {
 		maintenanceAPIError(w, err, http.StatusInternalServerError)
 		return
@@ -42,6 +63,7 @@ func (s *Server) handleMaintenanceRuns(w http.ResponseWriter, r *http.Request) {
 		"runs":   runs,
 		"limit":  limit,
 		"offset": offset,
+		"job_id": jobID,
 	})
 }
 
@@ -56,7 +78,14 @@ func (s *Server) handleMaintenanceRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	limit := maintenanceQueryInt(r, "limit", 100, 1, 500)
-	results, err := store.ListResultsForRun(r.Context(), runID, limit)
+	jobID := maintenanceJobID(r)
+
+	var results []meta.IcebergMaintenanceResult
+	if jobID != "" {
+		results, err = store.ListResultsForRunOwner(r.Context(), runID, jobID, limit)
+	} else {
+		results, err = store.ListResultsForRun(r.Context(), runID, limit)
+	}
 	if err != nil {
 		maintenanceAPIError(w, err, http.StatusInternalServerError)
 		return
@@ -64,6 +93,7 @@ func (s *Server) handleMaintenanceRun(w http.ResponseWriter, r *http.Request) {
 	maintenanceAPIJSON(w, http.StatusOK, map[string]any{
 		"run_id":  runID,
 		"results": results,
+		"job_id":  jobID,
 	})
 }
 
@@ -119,6 +149,13 @@ func (s *Server) maintenanceAPIStore(w http.ResponseWriter) (*meta.IcebergMainte
 		return nil, false
 	}
 	return s.maintenanceStore, true
+}
+
+func maintenanceJobID(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	return strings.TrimSpace(r.URL.Query().Get("job_id"))
 }
 
 func maintenanceQueryInt(r *http.Request, key string, fallback, minValue, maxValue int) int {
