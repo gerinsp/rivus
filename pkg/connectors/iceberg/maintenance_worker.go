@@ -26,6 +26,7 @@ const (
 	defaultMaintenanceLeaseDuration = 15 * time.Minute
 	defaultMaintenanceRetryLimit    = 5
 	defaultMaintenanceRetryBackoff  = time.Minute
+	defaultInventoryRetryBackoff    = 5 * time.Minute
 	defaultMaintenanceTaskPageSize  = 1
 	defaultMaintenanceDuePageSize   = 100
 	defaultCompactionCheckInterval  = 7 * 24 * time.Hour
@@ -110,6 +111,9 @@ func RunMaintenanceWorker(ctx context.Context, dsn string, opts MaintenanceWorke
 			}
 			lastStateSync = now
 		}
+		if err := scanOnePendingInventory(ctx, store, jobs, opts, now); err != nil {
+			log.Printf("[maintenance-worker %s] pending inventory scan error: %v", opts.WorkerID, err)
+		}
 		if err := enqueueDueMaintenance(ctx, store, jobs, now, opts.DuePageSize); err != nil {
 			return err
 		}
@@ -170,23 +174,53 @@ func syncMaintenanceStates(ctx context.Context, store *meta.IcebergMaintenanceSt
 		catalogName := maintenanceCatalogName(iceCfg)
 		for _, target := range targets {
 			tableIdentity := canonicalMaintenanceTableKey(catalogName, target.Namespace, target.Table)
+			inventoryDue := now
 			compactionDue := now.Add(deterministicJitter(tableIdentity+"|compact", settings.IdleCompactionInterval))
 			expireDue := now.Add(deterministicJitter(tableIdentity+"|expire", settings.ExpireInterval))
 			orphanDue := now.Add(deterministicJitter(tableIdentity+"|orphan", settings.OrphanInactiveInterval))
 			if err := store.UpsertState(ctx, meta.IcebergMaintenanceState{
-				TableKey:         tableIdentity,
-				Catalog:          catalogName,
-				Namespace:        target.Namespace,
-				Table:            target.Table,
-				OwnerType:        "job",
-				OwnerJobID:       jobID,
-				SnapshotComplete: snapshotComplete,
+				TableKey:             tableIdentity,
+				Catalog:              catalogName,
+				Namespace:            target.Namespace,
+				Table:                target.Table,
+				OwnerType:            "job",
+				OwnerJobID:           jobID,
+				SnapshotComplete:     snapshotComplete,
+				NextInventoryCheckAt: &inventoryDue,
 			}, compactionDue, expireDue, orphanDue); err != nil {
 				return nil, fmt.Errorf("upsert maintenance state %s: %w", tableIdentity, err)
 			}
 		}
 	}
 	return jobs, nil
+}
+
+// scanOnePendingInventory performs only one metadata scan per poll. At the
+// default 30-second poll rate, even a 6,000-table first scan remains bounded
+// in memory and CPU while newly configured small jobs become visible quickly.
+func scanOnePendingInventory(ctx context.Context, store *meta.IcebergMaintenanceStore, jobs map[string]maintenanceWorkerJob, opts MaintenanceWorkerOptions, now time.Time) error {
+	state, err := store.ClaimPendingInventoryState(ctx, opts.WorkerID, now, opts.LeaseDuration)
+	if err != nil || state == nil {
+		return err
+	}
+	job, ok := jobs[state.OwnerJobID]
+	if !ok || job.Job.Config == nil {
+		message := "owner job configuration is unavailable for inventory scan"
+		_ = store.RecordStateError(ctx, state.TableKey, message)
+		return store.RetryInventoryClaim(ctx, state.TableKey, opts.WorkerID, now.Add(defaultInventoryRetryBackoff))
+	}
+
+	scanCtx, cancel := context.WithTimeout(ctx, job.Settings.Timeout)
+	err = refreshPendingInventory(scanCtx, store, job.Job.Config, *state, job.Settings)
+	cancel()
+	if err != nil {
+		_ = store.RecordStateError(ctx, state.TableKey, err.Error())
+		if retryErr := store.RetryInventoryClaim(ctx, state.TableKey, opts.WorkerID, now.Add(defaultInventoryRetryBackoff)); retryErr != nil {
+			return retryErr
+		}
+		return nil
+	}
+	return store.FinishInventoryClaim(ctx, state.TableKey, opts.WorkerID)
 }
 
 func maintenanceSnapshotComplete(ctx context.Context, store *meta.IcebergMaintenanceStore, job meta.PersistedJob) bool {

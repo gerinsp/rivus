@@ -218,6 +218,29 @@ func executeNativeMaintenanceTask(
 	return outcome
 }
 
+func refreshPendingInventory(ctx context.Context, store *meta.IcebergMaintenanceStore, jobCfg *config.JobConfig, state meta.IcebergMaintenanceState, settings nativeMaintenanceSettings) error {
+	iceCfg, err := icebergConfigForNativeWorker(jobCfg)
+	if err != nil {
+		return err
+	}
+	cat, err := newCatalog(ctx, iceCfg)
+	if err != nil {
+		return err
+	}
+	tbl, err := cat.LoadTable(ctx, namespaceIdentifier(state.Namespace, state.Table))
+	if err != nil {
+		if errorsIsNoSuchIcebergTable(err) {
+			return store.MarkInventoryMissing(ctx, state.TableKey)
+		}
+		return fmt.Errorf("load table: %w", err)
+	}
+	inventory, err := scanActiveFileInventory(ctx, tbl, settings.SmallFileSizeBytes)
+	if err != nil {
+		return err
+	}
+	return saveActiveFileInventory(ctx, store, state.TableKey, inventory)
+}
+
 func scanActiveFileInventory(ctx context.Context, tbl *icetable.Table, smallFileSizeBytes int64) (activeFileInventory, error) {
 	var inventory activeFileInventory
 	if tbl == nil || tbl.CurrentSnapshot() == nil {

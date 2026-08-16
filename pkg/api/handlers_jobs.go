@@ -196,6 +196,11 @@ func (s *Server) handleJobByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if len(parts) == 4 && parts[1] == "iceberg" && parts[2] == "inventory" && parts[3] == "refresh" && r.Method == http.MethodPost {
+		s.handleJobIcebergInventoryRefresh(w, r, id)
+		return
+	}
+
 	if len(parts) == 4 && parts[1] == "iceberg" && parts[2] == "maintenance" {
 		s.handleJobIcebergMaintenanceSubmission(w, r, id, parts[3])
 		return
@@ -240,6 +245,50 @@ func (s *Server) handleJobByID(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusMethodNotAllowed)
+}
+
+type icebergInventoryRefreshRequest struct {
+	Force bool `json:"force"`
+}
+
+// handleJobIcebergInventoryRefresh only queues metadata inventory for this
+// job's tables. The maintenance worker performs the scan sequentially, so
+// opening a job detail page cannot trigger a fleet-wide scan.
+func (s *Server) handleJobIcebergInventoryRefresh(w http.ResponseWriter, r *http.Request, id string) {
+	job, err := s.jobManager.Get(id)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "job not found"})
+		return
+	}
+	if job.Config == nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "job configuration is unavailable"})
+		return
+	}
+
+	var req icebergInventoryRefreshRequest
+	if r.Body != nil {
+		defer r.Body.Close()
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil && err != io.EOF {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+	}
+
+	store, ok := s.maintenanceAPIStore(w)
+	if !ok {
+		return
+	}
+	requested, err := store.RequestInventoryRefresh(r.Context(), id, time.Now().UTC(), 10*time.Minute, req.Force)
+	if err != nil {
+		maintenanceAPIError(w, err, http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"job_id":    id,
+		"requested": requested,
+		"force":     req.Force,
+		"message":   "inventory scan queued for this job only",
+	})
 }
 
 type icebergOrphanCleanupRequest struct {

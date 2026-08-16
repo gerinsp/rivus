@@ -16,6 +16,7 @@ let previousJobListTab = 'doris';
 let getCurrentTab = () => 'doris';
 let switchTab = () => {};
 let routeChanged = () => {};
+let inventoryRefreshPoll = null;
 
 export function initJobDetail(handlers = {}) {
   currentJobId = handlers.initialJobId || currentJobId;
@@ -27,6 +28,41 @@ export function initJobDetail(handlers = {}) {
 
 export function getCurrentJobId() {
   return currentJobId;
+}
+
+function isNativeIcebergJob(job) {
+  return String(job?.sink_type || job?.config?.sink?.type || '').trim().toLowerCase() === 'iceberg_native'
+    && !!job?.iceberg_maintenance?.enabled;
+}
+
+async function queueInventoryRefresh(jobId, force = false) {
+  const response = await apiFetch(`/api/jobs/${encodeURIComponent(jobId)}/iceberg/inventory/refresh`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ force }),
+  });
+  if (!response.ok) {
+    throw new Error(`Unable to queue inventory scan: ${response.status}`);
+  }
+  const result = await response.json();
+  if (Number(result?.requested || 0) > 0) {
+    scheduleInventoryRefreshPoll(jobId);
+  }
+  return result;
+}
+
+function scheduleInventoryRefreshPoll(jobId) {
+  if (inventoryRefreshPoll) clearTimeout(inventoryRefreshPoll);
+  let attempts = 0;
+  const poll = async () => {
+    if (currentJobId !== jobId || getCurrentTab() !== 'job') return;
+    attempts += 1;
+    await refreshGraph({ silent: true });
+    if (attempts < 8) {
+      inventoryRefreshPoll = setTimeout(poll, 5000);
+    }
+  };
+  inventoryRefreshPoll = setTimeout(poll, 5000);
 }
 
 function renderGraphProgress(graph) {
@@ -607,7 +643,12 @@ export async function refreshGraph(options = {}) {
     job = await jobRes.json();
     renderJobDetailHeader(job);
     renderCheckpoint(job);
-    renderIcebergMaintenance(job);
+    renderIcebergMaintenance(job, {
+      onRefreshInventory: async () => {
+        await queueInventoryRefresh(jobId, true);
+        await refreshGraph({ silent: true });
+      },
+    });
   } else {
     renderJobDetailHeader({ id: jobId });
     renderIcebergMaintenance({ id: jobId });
@@ -619,7 +660,7 @@ export async function refreshGraph(options = {}) {
   if (!res.ok) {
     metaEl.textContent = 'Unavailable';
     setInnerHTMLIfChanged(canvas, `<div class="rounded-[18px] border border-rose-200 bg-rose-50 p-5 text-sm text-rose-700">Failed to load graph: ${res.status}</div>`);
-    return;
+    return null;
   }
 
   const graph = await res.json();
@@ -629,6 +670,7 @@ export async function refreshGraph(options = {}) {
   rawEl.textContent = JSON.stringify(graph, null, 2);
   metaEl.textContent = progressSummary || runtimeState || 'Graph ready';
   renderGraph(graph);
+  return job;
 }
 
 export async function showJobDetails(jobId) {
@@ -642,7 +684,15 @@ export async function showJobDetails(jobId) {
   document.getElementById('jobDetailSubtitle').textContent = '';
   document.getElementById('graphStatus').textContent = '-';
   document.getElementById('graphRaw').textContent = '';
-  await refreshGraph();
+  const job = await refreshGraph();
+  if (isNativeIcebergJob(job)) {
+    try {
+      await queueInventoryRefresh(jobId);
+      await refreshGraph({ silent: true });
+    } catch (error) {
+      console.warn('Unable to queue Iceberg inventory refresh', error);
+    }
+  }
 }
 
 export function backToJobs() {

@@ -30,6 +30,7 @@ function maintenanceStateLabel(state) {
     accumulating: 'Collecting files',
     ready: 'Ready for maintenance',
     running: 'Maintenance running',
+    inventory_pending: 'Waiting for inventory scan',
     healthy: 'Healthy',
     error: 'Inventory error',
     disabled: 'Disabled',
@@ -41,6 +42,9 @@ function maintenanceStateClass(state) {
   switch (String(state || '').toLowerCase()) {
     case 'running':
       return 'border-blue-200 bg-blue-50 text-blue-700';
+    case 'inventory_pending':
+    case 'scanning':
+      return 'border-amber-200 bg-amber-50 text-amber-700';
     case 'ready':
       return 'border-amber-200 bg-amber-50 text-amber-700';
     case 'error':
@@ -84,7 +88,7 @@ function historyLink(job) {
   return `<a href="${href}" target="_blank" rel="noopener noreferrer" class="brand-outline-btn rounded-md px-3 py-1.5 text-xs font-semibold">${label}</a>`;
 }
 
-export function renderIcebergMaintenance(job) {
+export function renderIcebergMaintenance(job, options = {}) {
   const panel = document.getElementById('icebergMaintenancePanel');
   if (!panel) return;
 
@@ -195,6 +199,7 @@ export function renderIcebergMaintenance(job) {
         <div class="flex flex-wrap items-center gap-2">
           <span class="rounded-full border px-3 py-1.5 text-xs font-semibold ${maintenanceStateClass(state)}">${escapeHtml(maintenanceStateLabel(state))}</span>
           <span class="rounded-full border border-slate-200 bg-white px-3 py-1.5 text-[11px] font-semibold text-slate-600">${escapeHtml(scanned)}</span>
+          <button type="button" data-maintenance-inventory-refresh class="brand-outline-btn rounded-md px-3 py-1.5 text-xs font-semibold">Refresh inventory</button>
           ${historyLink(job)}
         </div>
       </div>
@@ -235,4 +240,18 @@ export function renderIcebergMaintenance(job) {
       </div>
     </div>
   `);
+
+  const refreshButton = panel.querySelector('[data-maintenance-inventory-refresh]');
+  if (refreshButton && typeof options.onRefreshInventory === 'function') {
+    refreshButton.addEventListener('click', async () => {
+      refreshButton.disabled = true;
+      refreshButton.textContent = 'Queueing scan...';
+      try {
+        await options.onRefreshInventory();
+      } finally {
+        refreshButton.disabled = false;
+        refreshButton.textContent = 'Refresh inventory';
+      }
+    });
+  }
 }
