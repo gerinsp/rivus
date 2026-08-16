@@ -2,14 +2,10 @@ package config
 
 import "gopkg.in/yaml.v3"
 
-// UnmarshalYAML translates the public maintenance feature gates into runtime
-// executor gates. The raw ConnectorSpec map remains the persisted/user-facing
-// definition, where enabled is still the master switch.
-//
-// The CDC-side legacy automatic monitor keys off Enabled. It is intentionally
-// forced off here because scheduling now belongs exclusively to the durable
-// maintenance worker. NativeEnabled is retained only when both public switches
-// were enabled, so the CDC signaler can feed that worker.
+// UnmarshalYAML makes table_maintenance.enabled the single runtime feature
+// switch. NativeEnabled remains only as an internal compatibility field while
+// worker internals are being renamed; it is always derived from Enabled and the
+// historical native_enabled YAML key is ignored.
 func (c *IcebergTableMaintenanceConfig) UnmarshalYAML(value *yaml.Node) error {
 	type plain IcebergTableMaintenanceConfig
 	var decoded plain
@@ -17,9 +13,8 @@ func (c *IcebergTableMaintenanceConfig) UnmarshalYAML(value *yaml.Node) error {
 		return err
 	}
 
-	workerEnabled := decoded.Enabled && decoded.NativeEnabled
 	*c = IcebergTableMaintenanceConfig(decoded)
-	c.Enabled = false
-	c.NativeEnabled = workerEnabled
+	c.Enabled = decoded.Enabled
+	c.NativeEnabled = decoded.Enabled
 	return nil
 }
