@@ -7,13 +7,12 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const internalMaintenanceWorkerGate = "native_enabled"
-
 // ConnectorSpec keeps connector configs as raw maps so persisted jobs can be
 // consumed by both the CDC server and the separate maintenance worker.
-// table_maintenance.enabled is the only public feature switch. The historical
-// native_enabled key is now an internal compatibility detail derived from
-// enabled; user supplied values cannot change the selected runtime path.
+//
+// table_maintenance.enabled is the only feature gate. executor selects how
+// compaction is executed: hybrid, native, or spark. The historical
+// native_enabled key is removed during decode and is never persisted again.
 func (c *ConnectorSpec) UnmarshalYAML(value *yaml.Node) error {
 	type plain ConnectorSpec
 	var decoded plain
@@ -21,7 +20,7 @@ func (c *ConnectorSpec) UnmarshalYAML(value *yaml.Node) error {
 		return err
 	}
 	*c = ConnectorSpec(decoded)
-	c.normalizeMaintenanceFeatureGate()
+	c.normalizeMaintenanceConfig()
 	return nil
 }
 
@@ -32,29 +31,11 @@ func (c *ConnectorSpec) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	*c = ConnectorSpec(decoded)
-	c.normalizeMaintenanceFeatureGate()
+	c.normalizeMaintenanceConfig()
 	return nil
 }
 
-// MarshalJSON removes the historical internal worker gate so persisted jobs and
-// API responses expose only table_maintenance.enabled.
-func (c ConnectorSpec) MarshalJSON() ([]byte, error) {
-	type plain ConnectorSpec
-	clean := plain(c)
-	clean.Config = connectorConfigWithoutInternalMaintenanceGate(c.Config)
-	return json.Marshal(clean)
-}
-
-// MarshalYAML keeps generated/exported YAML aligned with the public one-switch
-// configuration model.
-func (c ConnectorSpec) MarshalYAML() (any, error) {
-	type plain ConnectorSpec
-	clean := plain(c)
-	clean.Config = connectorConfigWithoutInternalMaintenanceGate(c.Config)
-	return clean, nil
-}
-
-func (c *ConnectorSpec) normalizeMaintenanceFeatureGate() {
+func (c *ConnectorSpec) normalizeMaintenanceConfig() {
 	if c == nil || !strings.EqualFold(strings.TrimSpace(c.Type), "iceberg_native") || c.Config == nil {
 		return
 	}
@@ -66,35 +47,19 @@ func (c *ConnectorSpec) normalizeMaintenanceFeatureGate() {
 	if !ok || maintenance == nil {
 		return
 	}
-	enabled, _ := maintenance["enabled"].(bool)
-	// Keep the old key only inside the in-memory raw map until worker internals
-	// are fully renamed. It is always derived from enabled and never serialized.
-	maintenance[internalMaintenanceWorkerGate] = enabled
-}
 
-func connectorConfigWithoutInternalMaintenanceGate(config map[string]any) map[string]any {
-	if config == nil {
-		return nil
+	// native_enabled belonged to the first worker rollout. Scheduling now has a
+	// single master switch, so do not preserve or honor the old flag.
+	delete(maintenance, "native_enabled")
+
+	enabled, _ := maintenance["enabled"].(bool)
+	if !enabled {
+		return
 	}
-	out := make(map[string]any, len(config))
-	for key, value := range config {
-		out[key] = value
+	executor, _ := maintenance["executor"].(string)
+	executor = strings.ToLower(strings.TrimSpace(executor))
+	if executor == "" {
+		executor = "hybrid"
 	}
-	raw, ok := config["table_maintenance"]
-	if !ok {
-		return out
-	}
-	maintenance, ok := raw.(map[string]any)
-	if !ok || maintenance == nil {
-		return out
-	}
-	cleanMaintenance := make(map[string]any, len(maintenance))
-	for key, value := range maintenance {
-		if key == internalMaintenanceWorkerGate {
-			continue
-		}
-		cleanMaintenance[key] = value
-	}
-	out["table_maintenance"] = cleanMaintenance
-	return out
+	maintenance["executor"] = executor
 }
