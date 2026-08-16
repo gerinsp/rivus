@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Rivus Iceberg Maintenance</title>
+  <link rel="icon" type="image/png" href="/rivus-logo.png?v=2" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&amp;family=IBM+Plex+Sans:wght@400;500;600;700&amp;display=swap" rel="stylesheet" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="/styles.css?v=1" />
+</head>
+<body class="min-h-screen bg-slate-50 text-slate-900">
+  <main class="mx-auto max-w-[1500px] px-4 py-6 sm:px-6 lg:px-8">
+    <div class="mb-6 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+      <div>
+        <div class="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Iceberg maintenance</div>
+        <h1 class="mt-2 text-2xl font-semibold tracking-tight text-slate-950">Durable Worker Runs</h1>
+        <p class="mt-2 max-w-3xl text-sm leading-6 text-slate-600">Queue health and execution history from metadata MySQL. Native and Spark fallback results are shown from the same durable worker state.</p>
+      </div>
+      <div class="flex gap-2">
+        <a href="/" class="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50">Back to jobs</a>
+        <button id="refreshButton" class="rounded-md border border-blue-300 bg-blue-50 px-3 py-2 text-sm font-semibold text-blue-800 hover:bg-blue-100">Refresh</button>
+      </div>
+    </div>
+
+    <div id="notice" class="mb-4 hidden rounded-xl border px-4 py-3 text-sm"></div>
+
+    <section id="summary" class="grid gap-3 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-6"></section>
+
+    <section class="mt-6 overflow-hidden rounded-[20px] border border-slate-200 bg-white shadow-sm">
+      <div class="border-b border-slate-200 px-5 py-4 sm:px-6">
+        <div class="flex items-center justify-between gap-3">
+          <div>
+            <h2 class="font-semibold text-slate-900">Recent worker runs</h2>
+            <p class="mt-1 text-xs text-slate-500">Click a run to inspect operation, engine, routing, attempt, file counts, duration, and errors.</p>
+          </div>
+          <span id="runCount" class="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-semibold text-slate-600">0 runs</span>
+        </div>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="min-w-full text-sm">
+          <thead class="bg-slate-50 text-slate-600">
+            <tr class="border-b border-slate-200">
+              <th class="px-4 py-3 text-left text-[11px] font-semibold uppercase tracking-[0.14em]">Run</th>
+              <th class="px-4 py-3 text-left text-[11px] font-semibold uppercase tracking-[0.14em]">Worker</th>
+              <th class="px-4 py-3 text-left text-[11px] font-semibold uppercase tracking-[0.14em]">Status</th>
+              <th class="px-4 py-3 text-right text-[11px] font-semibold uppercase tracking-[0.14em]">Tasks</th>
+              <th class="px-4 py-3 text-right text-[11px] font-semibold uppercase tracking-[0.14em]">Success</th>
+              <th class="px-4 py-3 text-right text-[11px] font-semibold uppercase tracking-[0.14em]">Skipped</th>
+              <th class="px-4 py-3 text-right text-[11px] font-semibold uppercase tracking-[0.14em]">Failed</th>
+              <th class="px-4 py-3 text-left text-[11px] font-semibold uppercase tracking-[0.14em]">Started</th>
+            </tr>
+          </thead>
+          <tbody id="runsBody" class="divide-y divide-slate-100"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="detailsPanel" class="mt-6 hidden overflow-hidden rounded-[20px] border border-slate-200 bg-white shadow-sm">
+      <div class="border-b border-slate-200 px-5 py-4 sm:px-6">
+        <div class="flex items-center justify-between gap-3">
+          <div>
+            <div class="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Run details</div>
+            <h2 id="detailsTitle" class="mt-1 font-semibold text-slate-900">-</h2>
+          </div>
+          <button id="closeDetails" class="rounded-md border border-slate-300 px-3 py-2 text-xs font-semibold text-slate-700">Close</button>
+        </div>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="min-w-full text-sm">
+          <thead class="bg-slate-50 text-slate-600">
+            <tr class="border-b border-slate-200">
+              <th class="px-4 py-3 text-left text-[11px] font-semibold uppercase tracking-[0.14em]">Table</th>
+              <th class="px-4 py-3 text-left text-[11px] font-semibold uppercase tracking-[0.14em]">Operation</th>
+              <th class="px-4 py-3 text-left text-[11px] font-semibold uppercase tracking-[0.14em]">Engine / route</th>
+              <th class="px-4 py-3 text-left text-[11px] font-semibold uppercase tracking-[0.14em]">Status</th>
+              <th class="px-4 py-3 text-right text-[11px] font-semibold uppercase tracking-[0.14em]">Input</th>
+              <th class="px-4 py-3 text-right text-[11px] font-semibold uppercase tracking-[0.14em]">Output</th>
+              <th class="px-4 py-3 text-right text-[11px] font-semibold uppercase tracking-[0.14em]">Attempt</th>
+              <th class="px-4 py-3 text-right text-[11px] font-semibold uppercase tracking-[0.14em]">Duration</th>
+            </tr>
+          </thead>
+          <tbody id="resultsBody" class="divide-y divide-slate-100"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+<script>
+const fmt = new Intl.NumberFormat();
+const esc = (value) => String(value ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#39;');
+const dateText = (value) => {
+  if (!value) return '-';
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? String(value) : d.toLocaleString();
+};
+const bytes = (value) => {
+  let n = Number(value || 0);
+  if (!Number.isFinite(n)) return '-';
+  const units = ['B','KiB','MiB','GiB','TiB'];
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i += 1; }
+  return `${n.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+};
+const duration = (ms) => {
+  const n = Number(ms || 0);
+  if (!Number.isFinite(n)) return '-';
+  if (n < 1000) return `${Math.trunc(n)} ms`;
+  return `${(n / 1000).toFixed(1)} s`;
+};
+function notice(message, error = false) {
+  const el = document.getElementById('notice');
+  if (!message) { el.classList.add('hidden'); return; }
+  el.className = `mb-4 rounded-xl border px-4 py-3 text-sm ${error ? 'border-rose-200 bg-rose-50 text-rose-700' : 'border-slate-200 bg-white text-slate-600'}`;
+  el.textContent = message;
+}
+async function api(path) {
+  const res = await fetch(path, { credentials: 'same-origin' });
+  if (res.status === 401) {
+    window.location.href = '/login?next=' + encodeURIComponent(window.location.pathname);
+    throw new Error('authentication required');
+  }
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || `${res.status} ${res.statusText}`);
+  }
+  return res.json();
+}
+function metric(label, value, detail) {
+  return `<div class="rounded-[18px] border border-slate-200 bg-white p-4 shadow-sm"><div class="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-500">${esc(label)}</div><div class="mt-2 font-mono text-xl font-semibold text-slate-950">${esc(value)}</div><div class="mt-1 text-xs text-slate-500">${esc(detail || '')}</div></div>`;
+}
+function statusBadge(value) {
+  const v = String(value || '-').toLowerCase();
+  const cls = v.includes('error') || v === 'failed' ? 'border-rose-200 bg-rose-50 text-rose-700' : v === 'running' || v === 'succeeded' || v === 'finished' ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : v === 'skipped' ? 'border-slate-200 bg-slate-50 text-slate-600' : 'border-amber-200 bg-amber-50 text-amber-700';
+  return `<span class="inline-flex rounded-full border px-2.5 py-1 text-[11px] font-semibold ${cls}">${esc(value || '-')}</span>`;
+}
+async function load() {
+  const button = document.getElementById('refreshButton');
+  button.disabled = true;
+  notice('');
+  try {
+    const [summary, payload] = await Promise.all([
+      api('/api/iceberg/maintenance/summary'),
+      api('/api/iceberg/maintenance/runs?limit=100&offset=0'),
+    ]);
+    document.getElementById('summary').innerHTML = [
+      metric('Tracked tables', fmt.format(summary.tables || 0), `${fmt.format(summary.snapshot_blocked || 0)} snapshot blocked`),
+      metric('Queued', fmt.format(summary.queued_tasks || 0), 'Waiting for a worker lease'),
+      metric('Retrying', fmt.format(summary.retry_tasks || 0), 'Retryable worker tasks'),
+      metric('Running', fmt.format(summary.active_leases || 0), 'Active durable leases'),
+      metric('Failed', fmt.format(summary.failed_tasks || 0), 'Terminal task failures'),
+      metric('Oldest queue age', summary.oldest_queued_age_seconds ? `${fmt.format(summary.oldest_queued_age_seconds)} s` : '0 s', summary.oldest_queued_at ? dateText(summary.oldest_queued_at) : 'Queue is clear'),
+    ].join('');
+
+    const runs = Array.isArray(payload.runs) ? payload.runs : [];
+    document.getElementById('runCount').textContent = `${runs.length} run${runs.length === 1 ? '' : 's'}`;
+    document.getElementById('runsBody').innerHTML = runs.map((run) => `
+      <tr class="cursor-pointer hover:bg-slate-50" data-run-id="${esc(run.id)}">
+        <td class="px-4 py-3 font-mono text-xs font-semibold text-blue-700">#${esc(run.id)}</td>
+        <td class="px-4 py-3 font-mono text-xs text-slate-700">${esc(run.worker_id || '-')}</td>
+        <td class="px-4 py-3">${statusBadge(run.status)}</td>
+        <td class="px-4 py-3 text-right font-mono text-xs">${fmt.format(run.task_count || 0)}</td>
+        <td class="px-4 py-3 text-right font-mono text-xs text-emerald-700">${fmt.format(run.success_count || 0)}</td>
+        <td class="px-4 py-3 text-right font-mono text-xs text-slate-600">${fmt.format(run.skipped_count || 0)}</td>
+        <td class="px-4 py-3 text-right font-mono text-xs text-rose-700">${fmt.format(run.failed_count || 0)}</td>
+        <td class="px-4 py-3 text-xs text-slate-600">${esc(dateText(run.started_at))}</td>
+      </tr>`).join('') || '<tr><td colspan="8" class="px-4 py-10 text-center text-sm text-slate-500">No maintenance runs have been recorded yet.</td></tr>';
+    document.querySelectorAll('[data-run-id]').forEach((row) => row.addEventListener('click', () => loadRun(row.dataset.runId)));
+  } catch (err) {
+    notice(`Failed to load maintenance worker state: ${err.message}`, true);
+  } finally {
+    button.disabled = false;
+  }
+}
+async function loadRun(id) {
+  const panel = document.getElementById('detailsPanel');
+  panel.classList.remove('hidden');
+  document.getElementById('detailsTitle').textContent = `Run #${id}`;
+  document.getElementById('resultsBody').innerHTML = '<tr><td colspan="8" class="px-4 py-8 text-center text-sm text-slate-500">Loading results...</td></tr>';
+  try {
+    const payload = await api(`/api/iceberg/maintenance/runs/${encodeURIComponent(id)}?limit=500`);
+    const results = Array.isArray(payload.results) ? payload.results : [];
+    document.getElementById('resultsBody').innerHTML = results.map((result) => {
+      const route = result.routing_reason ? `<div class="mt-1 max-w-sm text-[11px] leading-4 text-slate-500">${esc(result.routing_reason)}</div>` : '';
+      const error = result.error ? `<div class="mt-1 max-w-lg break-words text-[11px] leading-4 text-rose-600">${esc(result.error)}</div>` : '';
+      return `<tr class="align-top">
+        <td class="px-4 py-3"><div class="font-mono text-xs font-semibold text-slate-800">${esc(result.table_key || '-')}</div>${error}</td>
+        <td class="px-4 py-3 font-mono text-xs text-slate-700">${esc(result.operation || '-')}</td>
+        <td class="px-4 py-3"><div class="font-mono text-xs font-semibold text-blue-700">${esc(result.engine || '-')}</div>${route}</td>
+        <td class="px-4 py-3">${statusBadge(result.status)}</td>
+        <td class="px-4 py-3 text-right"><div class="font-mono text-xs">${fmt.format(result.input_files || 0)} files</div><div class="mt-1 text-[11px] text-slate-500">${esc(bytes(result.input_bytes))}</div></td>
+        <td class="px-4 py-3 text-right"><div class="font-mono text-xs">${fmt.format(result.output_files || 0)} files</div><div class="mt-1 text-[11px] text-slate-500">${esc(bytes(result.output_bytes))}</div></td>
+        <td class="px-4 py-3 text-right font-mono text-xs">${fmt.format(result.attempt || 0)}</td>
+        <td class="px-4 py-3 text-right font-mono text-xs">${esc(duration(result.duration_ms))}</td>
+      </tr>`;
+    }).join('') || '<tr><td colspan="8" class="px-4 py-8 text-center text-sm text-slate-500">No results recorded for this run.</td></tr>';
+  } catch (err) {
+    document.getElementById('resultsBody').innerHTML = `<tr><td colspan="8" class="px-4 py-8 text-center text-sm text-rose-600">${esc(err.message)}</td></tr>`;
+  }
+  panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+document.getElementById('refreshButton').addEventListener('click', load);
+document.getElementById('closeDetails').addEventListener('click', () => document.getElementById('detailsPanel').classList.add('hidden'));
+load();
+setInterval(load, 30000);
+</script>
+</body>
+</html>

@@ -41,12 +41,15 @@ var sharedMaintenanceSignalStore struct {
 }
 
 func newNativeMaintenanceSignaler(jobID string, cfg config.IcebergConfig) (*nativeMaintenanceSignaler, error) {
+	// NativeEnabled is already normalized from the public enabled +
+	// native_enabled gates by the config decoder. Enabled is deliberately false
+	// in this runtime config so the removed legacy CDC monitor cannot start.
 	if !cfg.TableMaintenance.NativeEnabled {
 		return nil, nil
 	}
 	dsn := strings.TrimSpace(os.Getenv("RIVUS_META_MYSQL_DSN"))
 	if dsn == "" {
-		return nil, fmt.Errorf("iceberg table_maintenance.native_enabled requires RIVUS_META_MYSQL_DSN")
+		return nil, fmt.Errorf("iceberg table_maintenance worker requires RIVUS_META_MYSQL_DSN")
 	}
 	store, err := sharedNativeMaintenanceSignalStore(dsn)
 	if err != nil {
