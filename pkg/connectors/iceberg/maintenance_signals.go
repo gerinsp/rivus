@@ -41,12 +41,14 @@ var sharedMaintenanceSignalStore struct {
 }
 
 func newNativeMaintenanceSignaler(jobID string, cfg config.IcebergConfig) (*nativeMaintenanceSignaler, error) {
-	if !cfg.TableMaintenance.NativeEnabled {
+	// enabled is the user-facing master switch. native_enabled only chooses the
+	// durable worker/hybrid executor and cannot enable maintenance by itself.
+	if !cfg.TableMaintenance.Enabled || !cfg.TableMaintenance.NativeEnabled {
 		return nil, nil
 	}
 	dsn := strings.TrimSpace(os.Getenv("RIVUS_META_MYSQL_DSN"))
 	if dsn == "" {
-		return nil, fmt.Errorf("iceberg table_maintenance.native_enabled requires RIVUS_META_MYSQL_DSN")
+		return nil, fmt.Errorf("iceberg table_maintenance.enabled + native_enabled requires RIVUS_META_MYSQL_DSN")
 	}
 	store, err := sharedNativeMaintenanceSignalStore(dsn)
 	if err != nil {
