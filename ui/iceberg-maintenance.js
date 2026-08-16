@@ -70,7 +70,7 @@ function workerConfigStrip(job, enabled) {
     <div class="grid gap-3 border-b border-slate-200 bg-slate-50 px-5 py-4 sm:grid-cols-3 sm:px-6">
       ${maintenanceMetric('Automatic maintenance', enabled ? 'Enabled' : 'Disabled', enabled ? 'Durable worker scheduling is active' : 'No automatic tasks are scheduled')}
       ${maintenanceMetric('Scheduler', 'Maintenance Worker', 'CDC only emits lightweight maintenance signals')}
-      ${maintenanceMetric('Executor', executorLabel, 'Compaction policy; snapshot expiration and orphan cleanup stay native')}
+      ${maintenanceMetric('Executor', executorLabel, 'Compaction policy; cleanup operations stay native')}
     </div>
   `;
 }
@@ -101,9 +101,11 @@ export function renderIcebergMaintenance(job) {
 
   if (!maintenance) {
     setInnerHTMLIfChanged(panel, `
-      <div class="border-b border-slate-200 px-5 py-5 sm:px-6">
+      <div class="px-5 py-5 sm:px-6">
         <div class="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Iceberg Maintenance</div>
-        <div class="mt-2 text-sm text-slate-600">Durable maintenance-worker state will appear after the Iceberg sink starts.</div>
+        <div class="mt-3 rounded-[16px] border border-slate-200 bg-slate-50 px-4 py-4 text-sm text-slate-600">
+          Durable maintenance-worker state will appear after the Iceberg sink starts.
+        </div>
       </div>
       ${workerConfigStrip(job, configuredEnabled)}
     `);
@@ -112,7 +114,7 @@ export function renderIcebergMaintenance(job) {
 
   if (!maintenance.enabled) {
     setInnerHTMLIfChanged(panel, `
-      <div class="flex flex-col gap-3 border-b border-slate-200 px-5 py-5 sm:flex-row sm:items-center sm:justify-between sm:px-6">
+      <div class="flex flex-col gap-3 px-5 py-5 sm:flex-row sm:items-center sm:justify-between sm:px-6">
         <div>
           <div class="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Iceberg Maintenance</div>
           <div class="mt-2 text-sm text-slate-600">Automatic maintenance is disabled for this job. The maintenance worker will not schedule tasks.</div>
@@ -169,14 +171,14 @@ export function renderIcebergMaintenance(job) {
     `;
   }).join('');
 
-  const checkedAt = maintenance.checked_at ? formatDateTime(maintenance.checked_at) : 'Waiting for first state update';
-  const scanned = `${fmtWholeNumber(maintenance.tables_scanned || 0)} / ${fmtWholeNumber(maintenance.tables_total || 0)} tables tracked`;
+  const checkedAt = maintenance.checked_at ? formatDateTime(maintenance.checked_at) : 'Waiting for first scan';
+  const scanned = `${fmtWholeNumber(maintenance.tables_scanned || 0)} / ${fmtWholeNumber(maintenance.tables_total || 0)} tables scanned`;
   const errors = Number(maintenance.inventory_errors || 0);
   const inventoryNotice = state === 'waiting_for_snapshot'
     ? 'Initial snapshot is still running. The maintenance worker waits for the snapshot barrier; file counts refresh after the snapshot completes.'
     : errors > 0
-      ? `${fmtWholeNumber(errors)} table inventory scan(s) failed. Other durable table state remains available below.`
-      : 'Counts come from active files in the current Iceberg snapshot and durable maintenance metadata, not every object stored in S3.';
+      ? `${fmtWholeNumber(errors)} table inventory scan(s) failed. Other table counts remain available below.`
+      : 'Counts come from active files in the current Iceberg snapshot, not every object stored in S3.';
   const inventoryTone = errors > 0
     ? 'border-rose-200 bg-rose-50 text-rose-700'
     : state === 'waiting_for_snapshot'
@@ -196,7 +198,7 @@ export function renderIcebergMaintenance(job) {
           ${historyLink(job)}
         </div>
       </div>
-      <div class="mt-3 text-xs text-slate-500">Last durable state update: <span class="font-semibold text-slate-700">${escapeHtml(checkedAt)}</span></div>
+      <div class="mt-3 text-xs text-slate-500">Last successful inventory check: <span class="font-semibold text-slate-700">${escapeHtml(checkedAt)}</span></div>
     </div>
 
     ${workerConfigStrip(job, configuredEnabled)}
@@ -206,7 +208,7 @@ export function renderIcebergMaintenance(job) {
       ${maintenanceMetric('Equality-delete files', fmtWholeNumber(maintenance.active_equality_delete_files || 0), 'Currently referenced')}
       ${maintenanceMetric('Eligible small files', fmtWholeNumber(maintenance.eligible_small_files || 0), `Below ${fmtBytes(Number(maintenance.small_file_size_bytes || 0))}`)}
       ${maintenanceMetric('Eligible small bytes', fmtBytes(Number(maintenance.eligible_small_bytes || 0)), `Minimum ${fmtBytes(Number(maintenance.small_files_min_total_bytes || 0))}`)}
-      ${maintenanceMetric('Tables ready', fmtWholeNumber(maintenance.tables_ready || 0), `${fmtWholeNumber(maintenance.active_runs || 0)} worker lease(s) active`)}
+      ${maintenanceMetric('Tables ready', fmtWholeNumber(maintenance.tables_ready || 0), `${fmtWholeNumber(maintenance.active_runs || 0)} maintenance run(s) active`)}
     </div>
 
     <div class="mx-5 mt-4 rounded-[16px] border px-4 py-3 text-sm ${inventoryTone} sm:mx-6">${escapeHtml(inventoryNotice)}</div>
@@ -222,11 +224,11 @@ export function renderIcebergMaintenance(job) {
                 <th class="px-4 py-3 text-right text-[11px] font-semibold uppercase tracking-[0.14em]">Small files</th>
                 <th class="px-4 py-3 text-right text-[11px] font-semibold uppercase tracking-[0.14em]">Equality deletes</th>
                 <th class="min-w-44 px-4 py-3 text-left text-[11px] font-semibold uppercase tracking-[0.14em]">Current / trigger</th>
-                <th class="min-w-44 px-4 py-3 text-left text-[11px] font-semibold uppercase tracking-[0.14em]">State / last result</th>
+                <th class="min-w-44 px-4 py-3 text-left text-[11px] font-semibold uppercase tracking-[0.14em]">State</th>
               </tr>
             </thead>
             <tbody class="bg-white">
-              ${tableRows || '<tr><td colspan="6" class="px-4 py-8 text-center text-sm text-slate-500">No durable Iceberg table state is available yet.</td></tr>'}
+              ${tableRows || '<tr><td colspan="6" class="px-4 py-8 text-center text-sm text-slate-500">No Iceberg table inventory is available yet.</td></tr>'}
             </tbody>
           </table>
         </div>
