@@ -252,8 +252,9 @@ type icebergInventoryRefreshRequest struct {
 }
 
 // handleJobIcebergInventoryRefresh only queues metadata inventory for this
-// job's tables. The maintenance worker performs the scan sequentially, so
-// opening a job detail page cannot trigger a fleet-wide scan.
+// job's tables. The maintenance worker drains these explicit requests in
+// small bounded batches, so opening a job detail page cannot trigger a
+// fleet-wide scan.
 func (s *Server) handleJobIcebergInventoryRefresh(w http.ResponseWriter, r *http.Request, id string) {
 	job, err := s.jobManager.Get(id)
 	if err != nil {
@@ -278,7 +279,7 @@ func (s *Server) handleJobIcebergInventoryRefresh(w http.ResponseWriter, r *http
 	if !ok {
 		return
 	}
-	requested, err := store.RequestInventoryRefresh(r.Context(), id, time.Now().UTC(), 10*time.Minute, req.Force)
+	requested, err := store.RequestInventoryRefresh(r.Context(), id, time.Now().UTC(), req.Force)
 	if err != nil {
 		maintenanceAPIError(w, err, http.StatusInternalServerError)
 		return

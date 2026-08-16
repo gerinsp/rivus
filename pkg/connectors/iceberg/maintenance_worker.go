@@ -30,6 +30,7 @@ const (
 	defaultMaintenanceTaskPageSize  = 1
 	defaultMaintenanceDuePageSize   = 100
 	defaultCompactionCheckInterval  = 7 * 24 * time.Hour
+	interactiveInventoryBatchSize   = 3
 )
 
 type MaintenanceWorkerOptions struct {
@@ -111,7 +112,27 @@ func RunMaintenanceWorker(ctx context.Context, dsn string, opts MaintenanceWorke
 			}
 			lastStateSync = now
 		}
-		if err := scanOnePendingInventory(ctx, store, jobs, opts, now); err != nil {
+		for {
+			claimed, err := scanPriorityInventoryBatch(ctx, store, jobs, opts, now, 100, interactiveInventoryBatchSize)
+			if err != nil {
+				log.Printf("[maintenance-worker %s] interactive inventory scan error: %v", opts.WorkerID, err)
+				break
+			}
+			if claimed == 0 {
+				break
+			}
+		}
+		for {
+			claimed, err := scanPriorityInventoryBatch(ctx, store, jobs, opts, now, 1, interactiveInventoryBatchSize)
+			if err != nil {
+				log.Printf("[maintenance-worker %s] commit inventory scan error: %v", opts.WorkerID, err)
+				break
+			}
+			if claimed == 0 {
+				break
+			}
+		}
+		if _, err := scanOnePendingInventory(ctx, store, jobs, opts, now, 0); err != nil {
 			log.Printf("[maintenance-worker %s] pending inventory scan error: %v", opts.WorkerID, err)
 		}
 		if err := enqueueDueMaintenance(ctx, store, jobs, now, opts.DuePageSize); err != nil {
@@ -195,14 +216,59 @@ func syncMaintenanceStates(ctx context.Context, store *meta.IcebergMaintenanceSt
 	return jobs, nil
 }
 
-// scanOnePendingInventory performs only one metadata scan per poll. At the
-// default 30-second poll rate, even a 6,000-table first scan remains bounded
-// in memory and CPU while newly configured small jobs become visible quickly.
-func scanOnePendingInventory(ctx context.Context, store *meta.IcebergMaintenanceStore, jobs map[string]maintenanceWorkerJob, opts MaintenanceWorkerOptions, now time.Time) error {
-	state, err := store.ClaimPendingInventoryState(ctx, opts.WorkerID, now, opts.LeaseDuration)
+// scanOnePendingInventory performs one background metadata scan per poll. It
+// intentionally remains slow so a 6,000-table first scan never becomes a
+// burst. Detail-page requests use scanPriorityInventoryBatch instead.
+func scanOnePendingInventory(ctx context.Context, store *meta.IcebergMaintenanceStore, jobs map[string]maintenanceWorkerJob, opts MaintenanceWorkerOptions, now time.Time, minimumPriority int) (bool, error) {
+	state, err := store.ClaimPendingInventoryState(ctx, opts.WorkerID, now, opts.LeaseDuration, minimumPriority)
 	if err != nil || state == nil {
-		return err
+		return false, err
 	}
+	return true, scanClaimedInventory(ctx, store, jobs, opts, now, *state)
+}
+
+// scanPriorityInventoryBatch drains manual refreshes and commit-triggered
+// inventory updates without the normal poll delay. Each batch reads only a
+// few table metadata files concurrently, so a checkpoint that commits many
+// tables does not become an unbounded burst.
+func scanPriorityInventoryBatch(ctx context.Context, store *meta.IcebergMaintenanceStore, jobs map[string]maintenanceWorkerJob, opts MaintenanceWorkerOptions, now time.Time, minimumPriority, limit int) (int, error) {
+	if limit <= 0 {
+		limit = interactiveInventoryBatchSize
+	}
+	type claimedState struct {
+		state meta.IcebergMaintenanceState
+	}
+	claimed := make([]claimedState, 0, limit)
+	for len(claimed) < limit {
+		state, err := store.ClaimPendingInventoryState(ctx, opts.WorkerID, now, opts.LeaseDuration, minimumPriority)
+		if err != nil {
+			return len(claimed), err
+		}
+		if state == nil {
+			break
+		}
+		claimed = append(claimed, claimedState{state: *state})
+	}
+	if len(claimed) == 0 {
+		return 0, nil
+	}
+
+	var wg sync.WaitGroup
+	for _, item := range claimed {
+		item := item
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := scanClaimedInventory(ctx, store, jobs, opts, now, item.state); err != nil {
+				log.Printf("[maintenance-worker %s] priority inventory table=%s error: %v", opts.WorkerID, item.state.TableKey, err)
+			}
+		}()
+	}
+	wg.Wait()
+	return len(claimed), nil
+}
+
+func scanClaimedInventory(ctx context.Context, store *meta.IcebergMaintenanceStore, jobs map[string]maintenanceWorkerJob, opts MaintenanceWorkerOptions, now time.Time, state meta.IcebergMaintenanceState) error {
 	job, ok := jobs[state.OwnerJobID]
 	if !ok || job.Job.Config == nil {
 		message := "owner job configuration is unavailable for inventory scan"
@@ -211,7 +277,7 @@ func scanOnePendingInventory(ctx context.Context, store *meta.IcebergMaintenance
 	}
 
 	scanCtx, cancel := context.WithTimeout(ctx, job.Settings.Timeout)
-	err = refreshPendingInventory(scanCtx, store, job.Job.Config, *state, job.Settings)
+	err := refreshPendingInventory(scanCtx, store, job.Job.Config, state, job.Settings)
 	cancel()
 	if err != nil {
 		_ = store.RecordStateError(ctx, state.TableKey, err.Error())

@@ -5,6 +5,7 @@ import (
 	"time"
 
 	iceberg "github.com/apache/iceberg-go"
+	"github.com/gerinsp/rivus/pkg/config"
 	"github.com/gerinsp/rivus/pkg/meta"
 )
 
@@ -108,6 +109,26 @@ func TestOrphanCleanupSkipsInactiveTables(t *testing.T) {
 	next = nextMaintenanceSchedule(active, "remove_orphan_files", now, settings)
 	if next.Before(now.Add(settings.OrphanInterval)) || next.After(now.Add(settings.OrphanInterval+time.Hour)) {
 		t.Fatalf("active orphan schedule=%s, want around %s", next, now.Add(settings.OrphanInterval))
+	}
+}
+
+func TestDurableMaintenanceTableStateShowsInventoryScanning(t *testing.T) {
+	now := time.Now().UTC()
+	leaseUntil := now.Add(time.Minute)
+	queuedAt := now.Add(time.Minute)
+
+	if got := durableMaintenanceTableState(meta.IcebergMaintenanceState{
+		SnapshotComplete:    true,
+		InventoryLeaseUntil: &leaseUntil,
+	}, config.IcebergTableMaintenanceConfig{}); got != "scanning" {
+		t.Fatalf("active inventory lease state = %q, want scanning", got)
+	}
+	if got := durableMaintenanceTableState(meta.IcebergMaintenanceState{
+		SnapshotComplete:     true,
+		LastInventoryAt:      &now,
+		NextInventoryCheckAt: &queuedAt,
+	}, config.IcebergTableMaintenanceConfig{}); got != "inventory_pending" {
+		t.Fatalf("queued inventory state = %q, want inventory_pending", got)
 	}
 }
 

@@ -57,6 +57,22 @@ function maintenanceStateClass(state) {
   }
 }
 
+function maintenanceReason(table) {
+  const operations = Array.isArray(table?.operations) ? table.operations : [];
+  const route = operations.find((item) => String(item || '').startsWith('route:'));
+  if (route) return String(route).slice('route:'.length).trim();
+
+  const operation = operations.find((item) => !String(item || '').startsWith('engine:'));
+  if (!operation) return '';
+
+  const labels = {
+    compact: 'Compaction is being evaluated',
+    expire_snapshots: 'Snapshot cleanup is being evaluated',
+    remove_orphan_files: 'Orphan cleanup is being evaluated',
+  };
+  return labels[String(operation).trim()] || String(operation).trim();
+}
+
 function maintenanceMetric(label, value, detail) {
   return `
     <div class="stat-card min-w-0">
@@ -81,9 +97,10 @@ function workerConfigStrip(job, enabled) {
 
 function historyLink(job) {
   const jobID = String(job?.id || '').trim();
+  const maintenanceUI = 'https://data-platform.asmat.app';
   const href = jobID
-    ? `/ui/admin/iceberg-maintenance/runs/?job_id=${encodeURIComponent(jobID)}`
-    : '/ui/admin/iceberg-maintenance/runs/';
+    ? `${maintenanceUI}/ui/admin/iceberg-maintenance/runs?job_id=${encodeURIComponent(jobID)}`
+    : `${maintenanceUI}/ui/admin/iceberg-maintenance/runs`;
   const label = jobID ? "View this job's maintenance runs" : 'View maintenance runs';
   return `<a href="${href}" target="_blank" rel="noopener noreferrer" class="brand-outline-btn rounded-md px-3 py-1.5 text-xs font-semibold">${label}</a>`;
 }
@@ -144,18 +161,20 @@ export function renderIcebergMaintenance(job, options = {}) {
   const dataThreshold = Number(maintenance.data_files_threshold || 0);
   const deleteThreshold = Number(maintenance.equality_delete_files_threshold || 0);
   const tableRows = tables.map((table) => {
-    const operations = Array.isArray(table?.operations) && table.operations.length > 0
-      ? `<div class="mt-1 text-[11px] text-blue-600">${escapeHtml(table.operations.join(', '))}</div>`
-      : '';
-    const error = table?.error
-      ? `<div class="mt-1 max-w-xl break-words text-[11px] leading-4 text-rose-600">${escapeHtml(table.error)}</div>`
+    const reason = maintenanceReason(table);
+    const reasonCell = table?.error
+      ? `<div class="max-w-md break-words text-[11px] leading-4 text-rose-600">${escapeHtml(table.error)}</div>`
+      : reason
+        ? `<div class="max-w-md break-words text-[11px] leading-4 text-slate-600">${escapeHtml(reason)}</div>`
+        : '<span class="text-[11px] text-slate-400">-</span>';
+    const statusDetail = table?.error
+      ? '<div class="mt-1 text-[11px] text-rose-600">Needs retry</div>'
       : '';
     return `
       <tr class="border-b border-slate-100 align-top last:border-0">
         <td class="px-4 py-3">
           <div class="mono text-xs font-semibold text-slate-800">${escapeHtml(table?.identifier || '-')}</div>
           <div class="mt-1 text-[11px] text-slate-500">Checked ${escapeHtml(table?.checked_at ? formatDateTime(table.checked_at) : '-')}</div>
-          ${error}
         </td>
         <td class="mono px-4 py-3 text-right text-xs font-semibold text-slate-800">${fmtWholeNumber(table?.active_data_files || 0)}</td>
         <td class="px-4 py-3 text-right">
@@ -169,7 +188,10 @@ export function renderIcebergMaintenance(job, options = {}) {
         </td>
         <td class="px-4 py-3">
           <span class="inline-flex rounded-full border px-2.5 py-1 text-[11px] font-semibold ${maintenanceStateClass(table?.state)}">${escapeHtml(maintenanceStateLabel(table?.state))}</span>
-          ${operations}
+          ${statusDetail}
+        </td>
+        <td class="min-w-64 px-4 py-3">
+          ${reasonCell}
         </td>
       </tr>
     `;
@@ -229,11 +251,12 @@ export function renderIcebergMaintenance(job, options = {}) {
                 <th class="px-4 py-3 text-right text-[11px] font-semibold uppercase tracking-[0.14em]">Small files</th>
                 <th class="px-4 py-3 text-right text-[11px] font-semibold uppercase tracking-[0.14em]">Equality deletes</th>
                 <th class="min-w-44 px-4 py-3 text-left text-[11px] font-semibold uppercase tracking-[0.14em]">Current / trigger</th>
-                <th class="min-w-44 px-4 py-3 text-left text-[11px] font-semibold uppercase tracking-[0.14em]">State</th>
+                <th class="min-w-32 px-4 py-3 text-left text-[11px] font-semibold uppercase tracking-[0.14em]">Status</th>
+                <th class="min-w-64 px-4 py-3 text-left text-[11px] font-semibold uppercase tracking-[0.14em]">Maintenance reason</th>
               </tr>
             </thead>
             <tbody class="bg-white">
-              ${tableRows || '<tr><td colspan="6" class="px-4 py-8 text-center text-sm text-slate-500">No Iceberg table inventory is available yet.</td></tr>'}
+              ${tableRows || '<tr><td colspan="7" class="px-4 py-8 text-center text-sm text-slate-500">No Iceberg table inventory is available yet.</td></tr>'}
             </tbody>
           </table>
         </div>

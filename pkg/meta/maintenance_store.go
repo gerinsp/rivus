@@ -35,6 +35,8 @@ type IcebergMaintenanceState struct {
 	InventorySnapshotID       int64      `json:"inventory_snapshot_id"`
 	LastInventoryAt           *time.Time `json:"last_inventory_at,omitempty"`
 	NextInventoryCheckAt      *time.Time `json:"next_inventory_check_at,omitempty"`
+	InventoryLeaseOwner       string     `json:"inventory_lease_owner,omitempty"`
+	InventoryLeaseUntil       *time.Time `json:"inventory_lease_until,omitempty"`
 	LastWriteAt               *time.Time `json:"last_write_at,omitempty"`
 	NewDataFiles              int        `json:"new_data_files"`
 	NewEqualityDeleteFiles    int        `json:"new_equality_delete_files"`
@@ -435,8 +437,14 @@ func (s *IcebergMaintenanceStore) CoalesceSignal(
 	    new_data_files = new_data_files + ?,
 	    new_equality_delete_files = new_equality_delete_files + ?,
 	    last_write_at = CASE
-	      WHEN ? = 1 AND (? > 0 OR ? > 0)
+	      WHEN ? = 1
 	      THEN UTC_TIMESTAMP(6) ELSE last_write_at END,
+	    next_inventory_check_at = CASE
+	      WHEN ? = 1 AND GREATEST(snapshot_complete, ?) = 1
+	      THEN UTC_TIMESTAMP(6) ELSE next_inventory_check_at END,
+	    inventory_priority = CASE
+	      WHEN ? = 1 AND GREATEST(snapshot_complete, ?) = 1
+	      THEN GREATEST(inventory_priority, 50) ELSE inventory_priority END,
 	    next_orphan_check_at = CASE
 	      WHEN ? = 1 AND (? > 0 OR ? > 0) THEN CASE
 	        WHEN next_orphan_check_at IS NULL OR next_orphan_check_at > ? THEN ?
@@ -459,7 +467,9 @@ func (s *IcebergMaintenanceStore) CoalesceSignal(
 		addedEqDeleteFiles, equalityDeleteFilesThreshold,
 		due, due,
 		addedDataFiles, addedEqDeleteFiles,
-		boolInt(snapshotChanged), addedDataFiles, addedEqDeleteFiles,
+		boolInt(snapshotChanged),
+		boolInt(snapshotChanged), boolInt(snapshotComplete),
+		boolInt(snapshotChanged), boolInt(snapshotComplete),
 		boolInt(snapshotChanged), addedDataFiles, addedEqDeleteFiles, nextOrphan.UTC(), nextOrphan.UTC(),
 		boolInt(snapshotComplete), boolInt(snapshotChanged), snapshotID,
 		tableKey,
@@ -516,7 +526,7 @@ func (s *IcebergMaintenanceStore) DueStates(ctx context.Context, operation strin
 	 snapshot_complete, last_snapshot_id, inventory_snapshot_id, last_inventory_at, last_write_at, new_data_files, new_equality_delete_files,
 	 active_data_files, active_small_files, active_small_bytes, active_equality_delete_files,
 	 active_position_delete_files, next_compaction_check_at, next_expire_check_at, next_orphan_check_at,
-	 last_compaction_at, last_expire_at, last_orphan_at, lease_owner, lease_until,
+	 last_compaction_at, last_expire_at, last_orphan_at, inventory_lease_owner, inventory_lease_until, lease_owner, lease_until,
 	 attempt_count, last_error, created_at, updated_at
 	FROM iceberg_maintenance_state
 	WHERE snapshot_complete = 1 AND %s IS NOT NULL AND %s <= ?
@@ -541,9 +551,12 @@ func (s *IcebergMaintenanceStore) DueStates(ctx context.Context, operation strin
 // claim prevents a first inventory sweep from becoming an unbounded startup
 // burst for large deployments. Explicit job-detail refresh requests receive a
 // higher priority than the slow first-scan sweep.
-func (s *IcebergMaintenanceStore) ClaimPendingInventoryState(ctx context.Context, workerID string, now time.Time, lease time.Duration) (*IcebergMaintenanceState, error) {
+func (s *IcebergMaintenanceStore) ClaimPendingInventoryState(ctx context.Context, workerID string, now time.Time, lease time.Duration, minimumPriority int) (*IcebergMaintenanceState, error) {
 	if lease <= 0 {
 		lease = 15 * time.Minute
+	}
+	if minimumPriority < 0 {
+		minimumPriority = 0
 	}
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
@@ -555,13 +568,14 @@ func (s *IcebergMaintenanceStore) ClaimPendingInventoryState(ctx context.Context
 	 snapshot_complete, last_snapshot_id, inventory_snapshot_id, last_inventory_at, last_write_at, new_data_files, new_equality_delete_files,
 	 active_data_files, active_small_files, active_small_bytes, active_equality_delete_files,
 	 active_position_delete_files, next_compaction_check_at, next_expire_check_at, next_orphan_check_at,
-	 last_compaction_at, last_expire_at, last_orphan_at, lease_owner, lease_until,
+	 last_compaction_at, last_expire_at, last_orphan_at, inventory_lease_owner, inventory_lease_until, lease_owner, lease_until,
 	 attempt_count, last_error, created_at, updated_at
 	FROM iceberg_maintenance_state
 	WHERE snapshot_complete=1 AND next_inventory_check_at IS NOT NULL AND next_inventory_check_at <= ?
+	  AND inventory_priority >= ?
 	  AND (inventory_lease_until IS NULL OR inventory_lease_until < ?)
 	ORDER BY inventory_priority DESC, next_inventory_check_at ASC, table_key
-	LIMIT 1 FOR UPDATE SKIP LOCKED`, now.UTC(), now.UTC())
+	LIMIT 1 FOR UPDATE SKIP LOCKED`, now.UTC(), minimumPriority, now.UTC())
 	state, err := scanMaintenanceState(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -589,7 +603,14 @@ func (s *IcebergMaintenanceStore) ClaimPendingInventoryState(ctx context.Context
 
 func (s *IcebergMaintenanceStore) FinishInventoryClaim(ctx context.Context, tableKey, workerID string) error {
 	res, err := s.db.ExecContext(ctx, `UPDATE iceberg_maintenance_state
-	SET inventory_lease_owner=NULL, inventory_lease_until=NULL, next_inventory_check_at=NULL, inventory_priority=0, updated_at=UTC_TIMESTAMP(6)
+	SET inventory_lease_owner=NULL, inventory_lease_until=NULL,
+	    next_inventory_check_at=CASE
+	      WHEN last_snapshot_id <> inventory_snapshot_id THEN UTC_TIMESTAMP(6)
+	      ELSE NULL END,
+	    inventory_priority=CASE
+	      WHEN last_snapshot_id <> inventory_snapshot_id THEN GREATEST(inventory_priority, 50)
+	      ELSE 0 END,
+	    updated_at=UTC_TIMESTAMP(6)
 	WHERE table_key=? AND inventory_lease_owner=?`, tableKey, workerID)
 	if err != nil {
 		return err
@@ -602,22 +623,18 @@ func (s *IcebergMaintenanceStore) FinishInventoryClaim(ctx context.Context, tabl
 
 // RequestInventoryRefresh schedules a metadata-only inventory scan for a
 // single job. It never reads Parquet data and it never scans every configured
-// table. When force is false, recently checked tables are left alone.
-func (s *IcebergMaintenanceStore) RequestInventoryRefresh(ctx context.Context, ownerJobID string, now time.Time, maxAge time.Duration, force bool) (int64, error) {
+// table. A normal request only scans tables that have never been inventoried or
+// whose successful Iceberg commit is newer than their saved inventory.
+func (s *IcebergMaintenanceStore) RequestInventoryRefresh(ctx context.Context, ownerJobID string, now time.Time, force bool) (int64, error) {
 	ownerJobID = strings.TrimSpace(ownerJobID)
 	if ownerJobID == "" {
 		return 0, fmt.Errorf("maintenance inventory owner job id is required")
 	}
-	if maxAge <= 0 {
-		maxAge = 10 * time.Minute
-	}
 	now = now.UTC()
-	staleBefore := now.Add(-maxAge)
 	where := "owner_job_id=? AND snapshot_complete=1 AND (inventory_lease_until IS NULL OR inventory_lease_until < ?)"
 	args := []any{now, ownerJobID, now}
 	if !force {
-		where += " AND (last_inventory_at IS NULL OR last_inventory_at < ?)"
-		args = append(args, staleBefore)
+		where += " AND (last_inventory_at IS NULL OR (last_write_at IS NOT NULL AND last_write_at > last_inventory_at))"
 	}
 	query := `UPDATE iceberg_maintenance_state
 		SET next_inventory_check_at=?, inventory_priority=100, updated_at=UTC_TIMESTAMP(6)
@@ -1068,7 +1085,7 @@ func (s *IcebergMaintenanceStore) GetState(ctx context.Context, tableKey string)
 	 snapshot_complete, last_snapshot_id, inventory_snapshot_id, last_inventory_at, last_write_at, new_data_files, new_equality_delete_files,
 	 active_data_files, active_small_files, active_small_bytes, active_equality_delete_files,
 	 active_position_delete_files, next_compaction_check_at, next_expire_check_at, next_orphan_check_at,
-	 last_compaction_at, last_expire_at, last_orphan_at, lease_owner, lease_until,
+	 last_compaction_at, last_expire_at, last_orphan_at, inventory_lease_owner, inventory_lease_until, lease_owner, lease_until,
 	 attempt_count, last_error, created_at, updated_at FROM iceberg_maintenance_state WHERE table_key=?`, tableKey)
 	state, err := scanMaintenanceState(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -1087,13 +1104,13 @@ type rowScanner interface {
 func scanMaintenanceState(row rowScanner) (IcebergMaintenanceState, error) {
 	var state IcebergMaintenanceState
 	var snapshotComplete int
-	var lastInventory, lastWrite, nextCompaction, nextExpire, nextOrphan, lastCompaction, lastExpire, lastOrphan, leaseUntil sql.NullTime
-	var leaseOwner, lastError sql.NullString
+	var lastInventory, lastWrite, nextCompaction, nextExpire, nextOrphan, lastCompaction, lastExpire, lastOrphan, inventoryLeaseUntil, leaseUntil sql.NullTime
+	var inventoryLeaseOwner, leaseOwner, lastError sql.NullString
 	err := row.Scan(&state.TableKey, &state.Catalog, &state.Namespace, &state.Table, &state.OwnerType, &state.OwnerJobID,
 		&snapshotComplete, &state.LastSnapshotID, &state.InventorySnapshotID, &lastInventory, &lastWrite, &state.NewDataFiles, &state.NewEqualityDeleteFiles,
 		&state.ActiveDataFiles, &state.ActiveSmallFiles, &state.ActiveSmallBytes, &state.ActiveEqualityDeleteFiles,
 		&state.ActivePositionDeleteFiles, &nextCompaction, &nextExpire, &nextOrphan,
-		&lastCompaction, &lastExpire, &lastOrphan, &leaseOwner, &leaseUntil,
+		&lastCompaction, &lastExpire, &lastOrphan, &inventoryLeaseOwner, &inventoryLeaseUntil, &leaseOwner, &leaseUntil,
 		&state.AttemptCount, &lastError, &state.CreatedAt, &state.UpdatedAt)
 	if err != nil {
 		return state, err
@@ -1107,6 +1124,10 @@ func scanMaintenanceState(row rowScanner) (IcebergMaintenanceState, error) {
 	state.LastCompactionAt = nullTimePtr(lastCompaction)
 	state.LastExpireAt = nullTimePtr(lastExpire)
 	state.LastOrphanAt = nullTimePtr(lastOrphan)
+	state.InventoryLeaseUntil = nullTimePtr(inventoryLeaseUntil)
+	if inventoryLeaseOwner.Valid {
+		state.InventoryLeaseOwner = inventoryLeaseOwner.String
+	}
 	state.LeaseUntil = nullTimePtr(leaseUntil)
 	if leaseOwner.Valid {
 		state.LeaseOwner = leaseOwner.String

@@ -212,8 +212,16 @@ func (m *tableMaintenanceMonitor) publishDurableStatus(parent context.Context, s
 	}
 
 	var latest time.Time
+	inventoryScanning := false
+	inventoryPending := false
 	for _, state := range states {
 		tableState := durableMaintenanceTableState(state, m.cfg.TableMaintenance)
+		if tableState == "scanning" {
+			inventoryScanning = true
+		}
+		if tableState == "inventory_pending" {
+			inventoryPending = true
+		}
 		operations := []string{}
 		if result, resultErr := store.LatestResultForTable(ctx, state.TableKey); resultErr == nil && result != nil {
 			operations = append(operations, result.Operation)
@@ -262,8 +270,12 @@ func (m *tableMaintenanceMonitor) publishDurableStatus(parent context.Context, s
 	switch {
 	case summary.ActiveLeases > 0:
 		status.State = "running"
+	case inventoryScanning:
+		status.State = "scanning"
 	case status.InventoryErrors > 0:
 		status.State = "error"
+	case inventoryPending:
+		status.State = "inventory_pending"
 	case summary.Blocked > 0 && summary.Blocked == summary.Tables:
 		status.State = "waiting_for_snapshot"
 	case status.TablesTotal > 0 && status.TablesScanned == 0:
@@ -288,11 +300,17 @@ func durableMaintenanceTableState(state meta.IcebergMaintenanceState, cfg config
 	if !state.SnapshotComplete {
 		return "waiting_for_snapshot"
 	}
+	if state.InventoryLeaseUntil != nil && state.InventoryLeaseUntil.After(time.Now().UTC()) {
+		return "scanning"
+	}
 	if state.LeaseUntil != nil && state.LeaseUntil.After(time.Now().UTC()) {
 		return "running"
 	}
 	if state.LastError != "" {
 		return "error"
+	}
+	if state.NextInventoryCheckAt != nil {
+		return "inventory_pending"
 	}
 	if state.LastInventoryAt == nil {
 		return "inventory_pending"

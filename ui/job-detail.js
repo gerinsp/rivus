@@ -17,6 +17,7 @@ let getCurrentTab = () => 'doris';
 let switchTab = () => {};
 let routeChanged = () => {};
 let inventoryRefreshPoll = null;
+let inventoryStatusPoll = null;
 
 export function initJobDetail(handlers = {}) {
   currentJobId = handlers.initialJobId || currentJobId;
@@ -49,6 +50,30 @@ async function queueInventoryRefresh(jobId, force = false) {
     scheduleInventoryRefreshPoll(jobId);
   }
   return result;
+}
+
+function clearInventoryStatusPoll() {
+  if (inventoryStatusPoll) clearTimeout(inventoryStatusPoll);
+  inventoryStatusPoll = null;
+}
+
+// The worker owns Iceberg metadata scans. While this page is visible the UI
+// only refreshes Rivus's already-saved state, so a completed CDC commit becomes
+// visible without the browser reading S3 or Iceberg metadata itself.
+function scheduleInventoryStatusPoll(jobId) {
+  clearInventoryStatusPoll();
+  const poll = async () => {
+    if (currentJobId !== jobId || getCurrentTab() !== 'job') return;
+    try {
+      await refreshGraph({ silent: true });
+    } catch (error) {
+      console.warn('Unable to refresh Iceberg maintenance status', error);
+    }
+    if (currentJobId === jobId && getCurrentTab() === 'job') {
+      inventoryStatusPoll = setTimeout(poll, 15000);
+    }
+  };
+  inventoryStatusPoll = setTimeout(poll, 15000);
 }
 
 function scheduleInventoryRefreshPoll(jobId) {
@@ -674,6 +699,7 @@ export async function refreshGraph(options = {}) {
 }
 
 export async function showJobDetails(jobId) {
+  clearInventoryStatusPoll();
   currentJobId = jobId;
   const currentTab = getCurrentTab();
   if (currentTab !== 'job') previousJobListTab = currentTab;
@@ -688,6 +714,7 @@ export async function showJobDetails(jobId) {
   if (isNativeIcebergJob(job)) {
     try {
       await queueInventoryRefresh(jobId);
+      scheduleInventoryStatusPoll(jobId);
       await refreshGraph({ silent: true });
     } catch (error) {
       console.warn('Unable to queue Iceberg inventory refresh', error);
@@ -696,6 +723,7 @@ export async function showJobDetails(jobId) {
 }
 
 export function backToJobs() {
+  clearInventoryStatusPoll();
   const tab = previousJobListTab === 'iceberg' || previousJobListTab === 'logs' ? previousJobListTab : 'doris';
   switchTab(tab);
 }

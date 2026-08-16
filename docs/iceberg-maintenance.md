@@ -134,10 +134,10 @@ GOMEMLIMIT=256MiB
 
 The job-details UI keeps the existing Iceberg file-inventory panel, but its automatic-maintenance state comes from the durable maintenance tables. It no longer depends on a CDC-process scheduler.
 
-The **View maintenance runs** action opens:
+The **View maintenance runs** action opens the Data Platform maintenance UI:
 
 ```text
-/ui/admin/iceberg-maintenance/runs/
+https://data-platform.asmat.app/ui/admin/iceberg-maintenance/runs
 ```
 
 That page shows global queue health plus recent worker runs. Run details include operation, execution engine (`native` or `spark`), routing reason, attempts, input/output file counts and bytes, duration, and errors.
