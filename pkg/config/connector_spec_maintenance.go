@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -20,8 +21,7 @@ func (c *ConnectorSpec) UnmarshalYAML(value *yaml.Node) error {
 		return err
 	}
 	*c = ConnectorSpec(decoded)
-	c.normalizeMaintenanceConfig()
-	return nil
+	return c.normalizeMaintenanceConfig()
 }
 
 func (c *ConnectorSpec) UnmarshalJSON(data []byte) error {
@@ -31,21 +31,20 @@ func (c *ConnectorSpec) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	*c = ConnectorSpec(decoded)
-	c.normalizeMaintenanceConfig()
-	return nil
+	return c.normalizeMaintenanceConfig()
 }
 
-func (c *ConnectorSpec) normalizeMaintenanceConfig() {
+func (c *ConnectorSpec) normalizeMaintenanceConfig() error {
 	if c == nil || !strings.EqualFold(strings.TrimSpace(c.Type), "iceberg_native") || c.Config == nil {
-		return
+		return nil
 	}
 	raw, ok := c.Config["table_maintenance"]
 	if !ok {
-		return
+		return nil
 	}
 	maintenance, ok := raw.(map[string]any)
 	if !ok || maintenance == nil {
-		return
+		return nil
 	}
 
 	// native_enabled belonged to the first worker rollout. Scheduling now has a
@@ -54,12 +53,18 @@ func (c *ConnectorSpec) normalizeMaintenanceConfig() {
 
 	enabled, _ := maintenance["enabled"].(bool)
 	if !enabled {
-		return
+		return nil
 	}
 	executor, _ := maintenance["executor"].(string)
 	executor = strings.ToLower(strings.TrimSpace(executor))
 	if executor == "" {
 		executor = "hybrid"
 	}
-	maintenance["executor"] = executor
+	switch executor {
+	case "hybrid", "native", "spark":
+		maintenance["executor"] = executor
+		return nil
+	default:
+		return fmt.Errorf("table_maintenance.executor must be one of hybrid, native, spark")
+	}
 }
