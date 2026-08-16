@@ -21,6 +21,7 @@ func copyAnyMap(in map[string]any) map[string]any {
 				} else {
 					items[i] = item
 				}
+			}
 			out[key] = items
 		default:
 			out[key] = value
