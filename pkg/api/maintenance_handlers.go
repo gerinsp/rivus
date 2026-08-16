@@ -73,6 +73,34 @@ func (s *Server) handleMaintenanceRuns(w http.ResponseWriter, r *http.Request) {
 		maintenanceAPIError(w, err, http.StatusInternalServerError)
 		return
 	}
+	if r.URL.Query().Get("include_results") == "1" {
+		type runWithResults struct {
+			meta.IcebergMaintenanceRun
+			Results []meta.IcebergMaintenanceResult `json:"results"`
+		}
+		withResults := make([]runWithResults, 0, len(runs))
+		for _, run := range runs {
+			var results []meta.IcebergMaintenanceResult
+			if jobID != "" {
+				results, err = store.ListResultsForRunOwner(r.Context(), run.ID, jobID, 10)
+			} else {
+				results, err = store.ListResultsForRun(r.Context(), run.ID, 10)
+			}
+			if err != nil {
+				maintenanceAPIError(w, err, http.StatusInternalServerError)
+				return
+			}
+			withResults = append(withResults, runWithResults{IcebergMaintenanceRun: run, Results: results})
+		}
+		maintenanceAPIJSON(w, http.StatusOK, map[string]any{
+			"runs":   withResults,
+			"limit":  limit,
+			"offset": offset,
+			"total":  total,
+			"job_id": jobID,
+		})
+		return
+	}
 	maintenanceAPIJSON(w, http.StatusOK, map[string]any{
 		"runs":   runs,
 		"limit":  limit,
