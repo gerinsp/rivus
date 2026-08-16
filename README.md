@@ -72,7 +72,7 @@ The same Rivus image supports two independent process modes. Do not run both pro
                                 +------+------+
                                 |             |
                              native          Spark
-                          tiny/cleanup       heavy
+                         maintenance       compaction
 ```
 
 Example Compose service split:
@@ -94,13 +94,13 @@ services:
       GOMEMLIMIT: 256MiB
 ```
 
-Both containers need the same Iceberg REST/object-storage credentials. The maintenance worker must also be able to reach runner-app/Spark when heavy compaction fallback is configured.
+Both containers need the same Iceberg REST/object-storage credentials. The maintenance worker must also be able to reach runner-app/Spark when `executor: hybrid` may route compaction to Spark or when `executor: spark` is configured.
 
 The default Docker command is still the normal Rivus server; the image does not start a maintenance process automatically.
 
 ## Hybrid Iceberg maintenance
 
-Native maintenance is explicitly opt-in per Iceberg job. During the first rollout, use `native_enabled: true` **without** legacy `enabled: true`; the legacy flag starts the old CDC-side automatic Spark monitor and should remain disabled when the separate worker owns scheduling.
+Automatic maintenance is enabled with one master switch. Compaction behavior is selected independently with `executor`:
 
 ```yaml
 sink:
@@ -108,17 +108,18 @@ sink:
   config:
     # normal Iceberg REST/S3 settings...
     table_maintenance:
-      native_enabled: true
+      enabled: true
+      executor: hybrid
       native_signal_delay_seconds: 300
       native_idle_check_interval_seconds: 604800
 
-      # existing runner/Spark integration is retained for heavy compaction
+      # runner/Spark integration used by hybrid fallback or executor: spark
       runner_uri: http://runner-app:8001
       runner_api_token: ${RUNNER_API_TOKEN}
       runner_resource_profile: small
       catalog_name: rivus
 
-      # native tiny-compaction boundary
+      # hybrid native-compaction boundary
       small_file_size_bytes: 67108864
       small_files_min_count: 10
       small_files_min_total_bytes: 268435456
@@ -139,13 +140,21 @@ sink:
       worker_temp_directory: /tmp/rivus-maintenance
 ```
 
-The worker plans compaction with `iceberg-go` before choosing an executor. Total table size is not the routing metric: Rivus sums only selected rewrite groups. By default, selected work up to 512 MiB and 100 files can run natively. Larger rewrites, position-delete workloads, and multiple substantial groups route to the existing Spark maintenance integration.
+The executor modes are:
+
+- `hybrid` — default; the worker chooses native or Spark for each compaction task.
+- `native` — compaction stays in `iceberg-go`; no Spark fallback.
+- `spark` — every automatic compaction task is submitted to Spark.
+
+Snapshot expiration and orphan cleanup stay native in every executor mode. `enabled: false` disables automatic maintenance completely. The old `native_enabled` rollout flag is retired and is no longer part of the user-facing configuration.
+
+In hybrid mode, total table size is not the routing metric: Rivus sums only selected rewrite groups. By default, selected work up to 512 MiB and 100 files can run natively. Larger rewrites, position-delete workloads, and multiple substantial groups route to the existing Spark maintenance integration.
 
 Native compaction uses atomic `RewriteDataFiles`, applies equality deletes while reading, and uses Iceberg's dead-equality-delete logic before removing equality-delete files. Snapshot expiration is native and keeps at least ten snapshots with a seven-day default maximum age. Orphan cleanup is native and disk-bucketed so the complete referenced/candidate sets do not need to live in memory at once.
 
 CDC is not paused for maintenance. The worker checks the initial snapshot barrier before scheduling a table; commit conflicts are maintenance retries, so CDC wins concurrent writes.
 
-For the complete scheduler schema, routing rules, safety model, API and rollout guide, see [`docs/iceberg-maintenance.md`](docs/iceberg-maintenance.md).
+For the complete scheduler schema, executor behavior, safety model, API and rollout guide, see [`docs/iceberg-maintenance.md`](docs/iceberg-maintenance.md).
 
 ## Durable scheduler
 
@@ -165,7 +174,7 @@ RIVUS_META_MYSQL_DSN=rivus:change-me@tcp(meta-mysql:3306)/rivus_meta?parseTime=t
 RIVUS_MAINTENANCE_GOMAXPROCS=1
 RIVUS_MAINTENANCE_POLL_INTERVAL_SECONDS=30
 RIVUS_MAINTENANCE_LEASE_SECONDS=900
-RIVUS_MAINTENANCE_TASK_PAGE_SIZE=50
+RIVUS_MAINTENANCE_TASK_PAGE_SIZE=1
 RIVUS_MAINTENANCE_DUE_PAGE_SIZE=100
 GOMEMLIMIT=256MiB
 ```
