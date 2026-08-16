@@ -8,9 +8,6 @@ func cloneStringAnyMap(in map[string]any) map[string]any {
 // monitor. They are general config helpers, so keep them after retiring that
 // scheduler.
 func copyAnyMap(in map[string]any) map[string]any {
-	if in == nil {
-		return nil
-	}
 	out := make(map[string]any, len(in))
 	for key, value := range in {
 		switch nested := value.(type) {
@@ -24,7 +21,6 @@ func copyAnyMap(in map[string]any) map[string]any {
 				} else {
 					items[i] = item
 				}
-			}
 			out[key] = items
 		default:
 			out[key] = value
@@ -36,7 +32,7 @@ func copyAnyMap(in map[string]any) map[string]any {
 func stringAnyMap(value any) map[string]any {
 	switch typed := value.(type) {
 	case nil:
-		return nil
+		return map[string]any{}
 	case map[string]any:
 		return typed
 	case map[any]any:
@@ -50,6 +46,6 @@ func stringAnyMap(value any) map[string]any {
 		}
 		return out
 	default:
-		return nil
+		return map[string]any{}
 	}
 }
