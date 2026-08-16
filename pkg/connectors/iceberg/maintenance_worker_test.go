@@ -24,13 +24,16 @@ func TestDeterministicJitterStableAndBounded(t *testing.T) {
 
 func TestNativeMaintenanceSettingsDefaults(t *testing.T) {
 	settings, err := nativeMaintenanceSettingsFromRaw(map[string]any{
-		"table_maintenance": map[string]any{"native_enabled": true},
+		"table_maintenance": map[string]any{"enabled": true},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !settings.Enabled {
-		t.Fatalf("native maintenance should be enabled")
+		t.Fatalf("maintenance should be enabled")
+	}
+	if settings.Executor != maintenanceExecutorHybrid {
+		t.Fatalf("unexpected executor: %q", settings.Executor)
 	}
 	if settings.MaxSelectedInputBytes != 512*1024*1024 {
 		t.Fatalf("unexpected native byte limit: %d", settings.MaxSelectedInputBytes)
@@ -90,7 +93,7 @@ func TestMaintenanceStartsCompleteOnlyForStreamingResumeModes(t *testing.T) {
 func TestNativeMaintenanceRejectsUnsafeOrphanAge(t *testing.T) {
 	_, err := nativeMaintenanceSettingsFromRaw(map[string]any{
 		"table_maintenance": map[string]any{
-			"native_enabled":              true,
+			"enabled":                      true,
 			"native_orphan_min_age_hours": 24,
 		},
 	})

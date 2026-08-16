@@ -14,8 +14,8 @@ MySQL CDC -> rivus server -> Iceberg
           ^
           |
        rivus maintenance-worker --queue
-          | native: expire snapshots, bounded orphan cleanup, tiny compaction
-          ` Spark: heavy compaction through the existing runner/Spark backend
+          | native: compaction / expiration / orphan cleanup
+          ` Spark: compaction through the existing runner/Spark backend
 ```
 
 Run the server and worker as separate containers/processes using the same Rivus image:
@@ -25,28 +25,34 @@ Run the server and worker as separate containers/processes using the same Rivus 
 /app/rivus maintenance-worker --queue
 ```
 
-Both processes use the same `RIVUS_META_MYSQL_DSN`. The worker also needs the Iceberg REST/object-storage credentials from the persisted jobs. Spark fallback needs the existing runner-app or Spark configuration.
+Both processes use the same `RIVUS_META_MYSQL_DSN`. The worker also needs the Iceberg REST/object-storage credentials from the persisted jobs. `hybrid` and `spark` executor modes need the existing runner-app or Spark configuration whenever compaction is sent to Spark.
 
 ## Configuration semantics
 
-`enabled` is the public master switch. `native_enabled` currently selects the durable worker/hybrid path and is retained for compatibility with the first worker rollout.
+Automatic maintenance has one master switch and one executor selector:
 
 ```yaml
 table_maintenance:
   enabled: true
-  native_enabled: true
+  executor: hybrid
 ```
 
-The combinations mean:
+`enabled` controls whether automatic maintenance exists at all:
 
-| enabled | native_enabled | Result |
-| --- | --- | --- |
-| false | false | Automatic maintenance off |
-| false | true | Automatic maintenance off; the master switch wins |
-| true | true | Durable maintenance worker enabled |
-| true | false | No worker scheduling; legacy CDC-side automatic scheduling is retired |
+- `enabled: false` — no automatic maintenance tasks are scheduled.
+- `enabled: true` — the durable maintenance worker owns scheduling and execution.
 
-The CDC-side `tableMaintenanceMonitor` no longer schedules Spark maintenance. Its runtime compatibility layer only projects durable worker state into the existing job-details status shape so the UI can keep its current inventory panel while using MySQL as the source of truth.
+`executor` controls **compaction** execution:
+
+- `hybrid` — default. The worker analyzes the selected rewrite workload and chooses native or Spark.
+- `native` — compaction stays in `iceberg-go`; there is no Spark fallback.
+- `spark` — every automatic compaction task is submitted to Spark.
+
+Snapshot expiration and orphan cleanup remain native worker operations in all three executor modes. `executor` only selects the compaction engine.
+
+The historical `native_enabled` rollout flag is retired. Rivus removes it while decoding persisted/job configuration and does not use it to select a runtime path.
+
+The CDC-side `tableMaintenanceMonitor` no longer schedules maintenance. Its compatibility layer only projects durable MySQL worker state into the existing job-details status shape so the UI can keep its inventory panel while MySQL remains the source of truth.
 
 Recommended configuration:
 
@@ -57,20 +63,20 @@ sink:
     # normal Iceberg REST/S3 settings...
     table_maintenance:
       enabled: true
-      native_enabled: true
+      executor: hybrid
 
       # CDC signals compact work after a short quiet period; inactive tables get
       # only a weekly safety check.
       native_signal_delay_seconds: 300
       native_idle_check_interval_seconds: 604800
 
-      # existing Spark/runner integration remains the heavy fallback
+      # runner/Spark integration used by hybrid fallback or executor: spark
       runner_uri: http://runner-app:8001
       runner_api_token: ${RUNNER_API_TOKEN}
       runner_resource_profile: small
       catalog_name: rivus
 
-      # native compaction routing
+      # hybrid native-compaction boundary
       small_file_size_bytes: 67108864
       small_files_min_count: 10
       small_files_min_total_bytes: 268435456
@@ -98,6 +104,8 @@ sink:
       spark_poll_interval_seconds: 5
       spark_timeout_seconds: 7200
 ```
+
+If `executor` is omitted while maintenance is enabled, Rivus defaults it to `hybrid` for backward compatibility.
 
 ## Durable metadata schema
 
@@ -145,20 +153,28 @@ GET /api/iceberg/maintenance/tables/{catalog.namespace.table}
 
 The existing per-job manual maintenance endpoint remains available. Manual requests are separate from automatic worker scheduling.
 
-## Native versus Spark routing
+## Compaction executor behavior
 
-Rivus runs the `iceberg-go` compaction planner before choosing an executor. The routing decision uses selected rewrite groups rather than total table size.
+### `executor: hybrid`
 
-Native compaction is allowed when selected work stays within the configured file/byte limits. It uses atomic `RewriteDataFiles`, applies equality deletes while reading, and uses Iceberg dead-equality-delete cleanup before removing equality-delete files.
-
-Compaction routes to Spark when, by default, any of these apply:
+Rivus runs the `iceberg-go` compaction planner and bases routing on selected rewrite groups rather than total table size. By default, compaction routes to Spark when any of these apply:
 
 - selected input is greater than 512 MiB;
 - more than 100 selected input files are involved;
 - position-delete files are present;
 - multiple substantial compaction groups make process isolation preferable.
 
-Sort/Z-order and other Spark-specific rewrite strategies remain Spark-only. Every result records `engine` and `routing_reason`.
+Otherwise the rewrite runs natively. Every result records the actual `engine` and `routing_reason`.
+
+### `executor: native`
+
+The same planner determines the rewrite groups, but Spark routing is disabled. Even when the hybrid policy would have preferred Spark, the task stays in the native `iceberg-go` rewrite path. A native failure is retried/failed according to the normal worker retry policy; it is never silently handed to Spark.
+
+### `executor: spark`
+
+A compaction task is sent directly to the configured Spark/runner backend rather than using native analysis to choose an engine. Snapshot expiration and orphan cleanup are still performed natively by the maintenance worker.
+
+Native compaction uses atomic `RewriteDataFiles`, applies equality deletes while reading, and uses Iceberg dead-equality-delete cleanup before removing equality-delete files. Sort/Z-order and other Spark-specific rewrite strategies remain Spark-only.
 
 ## CDC priority and snapshot barrier
 
@@ -178,15 +194,16 @@ The worker buckets referenced and candidate object paths to disk so full table l
 
 Recommended rollout:
 
-1. Set `enabled: true` and `native_enabled: true` for a small workload.
+1. Start with `enabled: true` and `executor: hybrid` on a small workload.
 2. Start one maintenance worker and use orphan dry-run first.
 3. Observe queue age, retries/commit conflicts, native execution time, Spark routing, and object-store request volume.
-4. Expand gradually to hundreds and then thousands of tables.
-5. Scale workers only after the single-worker behavior is stable; MySQL leases support multiple workers safely.
+4. Use `executor: native` only when you explicitly want no Spark compaction fallback, or `executor: spark` when all compaction should be isolated in Spark.
+5. Expand gradually to hundreds and then thousands of tables.
+6. Scale workers only after the single-worker behavior is stable; MySQL leases support multiple workers safely.
 
 ## Current limitations
 
-- Native sort/Z-order is not implemented; use Spark.
-- Compaction groups containing position deletes route to Spark.
-- Heavy Spark fallback keeps the existing per-table runner/Spark submission behavior.
+- Native sort/Z-order is not implemented; use Spark for those strategies.
+- Hybrid mode routes position-delete compaction to Spark. Native mode explicitly overrides that routing guard.
+- Heavy Spark execution keeps the existing per-table runner/Spark submission behavior.
 - Native rewrite output is committed atomically, but exact per-attempt uncommitted output paths are not exposed by the current high-level `iceberg-go` rewrite API; the seven-day orphan-cleanup safety window protects cleanup.

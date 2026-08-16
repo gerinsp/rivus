@@ -39,6 +39,7 @@ const (
 
 type nativeMaintenanceSettings struct {
 	Enabled                bool
+	Executor               string
 	MaxSelectedInputBytes  int64
 	MaxSelectedFiles       int
 	TargetFileSizeBytes    int64
@@ -76,6 +77,7 @@ type compactionWorkload struct {
 
 func defaultNativeMaintenanceSettings() nativeMaintenanceSettings {
 	return nativeMaintenanceSettings{
+		Executor:               maintenanceExecutorHybrid,
 		MaxSelectedInputBytes:  defaultNativeMaxInputBytes,
 		MaxSelectedFiles:       defaultNativeMaxInputFiles,
 		TargetFileSizeBytes:    defaultNativeTargetBytes,
@@ -207,6 +209,19 @@ func executeHybridCompaction(
 	}
 	startSnapshotID := tbl.CurrentSnapshot().SnapshotID
 
+	// Spark mode does not use native compaction analysis to choose an engine.
+	// A compact task is always sent to Spark; cleanup operations remain native.
+	if settings.Executor == maintenanceExecutorSpark {
+		nativeCancel()
+		result.Engine = "spark"
+		result.RoutingReason = "executor=spark forces Spark compaction"
+		result.Details = map[string]any{
+			"executor":             settings.Executor,
+			"starting_snapshot_id": startSnapshotID,
+		}
+		return executeSparkCompactionFallback(ctx, jobID, jobCfg, state, task, result, settings)
+	}
+
 	cfg := compaction.DefaultConfig()
 	cfg.TargetFileSizeBytes = settings.TargetFileSizeBytes
 	cfg.MinFileSizeBytes = settings.SmallFileSizeBytes
@@ -225,28 +240,32 @@ func executeHybridCompaction(
 	result.InputBytes = work.SelectedBytes
 	result.DeleteFiles = work.EqualityDeletes + work.PositionDeletes
 	result.Details = map[string]any{
-		"groups":                 work.GroupCount,
-		"equality_delete_files":  work.EqualityDeletes,
-		"position_delete_files":  work.PositionDeletes,
-		"starting_snapshot_id":   startSnapshotID,
-		"estimated_output_files": plan.EstOutputFiles,
-		"estimated_output_bytes": plan.EstOutputBytes,
-		"max_native_input_bytes": settings.MaxSelectedInputBytes,
-		"max_native_input_files": settings.MaxSelectedFiles,
+		"executor":                settings.Executor,
+		"groups":                  work.GroupCount,
+		"equality_delete_files":   work.EqualityDeletes,
+		"position_delete_files":   work.PositionDeletes,
+		"starting_snapshot_id":    startSnapshotID,
+		"estimated_output_files":  plan.EstOutputFiles,
+		"estimated_output_bytes":  plan.EstOutputBytes,
+		"max_native_input_bytes":  settings.MaxSelectedInputBytes,
+		"max_native_input_files":  settings.MaxSelectedFiles,
 	}
 
 	if work.SelectedFiles == 0 || work.SelectedBytes < settings.MinSmallBytes {
 		result.Status = "skipped"
-		result.RoutingReason = "no native compaction group meets minimum input thresholds"
+		result.RoutingReason = "no compaction group meets minimum input thresholds"
 		return nativeTaskOutcome{Result: result}
 	}
 
 	routeSpark, reason := shouldRouteCompactionToSpark(work, settings)
-	if routeSpark {
+	if routeSpark && settings.Executor == maintenanceExecutorHybrid {
 		nativeCancel()
 		result.Engine = "spark"
 		result.RoutingReason = reason
 		return executeSparkCompactionFallback(ctx, jobID, jobCfg, state, task, result, settings)
+	}
+	if routeSpark && settings.Executor == maintenanceExecutorNative {
+		result.RoutingReason = "executor=native overrides hybrid Spark route: " + reason
 	}
 
 	if err := tbl.Refresh(nativeCtx); err != nil {
@@ -307,7 +326,13 @@ func executeHybridCompaction(
 		return nativeTaskOutcome{Result: result, Retryable: errors.Is(err, icetable.ErrCommitFailed) || nativeCtx.Err() != nil}
 	}
 	result.Status = "succeeded"
-	result.RoutingReason = "selected workload is within native file and byte limits"
+	if result.RoutingReason == "" {
+		if settings.Executor == maintenanceExecutorNative {
+			result.RoutingReason = "executor=native selected native compaction"
+		} else {
+			result.RoutingReason = "hybrid selected native: workload is within native file and byte limits"
+		}
+	}
 	result.OutputFiles = rewriteResult.AddedDataFiles
 	result.OutputBytes = rewriteResult.BytesAfter
 	result.Details["rewritten_groups"] = rewriteResult.RewrittenGroups
@@ -378,7 +403,7 @@ func executeSparkCompactionFallback(
 ) nativeTaskOutcome {
 	request := TableMaintenanceRequest{
 		Tables:         []string{tableKey(state.Namespace, state.Table)},
-		ExternalRunKey: fmt.Sprintf("rivus-native-maintenance:%d", task.ID),
+		ExternalRunKey: fmt.Sprintf("rivus-maintenance:%d", task.ID),
 		Operations: []TableMaintenanceOperation{{
 			Type: "rewrite_data_files",
 			Options: map[string]any{
@@ -392,7 +417,7 @@ func executeSparkCompactionFallback(
 	}
 	submission, err := SubmitTableMaintenanceForJobConfig(ctx, jobID, jobCfg, request, false)
 	if err != nil {
-		result.Error = fmt.Sprintf("submit Spark fallback: %v", err)
+		result.Error = fmt.Sprintf("submit Spark compaction: %v", err)
 		return nativeTaskOutcome{Result: result, Retryable: true}
 	}
 	result.SubmissionID = submission.SubmissionID
@@ -411,12 +436,12 @@ func executeSparkCompactionFallback(
 			result.Error = ctx.Err().Error()
 			return nativeTaskOutcome{Result: result, Retryable: true}
 		case <-deadline.C:
-			result.Error = "Spark fallback exceeded maintenance timeout"
+			result.Error = "Spark compaction exceeded maintenance timeout"
 			return nativeTaskOutcome{Result: result, Retryable: true}
 		case <-ticker.C:
 			status, err := GetTableMaintenanceStatusForJobConfig(ctx, jobCfg, submission.SubmissionID)
 			if err != nil {
-				result.Error = fmt.Sprintf("poll Spark fallback: %v", err)
+				result.Error = fmt.Sprintf("poll Spark compaction: %v", err)
 				return nativeTaskOutcome{Result: result, Retryable: true}
 			}
 			switch strings.ToUpper(strings.TrimSpace(status.DriverState)) {
@@ -424,7 +449,7 @@ func executeSparkCompactionFallback(
 				result.Status = "succeeded"
 				return nativeTaskOutcome{Result: result}
 			case "FAILED", "ERROR", "KILLED", "CANCELLED", "CANCELED":
-				result.Error = firstNonEmpty(strings.TrimSpace(status.Message), "Spark fallback failed")
+				result.Error = firstNonEmpty(strings.TrimSpace(status.Message), "Spark compaction failed")
 				return nativeTaskOutcome{Result: result, Retryable: true}
 			}
 		}

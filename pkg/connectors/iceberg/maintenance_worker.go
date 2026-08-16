@@ -146,7 +146,7 @@ func syncMaintenanceStates(ctx context.Context, store *meta.IcebergMaintenanceSt
 		}
 		settings, err := nativeMaintenanceSettingsFromRaw(sinkCfg)
 		if err != nil {
-			log.Printf("[maintenance-worker] skip job=%s invalid native config: %v", job.ID, err)
+			log.Printf("[maintenance-worker] skip job=%s invalid maintenance config: %v", job.ID, err)
 			continue
 		}
 		iceCfg, err := decodeIcebergConfig(sinkCfg)
@@ -172,9 +172,6 @@ func syncMaintenanceStates(ctx context.Context, store *meta.IcebergMaintenanceSt
 			tableIdentity := canonicalMaintenanceTableKey(catalogName, target.Namespace, target.Table)
 			compactionDue := now.Add(deterministicJitter(tableIdentity+"|compact", settings.IdleCompactionInterval))
 			expireDue := now.Add(deterministicJitter(tableIdentity+"|expire", settings.ExpireInterval))
-			// A table without a Rivus write signal is inactive. Do not spend an
-			// object-storage scan on it every month; seed its first orphan check
-			// in the longer inactive interval instead.
 			orphanDue := now.Add(deterministicJitter(tableIdentity+"|orphan", settings.OrphanInactiveInterval))
 			if err := store.UpsertState(ctx, meta.IcebergMaintenanceState{
 				TableKey:         tableIdentity,
@@ -247,7 +244,7 @@ func enqueueDueMaintenance(ctx context.Context, store *meta.IcebergMaintenanceSt
 			window := due.UTC().Format(time.RFC3339Nano)
 			_, err := store.EnqueueTask(ctx, state, operation.name, operation.priority, window, now, map[string]any{
 				"scheduled_at": due.UTC().Format(time.RFC3339Nano),
-				"native":       true,
+				"executor":     job.Settings.Executor,
 			})
 			if err != nil {
 				return fmt.Errorf("enqueue %s for %s: %w", operation.name, state.TableKey, err)
@@ -365,13 +362,14 @@ func processMaintenancePage(ctx context.Context, store *meta.IcebergMaintenanceS
 
 func nativeMaintenanceEnabledFromRaw(sinkCfg any) bool {
 	maintenance := rawMaintenanceMap(sinkCfg)
-	return rawBool(maintenance, "native_enabled", false)
+	return rawBool(maintenance, "enabled", false)
 }
 
 func nativeMaintenanceSettingsFromRaw(sinkCfg any) (nativeMaintenanceSettings, error) {
 	settings := defaultNativeMaintenanceSettings()
 	maintenance := rawMaintenanceMap(sinkCfg)
-	settings.Enabled = rawBool(maintenance, "native_enabled", false)
+	settings.Enabled = rawBool(maintenance, "enabled", false)
+	settings.Executor = normalizeMaintenanceExecutor(rawString(maintenance, "executor", maintenanceExecutorHybrid))
 	settings.MaxSelectedInputBytes = rawInt64(maintenance, "native_max_selected_input_bytes", settings.MaxSelectedInputBytes)
 	settings.MaxSelectedFiles = rawInt(maintenance, "native_max_selected_files", settings.MaxSelectedFiles)
 	settings.TargetFileSizeBytes = rawInt64(maintenance, "native_target_file_size_bytes", settings.TargetFileSizeBytes)
@@ -392,6 +390,9 @@ func nativeMaintenanceSettingsFromRaw(sinkCfg any) (nativeMaintenanceSettings, e
 	settings.SparkTimeout = time.Duration(rawInt(maintenance, "spark_timeout_seconds", int(settings.SparkTimeout/time.Second))) * time.Second
 	settings.IdleCompactionInterval = time.Duration(rawInt(maintenance, "native_idle_check_interval_seconds", int(settings.IdleCompactionInterval/time.Second))) * time.Second
 
+	if err := validateMaintenanceExecutor(settings.Executor); err != nil {
+		return settings, err
+	}
 	switch {
 	case settings.MaxSelectedInputBytes <= 0:
 		return settings, fmt.Errorf("native_max_selected_input_bytes must be > 0")

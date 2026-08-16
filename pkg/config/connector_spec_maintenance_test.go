@@ -7,7 +7,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-func TestMaintenanceMasterSwitchNormalizesYAMLConnectorSpec(t *testing.T) {
+func TestMaintenanceRemovesHistoricalNativeEnabled(t *testing.T) {
 	var spec ConnectorSpec
 	if err := yaml.Unmarshal([]byte(`type: iceberg_native
 config:
@@ -18,52 +18,83 @@ config:
 		t.Fatal(err)
 	}
 	maintenance := spec.Config["table_maintenance"].(map[string]any)
-	if maintenance["native_enabled"] != false {
-		t.Fatalf("native_enabled = %#v, want false when master enabled is false", maintenance["native_enabled"])
+	if _, ok := maintenance["native_enabled"]; ok {
+		t.Fatalf("historical native_enabled must be removed: %#v", maintenance)
 	}
 }
 
-func TestMaintenanceMasterSwitchNormalizesJSONConnectorSpec(t *testing.T) {
-	var spec ConnectorSpec
-	if err := json.Unmarshal([]byte(`{"type":"iceberg_native","config":{"table_maintenance":{"enabled":false,"native_enabled":true}}}`), &spec); err != nil {
-		t.Fatal(err)
-	}
-	maintenance := spec.Config["table_maintenance"].(map[string]any)
-	if maintenance["native_enabled"] != false {
-		t.Fatalf("native_enabled = %#v, want false when master enabled is false", maintenance["native_enabled"])
-	}
-}
-
-func TestMaintenanceMasterSwitchKeepsWorkerEnabled(t *testing.T) {
+func TestMaintenanceDefaultsExecutorToHybrid(t *testing.T) {
 	var spec ConnectorSpec
 	if err := yaml.Unmarshal([]byte(`type: iceberg_native
 config:
   table_maintenance:
     enabled: true
-    native_enabled: true
 `), &spec); err != nil {
 		t.Fatal(err)
 	}
 	maintenance := spec.Config["table_maintenance"].(map[string]any)
-	if maintenance["native_enabled"] != true {
-		t.Fatalf("native_enabled = %#v, want true when master and worker switches are true", maintenance["native_enabled"])
+	if maintenance["executor"] != "hybrid" {
+		t.Fatalf("executor = %#v, want hybrid", maintenance["executor"])
+	}
+	if _, ok := maintenance["native_enabled"]; ok {
+		t.Fatalf("native_enabled leaked into normalized config: %#v", maintenance)
 	}
 }
 
-func TestRuntimeMaintenanceDecoderRetiresLegacyEnabledGate(t *testing.T) {
+func TestMaintenanceNormalizesExplicitExecutor(t *testing.T) {
+	var spec ConnectorSpec
+	if err := yaml.Unmarshal([]byte(`type: iceberg_native
+config:
+  table_maintenance:
+    enabled: true
+    executor: SPARK
+`), &spec); err != nil {
+		t.Fatal(err)
+	}
+	maintenance := spec.Config["table_maintenance"].(map[string]any)
+	if maintenance["executor"] != "spark" {
+		t.Fatalf("executor = %#v, want spark", maintenance["executor"])
+	}
+}
+
+func TestMaintenanceRejectsUnknownExecutor(t *testing.T) {
+	var spec ConnectorSpec
+	err := yaml.Unmarshal([]byte(`type: iceberg_native
+config:
+  table_maintenance:
+    enabled: true
+    executor: flink
+`), &spec)
+	if err == nil {
+		t.Fatal("expected unknown executor to be rejected")
+	}
+}
+
+func TestMaintenanceJSONDefaultsExecutorToHybrid(t *testing.T) {
+	var spec ConnectorSpec
+	if err := json.Unmarshal([]byte(`{"type":"iceberg_native","config":{"table_maintenance":{"enabled":true}}}`), &spec); err != nil {
+		t.Fatal(err)
+	}
+	maintenance := spec.Config["table_maintenance"].(map[string]any)
+	if maintenance["executor"] != "hybrid" {
+		t.Fatalf("executor = %#v, want hybrid", maintenance["executor"])
+	}
+}
+
+func TestRuntimeMaintenanceDecoderUsesEnabledOnly(t *testing.T) {
 	var cfg struct {
 		Maintenance IcebergTableMaintenanceConfig `yaml:"table_maintenance"`
 	}
 	if err := yaml.Unmarshal([]byte(`table_maintenance:
   enabled: true
-  native_enabled: true
+  native_enabled: false
 `), &cfg); err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Maintenance.Enabled {
-		t.Fatal("legacy runtime Enabled gate must be false")
+	if !cfg.Maintenance.Enabled {
+		t.Fatal("runtime Enabled must follow the public enabled switch")
 	}
 	if !cfg.Maintenance.NativeEnabled {
-		t.Fatal("worker runtime gate must remain enabled")
+		t.Fatal("internal worker compatibility gate must be derived from enabled")
 	}
 }

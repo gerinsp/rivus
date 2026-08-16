@@ -2,15 +2,18 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 )
 
 // ConnectorSpec keeps connector configs as raw maps so persisted jobs can be
-// consumed by both the CDC server and the separate maintenance worker. These
-// unmarshallers normalize only the maintenance feature gates: enabled is the
-// master switch, so native_enabled can never turn the worker on by itself.
+// consumed by both the CDC server and the separate maintenance worker.
+//
+// table_maintenance.enabled is the only feature gate. executor selects how
+// compaction is executed: hybrid, native, or spark. The historical
+// native_enabled key is removed during decode and is never persisted again.
 func (c *ConnectorSpec) UnmarshalYAML(value *yaml.Node) error {
 	type plain ConnectorSpec
 	var decoded plain
@@ -18,8 +21,7 @@ func (c *ConnectorSpec) UnmarshalYAML(value *yaml.Node) error {
 		return err
 	}
 	*c = ConnectorSpec(decoded)
-	c.normalizeMaintenanceFeatureGates()
-	return nil
+	return c.normalizeMaintenanceConfig()
 }
 
 func (c *ConnectorSpec) UnmarshalJSON(data []byte) error {
@@ -29,24 +31,40 @@ func (c *ConnectorSpec) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	*c = ConnectorSpec(decoded)
-	c.normalizeMaintenanceFeatureGates()
-	return nil
+	return c.normalizeMaintenanceConfig()
 }
 
-func (c *ConnectorSpec) normalizeMaintenanceFeatureGates() {
+func (c *ConnectorSpec) normalizeMaintenanceConfig() error {
 	if c == nil || !strings.EqualFold(strings.TrimSpace(c.Type), "iceberg_native") || c.Config == nil {
-		return
+		return nil
 	}
 	raw, ok := c.Config["table_maintenance"]
 	if !ok {
-		return
+		return nil
 	}
 	maintenance, ok := raw.(map[string]any)
 	if !ok || maintenance == nil {
-		return
+		return nil
 	}
+
+	// native_enabled belonged to the first worker rollout. Scheduling now has a
+	// single master switch, so do not preserve or honor the old flag.
+	delete(maintenance, "native_enabled")
+
 	enabled, _ := maintenance["enabled"].(bool)
 	if !enabled {
-		maintenance["native_enabled"] = false
+		return nil
+	}
+	executor, _ := maintenance["executor"].(string)
+	executor = strings.ToLower(strings.TrimSpace(executor))
+	if executor == "" {
+		executor = "hybrid"
+	}
+	switch executor {
+	case "hybrid", "native", "spark":
+		maintenance["executor"] = executor
+		return nil
+	default:
+		return fmt.Errorf("table_maintenance.executor must be one of hybrid, native, spark")
 	}
 }
