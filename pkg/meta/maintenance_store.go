@@ -86,6 +86,14 @@ type IcebergMaintenanceRun struct {
 	CreatedAt    time.Time  `json:"created_at"`
 }
 
+type IcebergMaintenanceRunFilter struct {
+	OwnerJobID string
+	Status     string
+	Search     string
+	Operation  string
+	Engine     string
+}
+
 type IcebergMaintenanceResult struct {
 	ID               int64          `json:"id"`
 	RunID            int64          `json:"run_id"`
@@ -209,7 +217,8 @@ func (s *IcebergMaintenanceStore) Init(ctx context.Context) error {
 		  UNIQUE KEY uq_maintenance_task_idempotency (idempotency_key),
 		  INDEX idx_maintenance_task_due (status, not_before, priority, id),
 		  INDEX idx_maintenance_task_lease (status, lease_until),
-		  INDEX idx_maintenance_task_table (table_key, operation, status)
+		  INDEX idx_maintenance_task_table (table_key, operation, status),
+		  INDEX idx_maintenance_task_owner_status (owner_job_id, status, created_at, id)
 		)`,
 		`CREATE TABLE IF NOT EXISTS iceberg_maintenance_runs (
 		  id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -263,6 +272,9 @@ func (s *IcebergMaintenanceStore) Init(ctx context.Context) error {
 	if err := s.ensureColumn(ctx, "iceberg_maintenance_state", "last_write_at", "DATETIME(6) NULL AFTER last_snapshot_id"); err != nil {
 		return err
 	}
+	if err := s.ensureIndex(ctx, "iceberg_maintenance_tasks", "idx_maintenance_task_owner_status", "(owner_job_id, status, created_at, id)"); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -279,6 +291,30 @@ func (s *IcebergMaintenanceStore) ensureColumn(ctx context.Context, table, colum
 		return nil
 	}
 	_, err = s.db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, definition))
+	return err
+}
+
+// ensureIndex adds indexes introduced after the durable maintenance tables were
+// first deployed. CREATE TABLE IF NOT EXISTS does not update existing tables.
+func (s *IcebergMaintenanceStore) ensureIndex(ctx context.Context, table, index, definition string) error {
+	var found int
+	check := `SELECT COUNT(*) FROM information_schema.STATISTICS
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = ?`
+	if err := s.db.QueryRowContext(ctx, check, table, index).Scan(&found); err != nil {
+		return err
+	}
+	if found != 0 {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s ADD INDEX %s %s", table, index, definition))
+	if err == nil {
+		return nil
+	}
+	// Rivus API and the maintenance worker may initialize at the same time. If
+	// the other process won the ALTER race, accept the now-existing index.
+	if checkErr := s.db.QueryRowContext(ctx, check, table, index).Scan(&found); checkErr == nil && found != 0 {
+		return nil
+	}
 	return err
 }
 
@@ -628,6 +664,46 @@ func (s *IcebergMaintenanceStore) CreateRun(ctx context.Context, workerID string
 	return res.LastInsertId()
 }
 
+// CreateRunForTasks creates the run and its initial task results atomically.
+// Owner-scoped history can therefore display active work before each operation
+// finishes, and a run never appears with only a partial set of claimed tasks.
+func (s *IcebergMaintenanceStore) CreateRunForTasks(ctx context.Context, workerID string, tasks []IcebergMaintenanceTask, at time.Time) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	res, err := tx.ExecContext(ctx, `INSERT INTO iceberg_maintenance_runs
+	(worker_id,status,task_count,success_count,skipped_count,failed_count,started_at,created_at)
+	VALUES (?, 'running', ?, 0, 0, 0, ?, ?)`, workerID, len(tasks), at.UTC(), at.UTC())
+	if err != nil {
+		return 0, err
+	}
+	runID, err := res.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+
+	const insert = `INSERT INTO iceberg_maintenance_results (
+	 run_id,task_id,table_key,operation,engine,routing_reason,status,input_files,input_bytes,
+	 output_files,output_bytes,delete_files,expired_snapshots,orphan_candidates,deleted_files,
+	 deleted_bytes,duration_ms,attempt,details_json,created_at
+	) VALUES (?,?,?,?,?,'Awaiting worker execution','running',0,0,0,0,0,0,0,0,0,0,?,'{"phase":"waiting"}',?)`
+	for _, task := range tasks {
+		if task.ID <= 0 || task.AttemptCount <= 0 {
+			return 0, fmt.Errorf("invalid claimed maintenance task id=%d attempt=%d", task.ID, task.AttemptCount)
+		}
+		if _, err := tx.ExecContext(ctx, insert, runID, task.ID, task.TableKey, task.Operation, "pending", task.AttemptCount, at.UTC()); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return runID, nil
+}
+
 func (s *IcebergMaintenanceStore) FinishRun(ctx context.Context, runID int64, success, skipped, failed int, at time.Time) error {
 	status := "finished"
 	if failed > 0 {
@@ -688,14 +764,21 @@ func (s *IcebergMaintenanceStore) Summary(ctx context.Context, now time.Time) (I
 }
 
 func (s *IcebergMaintenanceStore) ListRuns(ctx context.Context, limit, offset int) ([]IcebergMaintenanceRun, error) {
+	return s.ListRunsFiltered(ctx, IcebergMaintenanceRunFilter{}, limit, offset)
+}
+
+func (s *IcebergMaintenanceStore) ListRunsFiltered(ctx context.Context, filter IcebergMaintenanceRunFilter, limit, offset int) ([]IcebergMaintenanceRun, error) {
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
 	if offset < 0 {
 		offset = 0
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id,worker_id,status,task_count,success_count,skipped_count,failed_count,started_at,finished_at,created_at
-	FROM iceberg_maintenance_runs ORDER BY id DESC LIMIT ? OFFSET ?`, limit, offset)
+	where, args := maintenanceRunFilterWhere(filter, false)
+	query := `SELECT r.id,r.worker_id,r.status,r.task_count,r.success_count,r.skipped_count,r.failed_count,r.started_at,r.finished_at,r.created_at
+	FROM iceberg_maintenance_runs r` + where + ` ORDER BY r.id DESC LIMIT ? OFFSET ?`
+	args = append(args, limit, offset)
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -714,6 +797,70 @@ func (s *IcebergMaintenanceStore) ListRuns(ctx context.Context, limit, offset in
 		out = append(out, run)
 	}
 	return out, rows.Err()
+}
+
+func (s *IcebergMaintenanceStore) CountRunsFiltered(ctx context.Context, filter IcebergMaintenanceRunFilter) (int, error) {
+	where, args := maintenanceRunFilterWhere(filter, false)
+	var total int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM iceberg_maintenance_runs r`+where, args...).Scan(&total)
+	return total, err
+}
+
+func maintenanceRunFilterWhere(filter IcebergMaintenanceRunFilter, ownerScoped bool) (string, []any) {
+	filter.OwnerJobID = strings.TrimSpace(filter.OwnerJobID)
+	filter.Status = strings.TrimSpace(filter.Status)
+	filter.Search = strings.TrimSpace(filter.Search)
+	filter.Operation = strings.TrimSpace(filter.Operation)
+	filter.Engine = strings.TrimSpace(filter.Engine)
+
+	clauses := make([]string, 0, 5)
+	args := make([]any, 0, 12)
+	if filter.Status != "" {
+		clauses = append(clauses, "r.status=?")
+		args = append(args, filter.Status)
+	}
+	if filter.Search != "" {
+		pattern := "%" + filter.Search + "%"
+		if ownerScoped {
+			clauses = append(clauses, `(r.worker_id LIKE ? OR CAST(r.id AS CHAR) LIKE ? OR EXISTS (
+				SELECT 1 FROM iceberg_maintenance_results search_res
+				JOIN iceberg_maintenance_tasks search_task ON search_task.id=search_res.task_id
+				WHERE search_res.run_id=r.id AND search_task.owner_job_id=? AND search_res.table_key LIKE ?))`)
+			args = append(args, pattern, pattern, filter.OwnerJobID, pattern)
+		} else {
+			clauses = append(clauses, `(r.worker_id LIKE ? OR CAST(r.id AS CHAR) LIKE ? OR EXISTS (
+				SELECT 1 FROM iceberg_maintenance_results search_res
+				WHERE search_res.run_id=r.id AND search_res.table_key LIKE ?))`)
+			args = append(args, pattern, pattern, pattern)
+		}
+	}
+	for _, item := range []struct {
+		value  string
+		column string
+	}{
+		{value: filter.Operation, column: "operation"},
+		{value: filter.Engine, column: "engine"},
+	} {
+		if item.value == "" {
+			continue
+		}
+		if ownerScoped {
+			clauses = append(clauses, fmt.Sprintf(`EXISTS (
+				SELECT 1 FROM iceberg_maintenance_results filter_res
+				JOIN iceberg_maintenance_tasks filter_task ON filter_task.id=filter_res.task_id
+				WHERE filter_res.run_id=r.id AND filter_task.owner_job_id=? AND filter_res.%s=?)`, item.column))
+			args = append(args, filter.OwnerJobID, item.value)
+		} else {
+			clauses = append(clauses, fmt.Sprintf(`EXISTS (
+				SELECT 1 FROM iceberg_maintenance_results filter_res
+				WHERE filter_res.run_id=r.id AND filter_res.%s=?)`, item.column))
+			args = append(args, item.value)
+		}
+	}
+	if len(clauses) == 0 {
+		return "", args
+	}
+	return " WHERE " + strings.Join(clauses, " AND "), args
 }
 
 func (s *IcebergMaintenanceStore) ListResultsForRun(ctx context.Context, runID int64, limit int) ([]IcebergMaintenanceResult, error) {

@@ -94,7 +94,11 @@ func (s *IcebergMaintenanceStore) SummaryForOwner(ctx context.Context, ownerJobI
 // belongs to one Rivus job. A worker run may contain tasks from multiple jobs,
 // so the per-status counts are recomputed from that job's results.
 func (s *IcebergMaintenanceStore) ListRunsForOwner(ctx context.Context, ownerJobID string, limit, offset int) ([]IcebergMaintenanceRun, error) {
-	ownerJobID = strings.TrimSpace(ownerJobID)
+	return s.ListRunsForOwnerFiltered(ctx, IcebergMaintenanceRunFilter{OwnerJobID: ownerJobID}, limit, offset)
+}
+
+func (s *IcebergMaintenanceStore) ListRunsForOwnerFiltered(ctx context.Context, filter IcebergMaintenanceRunFilter, limit, offset int) ([]IcebergMaintenanceRun, error) {
+	ownerJobID := strings.TrimSpace(filter.OwnerJobID)
 	if ownerJobID == "" {
 		return []IcebergMaintenanceRun{}, nil
 	}
@@ -105,7 +109,14 @@ func (s *IcebergMaintenanceStore) ListRunsForOwner(ctx context.Context, ownerJob
 		offset = 0
 	}
 
-	rows, err := s.db.QueryContext(ctx, `SELECT
+	filter.OwnerJobID = ownerJobID
+	filterWhere, filterArgs := maintenanceRunFilterWhere(filter, true)
+	where := " WHERE t.owner_job_id=?"
+	if filterWhere != "" {
+		where += " AND " + strings.TrimPrefix(filterWhere, " WHERE ")
+	}
+	args := append([]any{ownerJobID}, filterArgs...)
+	query := `SELECT
 	 r.id, r.worker_id, r.status,
 	 COUNT(res.id),
 	 COALESCE(SUM(res.status='succeeded'),0),
@@ -115,10 +126,12 @@ func (s *IcebergMaintenanceStore) ListRunsForOwner(ctx context.Context, ownerJob
 	FROM iceberg_maintenance_runs r
 	JOIN iceberg_maintenance_results res ON res.run_id=r.id
 	JOIN iceberg_maintenance_tasks t ON t.id=res.task_id
-	WHERE t.owner_job_id=?
+	` + where + `
 	GROUP BY r.id, r.worker_id, r.status, r.started_at, r.finished_at, r.created_at
 	ORDER BY r.id DESC
-	LIMIT ? OFFSET ?`, ownerJobID, limit, offset)
+	LIMIT ? OFFSET ?`
+	args = append(args, limit, offset)
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -138,6 +151,25 @@ func (s *IcebergMaintenanceStore) ListRunsForOwner(ctx context.Context, ownerJob
 		out = append(out, run)
 	}
 	return out, rows.Err()
+}
+
+func (s *IcebergMaintenanceStore) CountRunsForOwnerFiltered(ctx context.Context, filter IcebergMaintenanceRunFilter) (int, error) {
+	filter.OwnerJobID = strings.TrimSpace(filter.OwnerJobID)
+	if filter.OwnerJobID == "" {
+		return 0, nil
+	}
+	filterWhere, filterArgs := maintenanceRunFilterWhere(filter, true)
+	where := " WHERE t.owner_job_id=?"
+	if filterWhere != "" {
+		where += " AND " + strings.TrimPrefix(filterWhere, " WHERE ")
+	}
+	args := append([]any{filter.OwnerJobID}, filterArgs...)
+	var total int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(DISTINCT r.id)
+	FROM iceberg_maintenance_runs r
+	JOIN iceberg_maintenance_results res ON res.run_id=r.id
+	JOIN iceberg_maintenance_tasks t ON t.id=res.task_id`+where, args...).Scan(&total)
+	return total, err
 }
 
 func (s *IcebergMaintenanceStore) ListResultsForRunOwner(ctx context.Context, runID int64, ownerJobID string, limit int) ([]IcebergMaintenanceResult, error) {

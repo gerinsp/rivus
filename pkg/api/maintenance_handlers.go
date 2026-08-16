@@ -45,15 +45,29 @@ func (s *Server) handleMaintenanceRuns(w http.ResponseWriter, r *http.Request) {
 	limit := maintenanceQueryInt(r, "limit", 50, 1, 200)
 	offset := maintenanceQueryInt(r, "offset", 0, 0, 1_000_000)
 	jobID := maintenanceJobID(r)
+	filter := meta.IcebergMaintenanceRunFilter{
+		OwnerJobID: jobID,
+		Status:     maintenanceQueryText(r, "status", 64),
+		Search:     maintenanceQueryText(r, "q", 200),
+		Operation:  maintenanceQueryText(r, "operation", 64),
+		Engine:     maintenanceQueryText(r, "engine", 32),
+	}
 
 	var (
-		runs []meta.IcebergMaintenanceRun
-		err  error
+		runs  []meta.IcebergMaintenanceRun
+		total int
+		err   error
 	)
 	if jobID != "" {
-		runs, err = store.ListRunsForOwner(r.Context(), jobID, limit, offset)
+		runs, err = store.ListRunsForOwnerFiltered(r.Context(), filter, limit, offset)
+		if err == nil {
+			total, err = store.CountRunsForOwnerFiltered(r.Context(), filter)
+		}
 	} else {
-		runs, err = store.ListRuns(r.Context(), limit, offset)
+		runs, err = store.ListRunsFiltered(r.Context(), filter, limit, offset)
+		if err == nil {
+			total, err = store.CountRunsFiltered(r.Context(), filter)
+		}
 	}
 	if err != nil {
 		maintenanceAPIError(w, err, http.StatusInternalServerError)
@@ -63,6 +77,7 @@ func (s *Server) handleMaintenanceRuns(w http.ResponseWriter, r *http.Request) {
 		"runs":   runs,
 		"limit":  limit,
 		"offset": offset,
+		"total":  total,
 		"job_id": jobID,
 	})
 }
@@ -166,6 +181,17 @@ func maintenanceQueryInt(r *http.Request, key string, fallback, minValue, maxVal
 	value, err := strconv.Atoi(raw)
 	if err != nil || value < minValue || value > maxValue {
 		return fallback
+	}
+	return value
+}
+
+func maintenanceQueryText(r *http.Request, key string, maxLength int) string {
+	if r == nil {
+		return ""
+	}
+	value := strings.TrimSpace(r.URL.Query().Get(key))
+	if maxLength > 0 && len(value) > maxLength {
+		value = value[:maxLength]
 	}
 	return value
 }

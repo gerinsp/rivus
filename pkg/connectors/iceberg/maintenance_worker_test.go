@@ -93,7 +93,7 @@ func TestMaintenanceStartsCompleteOnlyForStreamingResumeModes(t *testing.T) {
 func TestNativeMaintenanceRejectsUnsafeOrphanAge(t *testing.T) {
 	_, err := nativeMaintenanceSettingsFromRaw(map[string]any{
 		"table_maintenance": map[string]any{
-			"enabled":                      true,
+			"enabled":                     true,
 			"native_orphan_min_age_hours": 24,
 		},
 	})
@@ -138,5 +138,21 @@ func TestMaintenanceMetaKeyIgnoresCDCDeleteExecutor(t *testing.T) {
 	key2 := maintenanceMetaKey("job", "initial", "mysql", map[string]any{"database": "db"}, "iceberg_native", changed)
 	if key1 != key2 {
 		t.Fatalf("maintenance meta key must match core stable meta key behavior")
+	}
+}
+
+func TestMaintenancePreflightFailureResultReplacesRunningPlaceholder(t *testing.T) {
+	task := meta.IcebergMaintenanceTask{
+		ID:           42,
+		TableKey:     "tiketux.tiketux_bronze.reservasi",
+		Operation:    "compact",
+		AttemptCount: 2,
+	}
+	result := maintenancePreflightFailureResult(7, task, "snapshot barrier is not complete")
+	if result.RunID != 7 || result.TaskID != task.ID || result.Attempt != task.AttemptCount {
+		t.Fatalf("result identity does not match claimed task: %#v", result)
+	}
+	if result.Status != "failed" || result.Engine != "none" || result.Error == "" {
+		t.Fatalf("unexpected preflight result: %#v", result)
 	}
 }

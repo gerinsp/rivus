@@ -32,6 +32,54 @@
 
     <section id="summary" class="grid gap-3 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-6"></section>
 
+    <form id="runFilters" class="mt-6 rounded-[20px] border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
+      <div class="grid gap-3 md:grid-cols-2 xl:grid-cols-6">
+        <label class="block">
+          <span class="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-500">Job</span>
+          <input id="jobFilter" type="text" placeholder="All Rivus jobs" class="mt-1.5 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800 outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100" />
+        </label>
+        <label class="block md:col-span-1 xl:col-span-2">
+          <span class="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-500">Search</span>
+          <input id="runSearch" type="search" placeholder="Run, worker, or table" class="mt-1.5 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800 outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100" />
+        </label>
+        <label class="block">
+          <span class="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-500">Run status</span>
+          <select id="runStatus" class="mt-1.5 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800">
+            <option value="">All statuses</option>
+            <option value="running">Running</option>
+            <option value="finished">Finished</option>
+            <option value="finished_with_errors">Finished with errors</option>
+          </select>
+        </label>
+        <label class="block">
+          <span class="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-500">Operation</span>
+          <select id="runOperation" class="mt-1.5 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800">
+            <option value="">All operations</option>
+            <option value="compact">Compact files</option>
+            <option value="expire_snapshots">Expire snapshots</option>
+            <option value="remove_orphan_files">Remove orphan files</option>
+          </select>
+        </label>
+        <label class="block">
+          <span class="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-500">Engine</span>
+          <select id="runEngine" class="mt-1.5 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800">
+            <option value="">All engines</option>
+            <option value="native">Native</option>
+            <option value="spark">Spark</option>
+            <option value="pending">Pending</option>
+            <option value="none">Preflight failure</option>
+          </select>
+        </label>
+      </div>
+      <div class="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-slate-100 pt-4">
+        <p class="text-xs text-slate-500">Filters run on the server, so this remains fast as history grows.</p>
+        <div class="flex gap-2">
+          <button id="clearFilters" type="button" class="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50">Clear</button>
+          <button type="submit" class="rounded-md border border-blue-600 bg-blue-600 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-700">Apply filters</button>
+        </div>
+      </div>
+    </form>
+
     <section class="mt-6 overflow-hidden rounded-[20px] border border-slate-200 bg-white shadow-sm">
       <div class="border-b border-slate-200 px-5 py-4 sm:px-6">
         <div class="flex items-center justify-between gap-3">
@@ -59,6 +107,20 @@
           <tbody id="runsBody" class="divide-y divide-slate-100"></tbody>
         </table>
       </div>
+      <div class="flex flex-col gap-3 border-t border-slate-200 bg-slate-50 px-5 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-6">
+        <div id="pageSummary" class="text-xs text-slate-500">No runs</div>
+        <div class="flex items-center gap-2">
+          <label class="text-xs text-slate-500">Rows
+            <select id="pageSize" class="ml-1 rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs text-slate-700">
+              <option value="25">25</option>
+              <option value="50">50</option>
+              <option value="100">100</option>
+            </select>
+          </label>
+          <button id="previousPage" type="button" class="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 disabled:cursor-not-allowed disabled:opacity-40">Previous</button>
+          <button id="nextPage" type="button" class="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 disabled:cursor-not-allowed disabled:opacity-40">Next</button>
+        </div>
+      </div>
     </section>
 
     <section id="detailsPanel" class="mt-6 hidden overflow-hidden rounded-[20px] border border-slate-200 bg-white shadow-sm">
@@ -70,6 +132,29 @@
           </div>
           <button id="closeDetails" class="rounded-md border border-slate-300 px-3 py-2 text-xs font-semibold text-slate-700">Close</button>
         </div>
+      </div>
+      <div class="grid gap-3 border-b border-slate-200 bg-slate-50 px-5 py-4 sm:grid-cols-2 lg:grid-cols-4 sm:px-6">
+        <input id="resultSearch" type="search" placeholder="Filter table name" class="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800" />
+        <select id="resultOperation" class="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800">
+          <option value="">All operations</option>
+          <option value="compact">Compact files</option>
+          <option value="expire_snapshots">Expire snapshots</option>
+          <option value="remove_orphan_files">Remove orphan files</option>
+        </select>
+        <select id="resultEngine" class="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800">
+          <option value="">All engines</option>
+          <option value="native">Native</option>
+          <option value="spark">Spark</option>
+          <option value="pending">Pending</option>
+          <option value="none">Preflight failure</option>
+        </select>
+        <select id="resultStatus" class="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800">
+          <option value="">All statuses</option>
+          <option value="running">Running</option>
+          <option value="succeeded">Succeeded</option>
+          <option value="skipped">Skipped</option>
+          <option value="failed">Failed</option>
+        </select>
       </div>
       <div class="overflow-x-auto">
         <table class="min-w-full text-sm">
@@ -91,139 +176,6 @@
     </section>
   </main>
 
-<script>
-const fmt = new Intl.NumberFormat();
-const query = new URLSearchParams(window.location.search);
-const jobID = String(query.get('job_id') || '').trim();
-const esc = (value) => String(value ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#39;');
-const dateText = (value) => {
-  if (!value) return '-';
-  const d = new Date(value);
-  return Number.isNaN(d.getTime()) ? String(value) : d.toLocaleString();
-};
-const bytes = (value) => {
-  let n = Number(value || 0);
-  if (!Number.isFinite(n)) return '-';
-  const units = ['B','KiB','MiB','GiB','TiB'];
-  let i = 0;
-  while (n >= 1024 && i < units.length - 1) { n /= 1024; i += 1; }
-  return `${n.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
-};
-const duration = (ms) => {
-  const n = Number(ms || 0);
-  if (!Number.isFinite(n)) return '-';
-  if (n < 1000) return `${Math.trunc(n)} ms`;
-  return `${(n / 1000).toFixed(1)} s`;
-};
-function scopedPath(path) {
-  if (!jobID) return path;
-  const url = new URL(path, window.location.origin);
-  url.searchParams.set('job_id', jobID);
-  return url.pathname + url.search;
-}
-function configureScope() {
-  if (!jobID) return;
-  document.getElementById('scopeBadge').textContent = `Job ${jobID}`;
-  document.getElementById('scopeDescription').textContent = 'Queue health and execution history for this Rivus job, read from durable metadata MySQL. Other jobs are excluded from this view.';
-  document.getElementById('backLink').href = `/?tab=job&id=${encodeURIComponent(jobID)}`;
-}
-function notice(message, error = false) {
-  const el = document.getElementById('notice');
-  if (!message) { el.classList.add('hidden'); return; }
-  el.className = `mb-4 rounded-xl border px-4 py-3 text-sm ${error ? 'border-rose-200 bg-rose-50 text-rose-700' : 'border-slate-200 bg-white text-slate-600'}`;
-  el.textContent = message;
-}
-async function api(path) {
-  const res = await fetch(path, { credentials: 'same-origin' });
-  if (res.status === 401) {
-    window.location.href = '/login?next=' + encodeURIComponent(window.location.pathname + window.location.search);
-    throw new Error('authentication required');
-  }
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || `${res.status} ${res.statusText}`);
-  }
-  return res.json();
-}
-function metric(label, value, detail) {
-  return `<div class="rounded-[18px] border border-slate-200 bg-white p-4 shadow-sm"><div class="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-500">${esc(label)}</div><div class="mt-2 font-mono text-xl font-semibold text-slate-950">${esc(value)}</div><div class="mt-1 text-xs text-slate-500">${esc(detail || '')}</div></div>`;
-}
-function statusBadge(value) {
-  const v = String(value || '-').toLowerCase();
-  const cls = v.includes('error') || v === 'failed' ? 'border-rose-200 bg-rose-50 text-rose-700' : v === 'running' || v === 'succeeded' || v === 'finished' ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : v === 'skipped' ? 'border-slate-200 bg-slate-50 text-slate-600' : 'border-amber-200 bg-amber-50 text-amber-700';
-  return `<span class="inline-flex rounded-full border px-2.5 py-1 text-[11px] font-semibold ${cls}">${esc(value || '-')}</span>`;
-}
-async function load() {
-  const button = document.getElementById('refreshButton');
-  button.disabled = true;
-  notice('');
-  try {
-    const [summary, payload] = await Promise.all([
-      api(scopedPath('/api/iceberg/maintenance/summary')),
-      api(scopedPath('/api/iceberg/maintenance/runs?limit=100&offset=0')),
-    ]);
-    document.getElementById('summary').innerHTML = [
-      metric('Tracked tables', fmt.format(summary.tables || 0), `${fmt.format(summary.snapshot_blocked || 0)} snapshot blocked`),
-      metric('Queued', fmt.format(summary.queued_tasks || 0), 'Waiting for a worker lease'),
-      metric('Retrying', fmt.format(summary.retry_tasks || 0), 'Retryable worker tasks'),
-      metric('Running', fmt.format(summary.active_leases || 0), 'Active durable leases'),
-      metric('Failed', fmt.format(summary.failed_tasks || 0), 'Terminal task failures'),
-      metric('Oldest queue age', summary.oldest_queued_age_seconds ? `${fmt.format(summary.oldest_queued_age_seconds)} s` : '0 s', summary.oldest_queued_at ? dateText(summary.oldest_queued_at) : 'Queue is clear'),
-    ].join('');
-
-    const runs = Array.isArray(payload.runs) ? payload.runs : [];
-    document.getElementById('runCount').textContent = `${runs.length} run${runs.length === 1 ? '' : 's'}`;
-    const emptyText = jobID ? 'No maintenance runs have been recorded for this job yet.' : 'No maintenance runs have been recorded yet.';
-    document.getElementById('runsBody').innerHTML = runs.map((run) => `
-      <tr class="cursor-pointer hover:bg-slate-50" data-run-id="${esc(run.id)}">
-        <td class="px-4 py-3 font-mono text-xs font-semibold text-blue-700">#${esc(run.id)}</td>
-        <td class="px-4 py-3 font-mono text-xs text-slate-700">${esc(run.worker_id || '-')}</td>
-        <td class="px-4 py-3">${statusBadge(run.status)}</td>
-        <td class="px-4 py-3 text-right font-mono text-xs">${fmt.format(run.task_count || 0)}</td>
-        <td class="px-4 py-3 text-right font-mono text-xs text-emerald-700">${fmt.format(run.success_count || 0)}</td>
-        <td class="px-4 py-3 text-right font-mono text-xs text-slate-600">${fmt.format(run.skipped_count || 0)}</td>
-        <td class="px-4 py-3 text-right font-mono text-xs text-rose-700">${fmt.format(run.failed_count || 0)}</td>
-        <td class="px-4 py-3 text-xs text-slate-600">${esc(dateText(run.started_at))}</td>
-      </tr>`).join('') || `<tr><td colspan="8" class="px-4 py-10 text-center text-sm text-slate-500">${esc(emptyText)}</td></tr>`;
-    document.querySelectorAll('[data-run-id]').forEach((row) => row.addEventListener('click', () => loadRun(row.dataset.runId)));
-  } catch (err) {
-    notice(`Failed to load maintenance worker state: ${err.message}`, true);
-  } finally {
-    button.disabled = false;
-  }
-}
-async function loadRun(id) {
-  const panel = document.getElementById('detailsPanel');
-  panel.classList.remove('hidden');
-  document.getElementById('detailsTitle').textContent = `Run #${id}`;
-  document.getElementById('resultsBody').innerHTML = '<tr><td colspan="8" class="px-4 py-8 text-center text-sm text-slate-500">Loading results...</td></tr>';
-  try {
-    const payload = await api(scopedPath(`/api/iceberg/maintenance/runs/${encodeURIComponent(id)}?limit=500`));
-    const results = Array.isArray(payload.results) ? payload.results : [];
-    document.getElementById('resultsBody').innerHTML = results.map((result) => {
-      const route = result.routing_reason ? `<div class="mt-1 max-w-sm text-[11px] leading-4 text-slate-500">${esc(result.routing_reason)}</div>` : '';
-      const error = result.error ? `<div class="mt-1 max-w-lg break-words text-[11px] leading-4 text-rose-600">${esc(result.error)}</div>` : '';
-      return `<tr class="align-top">
-        <td class="px-4 py-3"><div class="font-mono text-xs font-semibold text-slate-800">${esc(result.table_key || '-')}</div>${error}</td>
-        <td class="px-4 py-3 font-mono text-xs text-slate-700">${esc(result.operation || '-')}</td>
-        <td class="px-4 py-3"><div class="font-mono text-xs font-semibold text-blue-700">${esc(result.engine || '-')}</div>${route}</td>
-        <td class="px-4 py-3">${statusBadge(result.status)}</td>
-        <td class="px-4 py-3 text-right"><div class="font-mono text-xs">${fmt.format(result.input_files || 0)} files</div><div class="mt-1 text-[11px] text-slate-500">${esc(bytes(result.input_bytes))}</div></td>
-        <td class="px-4 py-3 text-right"><div class="font-mono text-xs">${fmt.format(result.output_files || 0)} files</div><div class="mt-1 text-[11px] text-slate-500">${esc(bytes(result.output_bytes))}</div></td>
-        <td class="px-4 py-3 text-right font-mono text-xs">${fmt.format(result.attempt || 0)}</td>
-        <td class="px-4 py-3 text-right font-mono text-xs">${esc(duration(result.duration_ms))}</td>
-      </tr>`;
-    }).join('') || '<tr><td colspan="8" class="px-4 py-8 text-center text-sm text-slate-500">No results recorded for this run in the selected job scope.</td></tr>';
-  } catch (err) {
-    document.getElementById('resultsBody').innerHTML = `<tr><td colspan="8" class="px-4 py-8 text-center text-sm text-rose-600">${esc(err.message)}</td></tr>`;
-  }
-  panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
-}
-configureScope();
-document.getElementById('refreshButton').addEventListener('click', load);
-document.getElementById('closeDetails').addEventListener('click', () => document.getElementById('detailsPanel').classList.add('hidden'));
-load();
-setInterval(load, 30000);
-</script>
+  <script src="./runs.js?v=1"></script>
 </body>
 </html>

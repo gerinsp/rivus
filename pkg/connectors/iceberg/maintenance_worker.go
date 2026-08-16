@@ -266,7 +266,7 @@ func processMaintenancePage(ctx context.Context, store *meta.IcebergMaintenanceS
 	if len(tasks) == 0 {
 		return 0, nil
 	}
-	runID, err := store.CreateRun(ctx, opts.WorkerID, len(tasks), now)
+	runID, err := store.CreateRunForTasks(ctx, opts.WorkerID, tasks, now)
 	if err != nil {
 		return 0, fmt.Errorf("create maintenance run: %w", err)
 	}
@@ -282,13 +282,25 @@ func processMaintenancePage(ctx context.Context, store *meta.IcebergMaintenanceS
 		}
 		if state == nil || !state.SnapshotComplete {
 			failures++
-			_ = store.FinishTask(ctx, task.ID, opts.WorkerID, meta.MaintenanceTaskRetry, "snapshot barrier is not complete", timePtr(time.Now().Add(time.Minute)))
+			message := "snapshot barrier is not complete"
+			if err := store.InsertResult(ctx, maintenancePreflightFailureResult(runID, task, message)); err != nil {
+				return len(tasks), fmt.Errorf("store maintenance preflight result task=%d: %w", task.ID, err)
+			}
+			if err := store.FinishTask(ctx, task.ID, opts.WorkerID, meta.MaintenanceTaskRetry, message, timePtr(time.Now().Add(time.Minute))); err != nil {
+				return len(tasks), err
+			}
 			continue
 		}
 		job, ok := jobs[task.OwnerJobID]
 		if !ok || job.Job.Config == nil {
 			failures++
-			_ = store.FinishTask(ctx, task.ID, opts.WorkerID, meta.MaintenanceTaskFailed, "owner job configuration is unavailable", nil)
+			message := "owner job configuration is unavailable"
+			if err := store.InsertResult(ctx, maintenancePreflightFailureResult(runID, task, message)); err != nil {
+				return len(tasks), fmt.Errorf("store maintenance preflight result task=%d: %w", task.ID, err)
+			}
+			if err := store.FinishTask(ctx, task.ID, opts.WorkerID, meta.MaintenanceTaskFailed, message, nil); err != nil {
+				return len(tasks), err
+			}
 			continue
 		}
 
@@ -358,6 +370,21 @@ func processMaintenancePage(ctx context.Context, store *meta.IcebergMaintenanceS
 		return len(tasks), err
 	}
 	return len(tasks), nil
+}
+
+func maintenancePreflightFailureResult(runID int64, task meta.IcebergMaintenanceTask, message string) meta.IcebergMaintenanceResult {
+	return meta.IcebergMaintenanceResult{
+		RunID:         runID,
+		TaskID:        task.ID,
+		TableKey:      task.TableKey,
+		Operation:     task.Operation,
+		Engine:        "none",
+		RoutingReason: "Worker preflight failed",
+		Status:        "failed",
+		Attempt:       task.AttemptCount,
+		Error:         message,
+		CreatedAt:     time.Now().UTC(),
+	}
 }
 
 func nativeMaintenanceEnabledFromRaw(sinkCfg any) bool {
