@@ -10,7 +10,7 @@ function maintenanceConfig(job) {
   return job?.config?.sink?.config?.table_maintenance || {};
 }
 
-function maintenanceEnabled(job) {
+function configuredMaintenanceEnabled(job) {
   const cfg = maintenanceConfig(job);
   if (typeof cfg.enabled === 'boolean') return cfg.enabled;
   return !!job?.iceberg_maintenance?.enabled;
@@ -97,7 +97,7 @@ export function renderIcebergMaintenance(job) {
 
   panel.classList.remove('hidden');
   const maintenance = job?.iceberg_maintenance;
-  const enabled = maintenanceEnabled(job);
+  const configuredEnabled = configuredMaintenanceEnabled(job);
 
   if (!maintenance) {
     setInnerHTMLIfChanged(panel, `
@@ -105,12 +105,12 @@ export function renderIcebergMaintenance(job) {
         <div class="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Iceberg Maintenance</div>
         <div class="mt-2 text-sm text-slate-600">Durable maintenance-worker state will appear after the Iceberg sink starts.</div>
       </div>
-      ${workerConfigStrip(job, enabled)}
+      ${workerConfigStrip(job, configuredEnabled)}
     `);
     return;
   }
 
-  if (!enabled) {
+  if (!maintenance.enabled) {
     setInnerHTMLIfChanged(panel, `
       <div class="flex flex-col gap-3 border-b border-slate-200 px-5 py-5 sm:flex-row sm:items-center sm:justify-between sm:px-6">
         <div>
@@ -119,7 +119,7 @@ export function renderIcebergMaintenance(job) {
         </div>
         <span class="rounded-full border px-3 py-1.5 text-xs font-semibold ${maintenanceStateClass('disabled')}">Disabled</span>
       </div>
-      ${workerConfigStrip(job, false)}
+      ${workerConfigStrip(job, configuredEnabled)}
     `);
     return;
   }
@@ -199,7 +199,7 @@ export function renderIcebergMaintenance(job) {
       <div class="mt-3 text-xs text-slate-500">Last durable state update: <span class="font-semibold text-slate-700">${escapeHtml(checkedAt)}</span></div>
     </div>
 
-    ${workerConfigStrip(job, true)}
+    ${workerConfigStrip(job, configuredEnabled)}
 
     <div class="grid gap-3 bg-slate-50 px-5 py-4 sm:grid-cols-2 xl:grid-cols-5 sm:px-6">
       ${maintenanceMetric('Active data files', fmtWholeNumber(maintenance.active_data_files || 0), 'Currently referenced')}
