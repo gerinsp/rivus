@@ -57,6 +57,19 @@ config:
 	}
 }
 
+func TestMaintenanceRejectsUnknownExecutor(t *testing.T) {
+	var spec ConnectorSpec
+	err := yaml.Unmarshal([]byte(`type: iceberg_native
+config:
+  table_maintenance:
+    enabled: true
+    executor: flink
+`), &spec)
+	if err == nil {
+		t.Fatal("expected unknown executor to be rejected")
+	}
+}
+
 func TestMaintenanceJSONDefaultsExecutorToHybrid(t *testing.T) {
 	var spec ConnectorSpec
 	if err := json.Unmarshal([]byte(`{"type":"iceberg_native","config":{"table_maintenance":{"enabled":true}}}`), &spec); err != nil {
