@@ -2,13 +2,12 @@ package config
 
 import (
 	"encoding/json"
-	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
 )
 
-func TestMaintenanceEnabledFalseDisablesInternalWorkerGate(t *testing.T) {
+func TestMaintenanceRemovesHistoricalNativeEnabled(t *testing.T) {
 	var spec ConnectorSpec
 	if err := yaml.Unmarshal([]byte(`type: iceberg_native
 config:
@@ -19,12 +18,12 @@ config:
 		t.Fatal(err)
 	}
 	maintenance := spec.Config["table_maintenance"].(map[string]any)
-	if maintenance[internalMaintenanceWorkerGate] != false {
-		t.Fatalf("internal worker gate = %#v, want false", maintenance[internalMaintenanceWorkerGate])
+	if _, ok := maintenance["native_enabled"]; ok {
+		t.Fatalf("historical native_enabled must be removed: %#v", maintenance)
 	}
 }
 
-func TestMaintenanceEnabledAloneEnablesInternalWorkerGateYAML(t *testing.T) {
+func TestMaintenanceDefaultsExecutorToHybrid(t *testing.T) {
 	var spec ConnectorSpec
 	if err := yaml.Unmarshal([]byte(`type: iceberg_native
 config:
@@ -34,62 +33,38 @@ config:
 		t.Fatal(err)
 	}
 	maintenance := spec.Config["table_maintenance"].(map[string]any)
-	if maintenance[internalMaintenanceWorkerGate] != true {
-		t.Fatalf("internal worker gate = %#v, want true", maintenance[internalMaintenanceWorkerGate])
+	if maintenance["executor"] != "hybrid" {
+		t.Fatalf("executor = %#v, want hybrid", maintenance["executor"])
+	}
+	if _, ok := maintenance["native_enabled"]; ok {
+		t.Fatalf("native_enabled leaked into normalized config: %#v", maintenance)
 	}
 }
 
-func TestMaintenanceEnabledAloneEnablesInternalWorkerGateJSON(t *testing.T) {
+func TestMaintenanceNormalizesExplicitExecutor(t *testing.T) {
+	var spec ConnectorSpec
+	if err := yaml.Unmarshal([]byte(`type: iceberg_native
+config:
+  table_maintenance:
+    enabled: true
+    executor: SPARK
+`), &spec); err != nil {
+		t.Fatal(err)
+	}
+	maintenance := spec.Config["table_maintenance"].(map[string]any)
+	if maintenance["executor"] != "spark" {
+		t.Fatalf("executor = %#v, want spark", maintenance["executor"])
+	}
+}
+
+func TestMaintenanceJSONDefaultsExecutorToHybrid(t *testing.T) {
 	var spec ConnectorSpec
 	if err := json.Unmarshal([]byte(`{"type":"iceberg_native","config":{"table_maintenance":{"enabled":true}}}`), &spec); err != nil {
 		t.Fatal(err)
 	}
 	maintenance := spec.Config["table_maintenance"].(map[string]any)
-	if maintenance[internalMaintenanceWorkerGate] != true {
-		t.Fatalf("internal worker gate = %#v, want true", maintenance[internalMaintenanceWorkerGate])
-	}
-}
-
-func TestHistoricalNativeEnabledCannotDisableWorker(t *testing.T) {
-	var spec ConnectorSpec
-	if err := yaml.Unmarshal([]byte(`type: iceberg_native
-config:
-  table_maintenance:
-    enabled: true
-    native_enabled: false
-`), &spec); err != nil {
-		t.Fatal(err)
-	}
-	maintenance := spec.Config["table_maintenance"].(map[string]any)
-	if maintenance[internalMaintenanceWorkerGate] != true {
-		t.Fatalf("historical native_enabled changed runtime path: %#v", maintenance)
-	}
-}
-
-func TestInternalWorkerGateIsNotSerialized(t *testing.T) {
-	var spec ConnectorSpec
-	if err := yaml.Unmarshal([]byte(`type: iceberg_native
-config:
-  table_maintenance:
-    enabled: true
-`), &spec); err != nil {
-		t.Fatal(err)
-	}
-
-	encodedJSON, err := json.Marshal(spec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(encodedJSON), "native_enabled") {
-		t.Fatalf("serialized JSON leaked internal worker gate: %s", encodedJSON)
-	}
-
-	encodedYAML, err := yaml.Marshal(spec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(encodedYAML), "native_enabled") {
-		t.Fatalf("serialized YAML leaked internal worker gate: %s", encodedYAML)
+	if maintenance["executor"] != "hybrid" {
+		t.Fatalf("executor = %#v, want hybrid", maintenance["executor"])
 	}
 }
 
