@@ -127,23 +127,23 @@ func TestAutomaticMaintenanceDefersSubmissionAcrossInitialSnapshot(t *testing.T)
 	}
 }
 
-func TestAutomaticCompactionRequiresActiveSmallFilesAndBytes(t *testing.T) {
+func TestAutomaticCompactionUsesSmallFileCountWithoutByteFloor(t *testing.T) {
 	cfg := config.IcebergTableMaintenanceConfig{
-		DataFilesThreshold:      100,
+		DataFilesThreshold:      200,
 		SmallFilesMinCount:      10,
 		SmallFilesMinTotalBytes: 256 * 1024 * 1024,
 	}
 	state := &tableMaintenanceWatchState{
 		eligibilityReady: true,
-		activeSmallFiles: 100,
-		activeSmallBytes: 32 * 1024 * 1024,
+		activeSmallFiles: 199,
+		activeSmallBytes: 14 * 1024 * 1024,
 	}
 	if operations := automaticOperationsDue(state, cfg, time.Now()); len(operations) != 0 {
-		t.Fatalf("operations = %#v, want no compaction below active-byte threshold", operations)
+		t.Fatalf("operations = %#v, want no compaction below the small-file count threshold", operations)
 	}
-	state.activeSmallBytes = 256 * 1024 * 1024
+	state.activeSmallFiles = 200
 	if operations := automaticOperationsDue(state, cfg, time.Now()); len(operations) != 1 || operations[0].Type != "rewrite_data_files" {
-		t.Fatalf("operations = %#v, want active-file compaction", operations)
+		t.Fatalf("operations = %#v, want compaction at the small-file count threshold", operations)
 	}
 }
 
@@ -158,7 +158,7 @@ func TestAutomaticCompactionUsesActiveCountsAfterMonitorRestart(t *testing.T) {
 	dataState := &tableMaintenanceWatchState{
 		eligibilityReady: true,
 		activeSmallFiles: 200,
-		activeSmallBytes: 256 * 1024 * 1024,
+		activeSmallBytes: 14 * 1024 * 1024,
 	}
 	if operations := automaticOperationsDue(dataState, cfg, time.Now()); len(operations) != 1 || operations[0].Type != "rewrite_data_files" {
 		t.Fatalf("data operations after restart = %#v", operations)

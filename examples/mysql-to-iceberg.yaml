@@ -46,7 +46,9 @@ sink:
     #   equality_delete_files_threshold: 50
     #   small_file_size_bytes: 67108864       # active files below 64 MiB
     #   small_files_min_count: 10
-    #   small_files_min_total_bytes: 268435456 # at least 256 MiB combined
+    #   small_files_min_total_bytes: 268435456 # additional trigger; 200 active small files or 50 equality deletes also trigger
+    #   native_max_selected_files: 250
+    #   native_max_equality_delete_files: 100
     #   compact_options:                       # memory-safe defaults shown explicitly
     #     strategy: binpack
     #     options:

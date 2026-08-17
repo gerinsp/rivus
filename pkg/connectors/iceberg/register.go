@@ -83,6 +83,8 @@ func normalizeIcebergConfig(c config.IcebergConfig) config.IcebergConfig {
 	c.TableMaintenance.ClientSparkVersion = strings.TrimSpace(c.TableMaintenance.ClientSparkVersion)
 	c.TableMaintenance.CatalogName = strings.TrimSpace(c.TableMaintenance.CatalogName)
 	c.TableMaintenance.RESTAuthHeader = strings.TrimSpace(c.TableMaintenance.RESTAuthHeader)
+	c.TableMaintenance.Executor = normalizeMaintenanceExecutor(c.TableMaintenance.Executor)
+	c.TableMaintenance.WorkerTempDirectory = strings.TrimSpace(c.TableMaintenance.WorkerTempDirectory)
 	c.SnapshotSpoolDirectory = strings.TrimSpace(c.SnapshotSpoolDirectory)
 	if c.TableMaintenance.Enabled || c.TableMaintenance.NativeEnabled {
 		if c.TableMaintenance.RunnerResourceProfile == "" {
@@ -120,6 +122,27 @@ func normalizeIcebergConfig(c config.IcebergConfig) config.IcebergConfig {
 		}
 		if c.TableMaintenance.NativeOrphanInactiveIntervalSeconds <= 0 {
 			c.TableMaintenance.NativeOrphanInactiveIntervalSeconds = 90 * 24 * 60 * 60
+		}
+		if c.TableMaintenance.NativeMaxSelectedInputBytes <= 0 {
+			c.TableMaintenance.NativeMaxSelectedInputBytes = defaultNativeMaxInputBytes
+		}
+		if c.TableMaintenance.NativeMaxSelectedFiles <= 0 {
+			c.TableMaintenance.NativeMaxSelectedFiles = defaultNativeMaxInputFiles
+		}
+		if c.TableMaintenance.NativeMaxEqualityDeleteFiles <= 0 {
+			c.TableMaintenance.NativeMaxEqualityDeleteFiles = defaultNativeMaxEqualityDeleteFiles
+		}
+		if c.TableMaintenance.NativeTargetFileSizeBytes <= 0 {
+			c.TableMaintenance.NativeTargetFileSizeBytes = defaultNativeTargetBytes
+		}
+		if c.TableMaintenance.NativeScanConcurrency <= 0 {
+			c.TableMaintenance.NativeScanConcurrency = 1
+		}
+		if c.TableMaintenance.NativeTimeoutSeconds <= 0 {
+			c.TableMaintenance.NativeTimeoutSeconds = int(defaultNativeTimeout.Seconds())
+		}
+		if c.TableMaintenance.WorkerTempDirectory == "" {
+			c.TableMaintenance.WorkerTempDirectory = "/tmp/rivus-maintenance"
 		}
 	}
 	if c.TableMaintenance.Enabled {

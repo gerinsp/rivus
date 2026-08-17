@@ -119,12 +119,15 @@ sink:
       runner_resource_profile: small
       catalog_name: rivus
 
-      # hybrid native-compaction boundary
+      # hybrid native-compaction boundary. A table becomes eligible after
+      # 200 active small files, 50 active equality-delete files, or 10 small
+      # files totaling 256 MiB.
       small_file_size_bytes: 67108864
       small_files_min_count: 10
       small_files_min_total_bytes: 268435456
       native_max_selected_input_bytes: 536870912
-      native_max_selected_files: 100
+      native_max_selected_files: 250
+      native_max_equality_delete_files: 100
       native_target_file_size_bytes: 134217728
       native_scan_concurrency: 1
       native_timeout_seconds: 600
@@ -139,6 +142,9 @@ sink:
       native_orphan_dry_run: true
       worker_temp_directory: /tmp/rivus-maintenance
 ```
+
+The 256 MiB value is an additional compaction trigger. It is not required once
+the active small-file count reaches 200 or equality deletes reach 50.
 
 The executor modes are:
 

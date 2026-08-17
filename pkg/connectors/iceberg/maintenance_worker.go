@@ -286,7 +286,7 @@ func scanClaimedInventory(ctx context.Context, store *meta.IcebergMaintenanceSto
 		}
 		return nil
 	}
-	return store.FinishInventoryClaim(ctx, state.TableKey, opts.WorkerID)
+	return store.FinishInventoryClaim(ctx, state.TableKey, opts.WorkerID, state.LastSnapshotID)
 }
 
 func maintenanceSnapshotComplete(ctx context.Context, store *meta.IcebergMaintenanceStore, job meta.PersistedJob) bool {
@@ -497,8 +497,11 @@ func nativeMaintenanceSettingsFromRaw(sinkCfg any) (nativeMaintenanceSettings, e
 	maintenance := rawMaintenanceMap(sinkCfg)
 	settings.Enabled = rawBool(maintenance, "enabled", false)
 	settings.Executor = normalizeMaintenanceExecutor(rawString(maintenance, "executor", maintenanceExecutorHybrid))
+	settings.DataFilesThreshold = rawInt(maintenance, "data_files_threshold", settings.DataFilesThreshold)
+	settings.EqualityDeleteThreshold = rawInt(maintenance, "equality_delete_files_threshold", settings.EqualityDeleteThreshold)
 	settings.MaxSelectedInputBytes = rawInt64(maintenance, "native_max_selected_input_bytes", settings.MaxSelectedInputBytes)
 	settings.MaxSelectedFiles = rawInt(maintenance, "native_max_selected_files", settings.MaxSelectedFiles)
+	settings.MaxEqualityDeleteFiles = rawInt(maintenance, "native_max_equality_delete_files", settings.MaxEqualityDeleteFiles)
 	settings.TargetFileSizeBytes = rawInt64(maintenance, "native_target_file_size_bytes", settings.TargetFileSizeBytes)
 	settings.SmallFileSizeBytes = rawInt64(maintenance, "small_file_size_bytes", settings.SmallFileSizeBytes)
 	settings.MinSmallFiles = rawInt(maintenance, "small_files_min_count", settings.MinSmallFiles)
@@ -521,10 +524,16 @@ func nativeMaintenanceSettingsFromRaw(sinkCfg any) (nativeMaintenanceSettings, e
 		return settings, err
 	}
 	switch {
+	case settings.DataFilesThreshold <= 0:
+		return settings, fmt.Errorf("data_files_threshold must be > 0")
+	case settings.EqualityDeleteThreshold <= 0:
+		return settings, fmt.Errorf("equality_delete_files_threshold must be > 0")
 	case settings.MaxSelectedInputBytes <= 0:
 		return settings, fmt.Errorf("native_max_selected_input_bytes must be > 0")
 	case settings.MaxSelectedFiles <= 0:
 		return settings, fmt.Errorf("native_max_selected_files must be > 0")
+	case settings.MaxEqualityDeleteFiles <= 0:
+		return settings, fmt.Errorf("native_max_equality_delete_files must be > 0")
 	case settings.TargetFileSizeBytes <= 0:
 		return settings, fmt.Errorf("native_target_file_size_bytes must be > 0")
 	case settings.SmallFileSizeBytes <= 0:

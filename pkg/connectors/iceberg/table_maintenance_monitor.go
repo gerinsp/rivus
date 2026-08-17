@@ -315,10 +315,12 @@ func durableMaintenanceTableState(state meta.IcebergMaintenanceState, cfg config
 	if state.LastInventoryAt == nil {
 		return "inventory_pending"
 	}
-	dataReady := cfg.DataFilesThreshold > 0 && state.NewDataFiles >= cfg.DataFilesThreshold
-	deleteReady := cfg.EqualityDeleteFilesThreshold > 0 && state.NewEqualityDeleteFiles >= cfg.EqualityDeleteFilesThreshold
-	smallReady := cfg.SmallFilesMinCount > 0 && cfg.SmallFilesMinTotalBytes > 0 && state.ActiveSmallFiles >= cfg.SmallFilesMinCount && state.ActiveSmallBytes >= cfg.SmallFilesMinTotalBytes
-	if dataReady || deleteReady || smallReady {
+	dataReady := cfg.DataFilesThreshold > 0 && state.ActiveSmallFiles >= cfg.DataFilesThreshold
+	deleteReady := cfg.EqualityDeleteFilesThreshold > 0 &&
+		state.ActiveEqualityDeleteFiles >= cfg.EqualityDeleteFilesThreshold
+	smallBytesReady := cfg.SmallFilesMinCount > 0 && cfg.SmallFilesMinTotalBytes > 0 &&
+		state.ActiveSmallFiles >= cfg.SmallFilesMinCount && state.ActiveSmallBytes >= cfg.SmallFilesMinTotalBytes
+	if dataReady || deleteReady || smallBytesReady {
 		return "ready"
 	}
 	return "healthy"
@@ -339,10 +341,10 @@ func automaticOperationsDue(state *tableMaintenanceWatchState, cfg config.Iceber
 		return nil
 	}
 	operations := make([]TableMaintenanceOperation, 0, 3)
-	dataTrigger := cfg.DataFilesThreshold > 0 && (state.newDataFiles >= cfg.DataFilesThreshold || state.activeSmallFiles >= cfg.DataFilesThreshold)
-	deleteTrigger := cfg.EqualityDeleteFilesThreshold > 0 && (state.newEqualityDeletes >= cfg.EqualityDeleteFilesThreshold || state.activeEqDeletes >= cfg.EqualityDeleteFilesThreshold)
+	dataTrigger := cfg.DataFilesThreshold > 0 && state.activeSmallFiles >= cfg.DataFilesThreshold
+	deleteTrigger := cfg.EqualityDeleteFilesThreshold > 0 && state.activeEqDeletes >= cfg.EqualityDeleteFilesThreshold
 	smallEnough := cfg.SmallFilesMinCount > 0 && cfg.SmallFilesMinTotalBytes > 0 && state.activeSmallFiles >= cfg.SmallFilesMinCount && state.activeSmallBytes >= cfg.SmallFilesMinTotalBytes
-	if deleteTrigger || (dataTrigger && smallEnough) {
+	if deleteTrigger || dataTrigger || smallEnough {
 		options := cloneStringAnyMap(cfg.CompactOptions)
 		if options == nil {
 			options = map[string]any{}

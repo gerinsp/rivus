@@ -40,8 +40,14 @@ func TestNativeMaintenanceSettingsDefaults(t *testing.T) {
 	if settings.MaxSelectedInputBytes != 512*1024*1024 {
 		t.Fatalf("unexpected native byte limit: %d", settings.MaxSelectedInputBytes)
 	}
-	if settings.MaxSelectedFiles != 100 {
+	if settings.DataFilesThreshold != 200 || settings.EqualityDeleteThreshold != 50 {
+		t.Fatalf("unexpected maintenance thresholds: data=%d deletes=%d", settings.DataFilesThreshold, settings.EqualityDeleteThreshold)
+	}
+	if settings.MaxSelectedFiles != 250 {
 		t.Fatalf("unexpected native file limit: %d", settings.MaxSelectedFiles)
+	}
+	if settings.MaxEqualityDeleteFiles != 100 {
+		t.Fatalf("unexpected native equality-delete limit: %d", settings.MaxEqualityDeleteFiles)
 	}
 	if settings.OrphanMinAge < 7*24*time.Hour {
 		t.Fatalf("orphan minimum age below safety floor: %s", settings.OrphanMinAge)
@@ -156,23 +162,113 @@ func TestNativeMaintenanceRejectsUnsafeOrphanAge(t *testing.T) {
 func TestCompactionRoutingBoundaries(t *testing.T) {
 	settings := defaultNativeMaintenanceSettings()
 	cases := []struct {
-		name string
-		work compactionWorkload
-		want bool
+		name  string
+		work  compactionWorkload
+		state meta.IcebergMaintenanceState
+		want  bool
 	}{
 		{name: "tiny", work: compactionWorkload{SelectedFiles: 50, SelectedBytes: 400 * 1024 * 1024, GroupCount: 1}, want: false},
+		{name: "200 selected files", work: compactionWorkload{SelectedFiles: 200, SelectedBytes: 14 * 1024 * 1024, GroupCount: 1}, want: false},
 		{name: "too many bytes", work: compactionWorkload{SelectedFiles: 50, SelectedBytes: 513 * 1024 * 1024, GroupCount: 1}, want: true},
-		{name: "too many files", work: compactionWorkload{SelectedFiles: 101, SelectedBytes: 400 * 1024 * 1024, GroupCount: 1}, want: true},
+		{name: "too many files", work: compactionWorkload{SelectedFiles: 251, SelectedBytes: 400 * 1024 * 1024, GroupCount: 1}, want: true},
+		{name: "100 equality deletes", work: compactionWorkload{SelectedFiles: 50, SelectedBytes: 14 * 1024 * 1024, EqualityDeletes: 100, GroupCount: 1}, want: false},
+		{name: "too many equality deletes", work: compactionWorkload{SelectedFiles: 50, SelectedBytes: 14 * 1024 * 1024, EqualityDeletes: 101, GroupCount: 1}, want: true},
 		{name: "position deletes", work: compactionWorkload{SelectedFiles: 20, SelectedBytes: 300 * 1024 * 1024, PositionDeletes: 1, GroupCount: 1}, want: true},
-		{name: "multiple substantial groups", work: compactionWorkload{SelectedFiles: 80, SelectedBytes: 300 * 1024 * 1024, GroupCount: 2}, want: true},
+		{name: "multiple groups within native limits", work: compactionWorkload{SelectedFiles: 80, SelectedBytes: 300 * 1024 * 1024, GroupCount: 2}, want: false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, _ := shouldRouteCompactionToSpark(tc.work, settings)
+			got, _ := shouldRouteCompactionToSpark(tc.work, tc.state, settings)
 			if got != tc.want {
 				t.Fatalf("route to Spark=%t, want %t", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestCompactionTriggersFor(t *testing.T) {
+	const megabyte = 1024 * 1024
+	settings := defaultNativeMaintenanceSettings()
+	cases := []struct {
+		name  string
+		state meta.IcebergMaintenanceState
+		want  compactionTriggers
+	}{
+		{
+			name: "57 active equality deletes trigger below byte floor",
+			state: meta.IcebergMaintenanceState{
+				ActiveSmallFiles:          1,
+				ActiveSmallBytes:          14 * megabyte,
+				ActiveEqualityDeleteFiles: 57,
+			},
+			want: compactionTriggers{EqualityDelete: true},
+		},
+		{
+			name: "200 active small files trigger below byte floor",
+			state: meta.IcebergMaintenanceState{
+				ActiveSmallFiles: 200,
+				ActiveSmallBytes: 14 * megabyte,
+			},
+			want: compactionTriggers{SmallFileCount: true},
+		},
+		{
+			name: "199 small files and 49 equality deletes do not trigger below byte floor",
+			state: meta.IcebergMaintenanceState{
+				ActiveSmallFiles:          199,
+				ActiveSmallBytes:          14 * megabyte,
+				ActiveEqualityDeleteFiles: 49,
+			},
+			want: compactionTriggers{},
+		},
+		{
+			name: "unscanned commit counter alone does not trigger compaction",
+			state: meta.IcebergMaintenanceState{
+				NewEqualityDeleteFiles: 57,
+			},
+			want: compactionTriggers{},
+		},
+		{
+			name: "10 small files trigger at byte floor",
+			state: meta.IcebergMaintenanceState{
+				ActiveSmallFiles: 10,
+				ActiveSmallBytes: 256 * megabyte,
+			},
+			want: compactionTriggers{SmallFileBytes: true},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := compactionTriggersFor(tc.state, settings); got != tc.want {
+				t.Fatalf("compaction triggers = %#v, want %#v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDurableMaintenanceTableStateUsesSmallFileAndDeleteTriggers(t *testing.T) {
+	now := time.Now().UTC()
+	cfg := config.IcebergTableMaintenanceConfig{
+		DataFilesThreshold:           200,
+		EqualityDeleteFilesThreshold: 50,
+		SmallFilesMinCount:           10,
+		SmallFilesMinTotalBytes:      256 * 1024 * 1024,
+	}
+
+	if got := durableMaintenanceTableState(meta.IcebergMaintenanceState{
+		SnapshotComplete: true,
+		LastInventoryAt:  &now,
+		ActiveSmallFiles: 200,
+		ActiveSmallBytes: 14 * 1024 * 1024,
+	}, cfg); got != "ready" {
+		t.Fatalf("200 small files below 256 MiB state=%q, want ready", got)
+	}
+	if got := durableMaintenanceTableState(meta.IcebergMaintenanceState{
+		SnapshotComplete:          true,
+		LastInventoryAt:           &now,
+		ActiveEqualityDeleteFiles: 50,
+	}, cfg); got != "ready" {
+		t.Fatalf("50 equality deletes state=%q, want ready", got)
 	}
 }
 

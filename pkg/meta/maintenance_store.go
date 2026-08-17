@@ -404,7 +404,7 @@ func (s *IcebergMaintenanceStore) CoalesceSignal(
 	snapshotID int64,
 	newDataFiles, newEqDeleteFiles int,
 	snapshotComplete bool,
-	dataFilesThreshold, equalityDeleteFilesThreshold int,
+	equalityDeleteFilesThreshold int,
 	nextCompaction time.Time,
 	nextOrphan time.Time,
 ) (bool, error) {
@@ -429,7 +429,7 @@ func (s *IcebergMaintenanceStore) CoalesceSignal(
 	const stmt = `UPDATE iceberg_maintenance_state
 	SET next_compaction_check_at = CASE
 	      WHEN GREATEST(snapshot_complete, ?) = 1 AND (
-	        new_data_files + ? >= ? OR new_equality_delete_files + ? >= ?
+	        new_equality_delete_files + ? >= ?
 	      ) THEN CASE
 	        WHEN next_compaction_check_at IS NULL OR next_compaction_check_at > ? THEN ?
 	        ELSE next_compaction_check_at END
@@ -454,16 +454,12 @@ func (s *IcebergMaintenanceStore) CoalesceSignal(
 	    last_snapshot_id = CASE WHEN ? = 1 THEN ? ELSE last_snapshot_id END,
 	    updated_at = UTC_TIMESTAMP(6)
 	WHERE table_key = ?`
-	if dataFilesThreshold <= 0 {
-		dataFilesThreshold = int(^uint(0) >> 1)
-	}
 	if equalityDeleteFilesThreshold <= 0 {
 		equalityDeleteFilesThreshold = int(^uint(0) >> 1)
 	}
 	due := nextCompaction.UTC()
 	res, err := tx.ExecContext(ctx, stmt,
 		boolInt(snapshotComplete),
-		addedDataFiles, dataFilesThreshold,
 		addedEqDeleteFiles, equalityDeleteFilesThreshold,
 		due, due,
 		addedDataFiles, addedEqDeleteFiles,
@@ -496,19 +492,19 @@ func (s *IcebergMaintenanceStore) SetSnapshotCompleteForOwner(
 	ctx context.Context,
 	ownerJobID string,
 	complete bool,
-	dataFilesThreshold, equalityDeleteFilesThreshold int,
+	equalityDeleteFilesThreshold int,
 	nextCompaction time.Time,
 ) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE iceberg_maintenance_state
 	SET snapshot_complete=?,
 	    next_compaction_check_at=CASE
-	      WHEN ?=1 AND (new_data_files >= ? OR new_equality_delete_files >= ?) THEN CASE
+	      WHEN ?=1 AND new_equality_delete_files >= ? THEN CASE
 	        WHEN next_compaction_check_at IS NULL OR next_compaction_check_at > ? THEN ?
 	        ELSE next_compaction_check_at END
 	      ELSE next_compaction_check_at END,
 	    updated_at=UTC_TIMESTAMP(6)
 	WHERE owner_job_id=?`,
-		boolInt(complete), boolInt(complete), dataFilesThreshold, equalityDeleteFilesThreshold,
+		boolInt(complete), boolInt(complete), equalityDeleteFilesThreshold,
 		nextCompaction.UTC(), nextCompaction.UTC(), ownerJobID,
 	)
 	return err
@@ -601,17 +597,22 @@ func (s *IcebergMaintenanceStore) ClaimPendingInventoryState(ctx context.Context
 	return &state, nil
 }
 
-func (s *IcebergMaintenanceStore) FinishInventoryClaim(ctx context.Context, tableKey, workerID string) error {
+// FinishInventoryClaim clears a completed inventory scan unless Rivus CDC
+// committed another snapshot while that scan was running. The claimed CDC
+// snapshot is deliberately used instead of inventory_snapshot_id: a native or
+// Spark maintenance commit legitimately creates a newer Iceberg snapshot, but
+// it must not cause an endless inventory-refresh loop.
+func (s *IcebergMaintenanceStore) FinishInventoryClaim(ctx context.Context, tableKey, workerID string, claimedLastSnapshotID int64) error {
 	res, err := s.db.ExecContext(ctx, `UPDATE iceberg_maintenance_state
 	SET inventory_lease_owner=NULL, inventory_lease_until=NULL,
 	    next_inventory_check_at=CASE
-	      WHEN last_snapshot_id <> inventory_snapshot_id THEN UTC_TIMESTAMP(6)
+	      WHEN last_snapshot_id <> ? THEN UTC_TIMESTAMP(6)
 	      ELSE NULL END,
 	    inventory_priority=CASE
-	      WHEN last_snapshot_id <> inventory_snapshot_id THEN GREATEST(inventory_priority, 50)
+	      WHEN last_snapshot_id <> ? THEN GREATEST(inventory_priority, 50)
 	      ELSE 0 END,
 	    updated_at=UTC_TIMESTAMP(6)
-	WHERE table_key=? AND inventory_lease_owner=?`, tableKey, workerID)
+	WHERE table_key=? AND inventory_lease_owner=?`, claimedLastSnapshotID, claimedLastSnapshotID, tableKey, workerID)
 	if err != nil {
 		return err
 	}
@@ -670,8 +671,16 @@ func (s *IcebergMaintenanceStore) EnqueueTask(ctx context.Context, state Iceberg
 	const stmt = `INSERT IGNORE INTO iceberg_maintenance_tasks (
 	 idempotency_key, table_key, owner_job_id, operation, priority, status, attempt_count,
 	 not_before, schedule_window, payload_json, created_at, updated_at
-	) VALUES (?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6))`
-	res, err := s.db.ExecContext(ctx, stmt, idempotency, state.TableKey, state.OwnerJobID, operation, priority, notBefore.UTC(), scheduleWindow, string(payloadJSON))
+) SELECT ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6)
+WHERE NOT EXISTS (
+	SELECT 1 FROM iceberg_maintenance_tasks AS active
+	WHERE active.table_key=? AND active.operation=?
+	  AND active.status IN ('queued','retry','leased')
+)`
+	res, err := s.db.ExecContext(ctx, stmt,
+		idempotency, state.TableKey, state.OwnerJobID, operation, priority, notBefore.UTC(), scheduleWindow, string(payloadJSON),
+		state.TableKey, operation,
+	)
 	if err != nil {
 		return false, err
 	}
@@ -811,6 +820,26 @@ func (s *IcebergMaintenanceStore) UpdateInventory(ctx context.Context, tableKey 
 	 inventory_snapshot_id=?, last_inventory_at=UTC_TIMESTAMP(6), active_data_files=?, active_small_files=?, active_small_bytes=?,
 	 active_equality_delete_files=?, active_position_delete_files=?, last_error=NULL, updated_at=UTC_TIMESTAMP(6)
 	WHERE table_key=?`, snapshotID, dataFiles, smallFiles, smallBytes, equalityDeletes, positionDeletes, tableKey)
+	return err
+}
+
+// ScheduleCompactionCheck makes a compaction check due after a fresh manifest
+// inventory has observed an actual small-file or equality-delete threshold.
+// It does not queue work for a table whose initial snapshot is still running.
+func (s *IcebergMaintenanceStore) ScheduleCompactionCheck(ctx context.Context, tableKey string, due time.Time) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE iceberg_maintenance_state AS state
+	SET next_compaction_check_at = CASE
+	      WHEN snapshot_complete = 1 THEN CASE
+	        WHEN next_compaction_check_at IS NULL OR next_compaction_check_at > ? THEN ?
+	        ELSE next_compaction_check_at END
+	      ELSE next_compaction_check_at END,
+	    updated_at=UTC_TIMESTAMP(6)
+	WHERE state.table_key=?
+	  AND NOT EXISTS (
+	    SELECT 1 FROM iceberg_maintenance_tasks AS active
+	    WHERE active.table_key=state.table_key AND active.operation='compact'
+	      AND active.status IN ('queued','retry','leased')
+	  )`, due.UTC(), due.UTC(), tableKey)
 	return err
 }
 

@@ -26,11 +26,14 @@ import (
 
 const (
 	defaultNativeMaxInputBytes          = int64(512 * 1024 * 1024)
-	defaultNativeMaxInputFiles          = 100
+	defaultNativeMaxInputFiles          = 250
+	defaultNativeMaxEqualityDeleteFiles = 100
 	defaultNativeTargetBytes            = int64(128 * 1024 * 1024)
 	defaultNativeSmallBytes             = int64(64 * 1024 * 1024)
 	defaultNativeMinSmallFiles          = 10
 	defaultNativeMinSmallBytes          = int64(256 * 1024 * 1024)
+	defaultDataFilesThreshold           = 200
+	defaultEqualityDeleteFilesThreshold = 50
 	defaultNativeTimeout                = 10 * time.Minute
 	defaultNativeOrphanAge              = 7 * 24 * time.Hour
 	defaultNativeOrphanInactiveInterval = 90 * 24 * time.Hour
@@ -38,27 +41,30 @@ const (
 )
 
 type nativeMaintenanceSettings struct {
-	Enabled                bool
-	Executor               string
-	MaxSelectedInputBytes  int64
-	MaxSelectedFiles       int
-	TargetFileSizeBytes    int64
-	SmallFileSizeBytes     int64
-	MinSmallFiles          int
-	MinSmallBytes          int64
-	ScanConcurrency        int
-	Timeout                time.Duration
-	TempDirectory          string
-	ExpireInterval         time.Duration
-	SnapshotMaxAge         time.Duration
-	SnapshotRetainLast     int
-	OrphanInterval         time.Duration
-	OrphanInactiveInterval time.Duration
-	OrphanMinAge           time.Duration
-	OrphanDryRun           bool
-	SparkPollInterval      time.Duration
-	SparkTimeout           time.Duration
-	IdleCompactionInterval time.Duration
+	Enabled                 bool
+	Executor                string
+	DataFilesThreshold      int
+	EqualityDeleteThreshold int
+	MaxSelectedInputBytes   int64
+	MaxSelectedFiles        int
+	MaxEqualityDeleteFiles  int
+	TargetFileSizeBytes     int64
+	SmallFileSizeBytes      int64
+	MinSmallFiles           int
+	MinSmallBytes           int64
+	ScanConcurrency         int
+	Timeout                 time.Duration
+	TempDirectory           string
+	ExpireInterval          time.Duration
+	SnapshotMaxAge          time.Duration
+	SnapshotRetainLast      int
+	OrphanInterval          time.Duration
+	OrphanInactiveInterval  time.Duration
+	OrphanMinAge            time.Duration
+	OrphanDryRun            bool
+	SparkPollInterval       time.Duration
+	SparkTimeout            time.Duration
+	IdleCompactionInterval  time.Duration
 }
 
 type nativeTaskOutcome struct {
@@ -76,36 +82,55 @@ type activeFileInventory struct {
 }
 
 type compactionWorkload struct {
-	Groups          []icetable.CompactionTaskGroup
-	SelectedFiles   int
-	SelectedBytes   int64
-	EqualityDeletes int
-	PositionDeletes int
-	GroupCount      int
+	Groups              []icetable.CompactionTaskGroup
+	SelectedDataFiles   int
+	SelectedDeleteFiles int
+	SelectedFiles       int
+	SelectedBytes       int64
+	EqualityDeletes     int
+	PositionDeletes     int
+	GroupCount          int
+}
+
+// compactionTriggers describes why a table is eligible for a rewrite. The
+// counters come from the active files in its current Iceberg snapshot, not
+// from historical commit counts. That distinction prevents an initial
+// snapshot of healthy 128 MiB files from looking like a small-file problem.
+type compactionTriggers struct {
+	SmallFileCount bool
+	SmallFileBytes bool
+	EqualityDelete bool
+}
+
+func (t compactionTriggers) Any() bool {
+	return t.SmallFileCount || t.SmallFileBytes || t.EqualityDelete
 }
 
 func defaultNativeMaintenanceSettings() nativeMaintenanceSettings {
 	return nativeMaintenanceSettings{
-		Executor:               maintenanceExecutorHybrid,
-		MaxSelectedInputBytes:  defaultNativeMaxInputBytes,
-		MaxSelectedFiles:       defaultNativeMaxInputFiles,
-		TargetFileSizeBytes:    defaultNativeTargetBytes,
-		SmallFileSizeBytes:     defaultNativeSmallBytes,
-		MinSmallFiles:          defaultNativeMinSmallFiles,
-		MinSmallBytes:          defaultNativeMinSmallBytes,
-		ScanConcurrency:        1,
-		Timeout:                defaultNativeTimeout,
-		TempDirectory:          "/tmp/rivus-maintenance",
-		ExpireInterval:         24 * time.Hour,
-		SnapshotMaxAge:         7 * 24 * time.Hour,
-		SnapshotRetainLast:     10,
-		OrphanInterval:         30 * 24 * time.Hour,
-		OrphanInactiveInterval: defaultNativeOrphanInactiveInterval,
-		OrphanMinAge:           defaultNativeOrphanAge,
-		OrphanDryRun:           false,
-		SparkPollInterval:      5 * time.Second,
-		SparkTimeout:           2 * time.Hour,
-		IdleCompactionInterval: 7 * 24 * time.Hour,
+		Executor:                maintenanceExecutorHybrid,
+		DataFilesThreshold:      defaultDataFilesThreshold,
+		EqualityDeleteThreshold: defaultEqualityDeleteFilesThreshold,
+		MaxSelectedInputBytes:   defaultNativeMaxInputBytes,
+		MaxSelectedFiles:        defaultNativeMaxInputFiles,
+		MaxEqualityDeleteFiles:  defaultNativeMaxEqualityDeleteFiles,
+		TargetFileSizeBytes:     defaultNativeTargetBytes,
+		SmallFileSizeBytes:      defaultNativeSmallBytes,
+		MinSmallFiles:           defaultNativeMinSmallFiles,
+		MinSmallBytes:           defaultNativeMinSmallBytes,
+		ScanConcurrency:         1,
+		Timeout:                 defaultNativeTimeout,
+		TempDirectory:           "/tmp/rivus-maintenance",
+		ExpireInterval:          24 * time.Hour,
+		SnapshotMaxAge:          7 * 24 * time.Hour,
+		SnapshotRetainLast:      10,
+		OrphanInterval:          30 * 24 * time.Hour,
+		OrphanInactiveInterval:  defaultNativeOrphanInactiveInterval,
+		OrphanMinAge:            defaultNativeOrphanAge,
+		OrphanDryRun:            false,
+		SparkPollInterval:       5 * time.Second,
+		SparkTimeout:            2 * time.Hour,
+		IdleCompactionInterval:  7 * 24 * time.Hour,
 	}
 }
 
@@ -179,6 +204,14 @@ func executeNativeMaintenanceTask(
 			result.Error = fmt.Sprintf("save active file inventory: %v", err)
 			return finish(nativeTaskOutcome{Result: result, Retryable: true})
 		}
+		// The planning decision below must use the inventory just read, rather
+		// than the state value that was loaded before this task was leased.
+		state.InventorySnapshotID = inventory.SnapshotID
+		state.ActiveDataFiles = inventory.DataFiles
+		state.ActiveSmallFiles = inventory.SmallFiles
+		state.ActiveSmallBytes = inventory.SmallBytes
+		state.ActiveEqualityDeleteFiles = inventory.EqualityDeletes
+		state.ActivePositionDeleteFiles = inventory.PositionDeletes
 	}
 	setupCancel()
 
@@ -238,7 +271,13 @@ func refreshPendingInventory(ctx context.Context, store *meta.IcebergMaintenance
 	if err != nil {
 		return err
 	}
-	return saveActiveFileInventory(ctx, store, state.TableKey, inventory)
+	if err := saveActiveFileInventory(ctx, store, state.TableKey, inventory); err != nil {
+		return err
+	}
+	if !state.SnapshotComplete || !inventoryTriggersCompaction(inventory, settings) {
+		return nil
+	}
+	return store.ScheduleCompactionCheck(ctx, state.TableKey, time.Now().UTC())
 }
 
 func scanActiveFileInventory(ctx context.Context, tbl *icetable.Table, smallFileSizeBytes int64) (activeFileInventory, error) {
@@ -295,6 +334,24 @@ func saveActiveFileInventory(ctx context.Context, store *meta.IcebergMaintenance
 		inventory.SmallBytes, inventory.EqualityDeletes, inventory.PositionDeletes)
 }
 
+func inventoryTriggersCompaction(inventory activeFileInventory, settings nativeMaintenanceSettings) bool {
+	return compactionTriggersFor(meta.IcebergMaintenanceState{
+		ActiveSmallFiles:          inventory.SmallFiles,
+		ActiveSmallBytes:          inventory.SmallBytes,
+		ActiveEqualityDeleteFiles: inventory.EqualityDeletes,
+		ActivePositionDeleteFiles: inventory.PositionDeletes,
+	}, settings).Any()
+}
+
+func compactionTriggersFor(state meta.IcebergMaintenanceState, settings nativeMaintenanceSettings) compactionTriggers {
+	return compactionTriggers{
+		SmallFileCount: settings.DataFilesThreshold > 0 && state.ActiveSmallFiles >= settings.DataFilesThreshold,
+		SmallFileBytes: settings.MinSmallFiles > 0 && settings.MinSmallBytes > 0 &&
+			state.ActiveSmallFiles >= settings.MinSmallFiles && state.ActiveSmallBytes >= settings.MinSmallBytes,
+		EqualityDelete: settings.EqualityDeleteThreshold > 0 && state.ActiveEqualityDeleteFiles >= settings.EqualityDeleteThreshold,
+	}
+}
+
 func addInventoryWarning(result *meta.IcebergMaintenanceResult, err error) {
 	if result == nil || err == nil {
 		return
@@ -344,24 +401,18 @@ func executeHybridCompaction(
 	}
 	startSnapshotID := tbl.CurrentSnapshot().SnapshotID
 
-	// Spark mode does not use native compaction analysis to choose an engine.
-	// A compact task is always sent to Spark; cleanup operations remain native.
-	if settings.Executor == maintenanceExecutorSpark {
-		nativeCancel()
-		result.Engine = "spark"
-		result.RoutingReason = "executor=spark forces Spark compaction"
-		result.Details = map[string]any{
-			"executor":             settings.Executor,
-			"starting_snapshot_id": startSnapshotID,
-		}
-		return executeSparkCompactionFallback(ctx, jobID, jobCfg, state, task, result, settings)
-	}
-
+	triggers := compactionTriggersFor(state, settings)
 	cfg := compaction.DefaultConfig()
 	cfg.TargetFileSizeBytes = settings.TargetFileSizeBytes
 	cfg.MinFileSizeBytes = settings.SmallFileSizeBytes
 	cfg.MaxFileSizeBytes = maxInt64(settings.TargetFileSizeBytes*9/5, settings.SmallFileSizeBytes+1)
 	cfg.MinInputFiles = uint(settings.MinSmallFiles)
+	// Delete-driven maintenance must be able to rewrite a single affected data
+	// file. Ordinary small-file compaction keeps the higher minimum so one
+	// small file is never rewritten in a loop.
+	if triggers.EqualityDelete {
+		cfg.MinInputFiles = 1
+	}
 	cfg.DeleteFileThreshold = 1
 	cfg.PreserveDeadEqualityDeletes = false
 
@@ -375,32 +426,75 @@ func executeHybridCompaction(
 	result.InputBytes = work.SelectedBytes
 	result.DeleteFiles = work.EqualityDeletes + work.PositionDeletes
 	result.Details = map[string]any{
-		"executor":               settings.Executor,
-		"groups":                 work.GroupCount,
-		"equality_delete_files":  work.EqualityDeletes,
-		"position_delete_files":  work.PositionDeletes,
-		"starting_snapshot_id":   startSnapshotID,
-		"estimated_output_files": plan.EstOutputFiles,
-		"estimated_output_bytes": plan.EstOutputBytes,
-		"max_native_input_bytes": settings.MaxSelectedInputBytes,
-		"max_native_input_files": settings.MaxSelectedFiles,
+		"executor":                         settings.Executor,
+		"groups":                           work.GroupCount,
+		"selected_data_files":              work.SelectedDataFiles,
+		"selected_delete_files":            work.SelectedDeleteFiles,
+		"equality_delete_files":            work.EqualityDeletes,
+		"position_delete_files":            work.PositionDeletes,
+		"active_equality_delete_files":     state.ActiveEqualityDeleteFiles,
+		"active_position_delete_files":     state.ActivePositionDeleteFiles,
+		"trigger_small_file_count":         triggers.SmallFileCount,
+		"trigger_small_file_bytes":         triggers.SmallFileBytes,
+		"trigger_equality_delete_files":    triggers.EqualityDelete,
+		"starting_snapshot_id":             startSnapshotID,
+		"estimated_output_files":           plan.EstOutputFiles,
+		"estimated_output_bytes":           plan.EstOutputBytes,
+		"max_native_input_bytes":           settings.MaxSelectedInputBytes,
+		"max_native_input_files":           settings.MaxSelectedFiles,
+		"max_native_equality_delete_files": settings.MaxEqualityDeleteFiles,
 	}
 
-	if work.SelectedFiles == 0 || work.SelectedBytes < settings.MinSmallBytes {
+	// The safety route is deliberately evaluated before the normal byte-based
+	// eligibility check. A table with 5,000 delete files must go to Spark even
+	// when those files are small in total.
+	routeSpark, reason := shouldRouteCompactionToSpark(work, state, settings)
+	eligible := triggers.Any()
+	if work.SelectedDataFiles == 0 {
+		// The native planner can have no usable group even when a table has a
+		// dangerous delete-file count. Let Spark make its own plan in hybrid
+		// mode for that case; native mode remains bounded and reports a skip.
+		if eligible && routeSpark {
+			if settings.Executor == maintenanceExecutorNative {
+				result.Status = "skipped"
+				result.RoutingReason = "native safety limit reached; enable hybrid executor for Spark: " + reason
+				return nativeTaskOutcome{Result: result}
+			}
+			nativeCancel()
+			result.Engine = "spark"
+			if settings.Executor == maintenanceExecutorSpark {
+				result.RoutingReason = "executor=spark selected Spark compaction"
+			} else {
+				result.RoutingReason = reason
+			}
+			return executeSparkCompactionFallback(ctx, jobID, jobCfg, state, task, result, settings, hasDeleteWork(work, state))
+		}
 		result.Status = "skipped"
-		result.RoutingReason = "no compaction group meets minimum input thresholds"
+		result.RoutingReason = "compaction planner found no eligible data-file group"
+		return nativeTaskOutcome{Result: result}
+	}
+	if !eligible {
+		result.Status = "skipped"
+		result.RoutingReason = "active inventory has not reached a compaction trigger"
 		return nativeTaskOutcome{Result: result}
 	}
 
-	routeSpark, reason := shouldRouteCompactionToSpark(work, settings)
-	if routeSpark && settings.Executor == maintenanceExecutorHybrid {
+	if settings.Executor == maintenanceExecutorSpark {
+		nativeCancel()
+		result.Engine = "spark"
+		result.RoutingReason = "executor=spark selected Spark compaction"
+		return executeSparkCompactionFallback(ctx, jobID, jobCfg, state, task, result, settings, hasDeleteWork(work, state))
+	}
+	if routeSpark {
+		if settings.Executor == maintenanceExecutorNative {
+			result.Status = "skipped"
+			result.RoutingReason = "native safety limit reached; enable hybrid executor for Spark: " + reason
+			return nativeTaskOutcome{Result: result}
+		}
 		nativeCancel()
 		result.Engine = "spark"
 		result.RoutingReason = reason
-		return executeSparkCompactionFallback(ctx, jobID, jobCfg, state, task, result, settings)
-	}
-	if routeSpark && settings.Executor == maintenanceExecutorNative {
-		result.RoutingReason = "executor=native overrides hybrid Spark route: " + reason
+		return executeSparkCompactionFallback(ctx, jobID, jobCfg, state, task, result, settings, hasDeleteWork(work, state))
 	}
 
 	if err := tbl.Refresh(nativeCtx); err != nil {
@@ -412,7 +506,7 @@ func executeHybridCompaction(
 		return nativeTaskOutcome{Result: result, Retryable: true}
 	}
 
-	rewrittenPaths := make(map[string]struct{}, work.SelectedFiles)
+	rewrittenPaths := make(map[string]struct{}, work.SelectedDataFiles)
 	for _, group := range work.Groups {
 		for _, scanTask := range group.Tasks {
 			if scanTask.File != nil {
@@ -483,8 +577,8 @@ func executeHybridCompaction(
 func buildCompactionWorkload(plan compaction.Plan) compactionWorkload {
 	work := compactionWorkload{GroupCount: len(plan.Groups)}
 	work.Groups = make([]icetable.CompactionTaskGroup, 0, len(plan.Groups))
-	seenEq := make(map[string]struct{})
-	seenPos := make(map[string]struct{})
+	seenEq := make(map[string]int64)
+	seenPos := make(map[string]int64)
 	for _, group := range plan.Groups {
 		converted := icetable.CompactionTaskGroup{
 			PartitionKey:   group.PartitionKey,
@@ -492,39 +586,58 @@ func buildCompactionWorkload(plan compaction.Plan) compactionWorkload {
 			TotalSizeBytes: group.TotalSizeBytes,
 		}
 		work.Groups = append(work.Groups, converted)
-		work.SelectedFiles += len(group.Tasks)
+		work.SelectedDataFiles += len(group.Tasks)
 		work.SelectedBytes += group.TotalSizeBytes
 		for _, task := range group.Tasks {
 			for _, deleteFile := range task.EqualityDeleteFiles {
 				if deleteFile != nil {
-					seenEq[deleteFile.FilePath()] = struct{}{}
+					if _, seen := seenEq[deleteFile.FilePath()]; !seen {
+						seenEq[deleteFile.FilePath()] = deleteFile.FileSizeBytes()
+					}
 				}
 			}
 			for _, deleteFile := range task.DeleteFiles {
 				if deleteFile != nil {
-					seenPos[deleteFile.FilePath()] = struct{}{}
+					if _, seen := seenPos[deleteFile.FilePath()]; !seen {
+						seenPos[deleteFile.FilePath()] = deleteFile.FileSizeBytes()
+					}
 				}
 			}
 		}
 	}
 	work.EqualityDeletes = len(seenEq)
 	work.PositionDeletes = len(seenPos)
+	work.SelectedDeleteFiles = work.EqualityDeletes + work.PositionDeletes
+	work.SelectedFiles = work.SelectedDataFiles + work.SelectedDeleteFiles
+	for _, size := range seenEq {
+		work.SelectedBytes += size
+	}
+	for _, size := range seenPos {
+		work.SelectedBytes += size
+	}
 	return work
 }
 
-func shouldRouteCompactionToSpark(work compactionWorkload, settings nativeMaintenanceSettings) (bool, string) {
+func shouldRouteCompactionToSpark(work compactionWorkload, state meta.IcebergMaintenanceState, settings nativeMaintenanceSettings) (bool, string) {
+	equalityDeletes := maxInt(work.EqualityDeletes, state.ActiveEqualityDeleteFiles)
+	positionDeletes := maxInt(work.PositionDeletes, state.ActivePositionDeleteFiles)
 	switch {
-	case work.PositionDeletes > 0:
+	case positionDeletes > 0:
 		return true, "position-delete files are present during the initial native rollout"
+	case equalityDeletes > settings.MaxEqualityDeleteFiles:
+		return true, fmt.Sprintf("equality-delete files %d exceed native limit %d", equalityDeletes, settings.MaxEqualityDeleteFiles)
 	case work.SelectedBytes > settings.MaxSelectedInputBytes:
 		return true, fmt.Sprintf("selected input %d bytes exceeds native limit %d", work.SelectedBytes, settings.MaxSelectedInputBytes)
 	case work.SelectedFiles > settings.MaxSelectedFiles:
 		return true, fmt.Sprintf("selected input %d files exceeds native limit %d", work.SelectedFiles, settings.MaxSelectedFiles)
-	case work.GroupCount > 1 && work.SelectedBytes > settings.MaxSelectedInputBytes/2:
-		return true, "multiple substantial compaction groups are better isolated in Spark"
 	default:
 		return false, ""
 	}
+}
+
+func hasDeleteWork(work compactionWorkload, state meta.IcebergMaintenanceState) bool {
+	return work.EqualityDeletes > 0 || work.PositionDeletes > 0 ||
+		state.ActiveEqualityDeleteFiles > 0 || state.ActivePositionDeleteFiles > 0
 }
 
 func executeSparkCompactionFallback(
@@ -535,7 +648,19 @@ func executeSparkCompactionFallback(
 	task meta.IcebergMaintenanceTask,
 	result meta.IcebergMaintenanceResult,
 	settings nativeMaintenanceSettings,
+	deleteTriggered bool,
 ) nativeTaskOutcome {
+	minInputFiles := settings.MinSmallFiles
+	if deleteTriggered {
+		minInputFiles = 1
+	}
+	options := map[string]any{
+		"target-file-size-bytes": fmt.Sprintf("%d", settings.TargetFileSizeBytes),
+		"min-input-files":        fmt.Sprintf("%d", minInputFiles),
+	}
+	if deleteTriggered {
+		options["delete-file-threshold"] = "1"
+	}
 	request := TableMaintenanceRequest{
 		Tables:         []string{tableKey(state.Namespace, state.Table)},
 		ExternalRunKey: fmt.Sprintf("rivus-maintenance:%d", task.ID),
@@ -543,10 +668,7 @@ func executeSparkCompactionFallback(
 			Type: "rewrite_data_files",
 			Options: map[string]any{
 				"strategy": "binpack",
-				"options": map[string]any{
-					"target-file-size-bytes": fmt.Sprintf("%d", settings.TargetFileSizeBytes),
-					"min-input-files":        fmt.Sprintf("%d", settings.MinSmallFiles),
-				},
+				"options":  options,
 			},
 		}},
 	}
@@ -901,6 +1023,13 @@ func ensureSameStoragePrefix(tableLocation, path string) error {
 }
 
 func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func maxInt(a, b int) int {
 	if a > b {
 		return a
 	}

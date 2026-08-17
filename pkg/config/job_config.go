@@ -117,10 +117,18 @@ type IcebergTimestampColumnConfig struct {
 type IcebergTableMaintenanceConfig struct {
 	Enabled                             bool              `yaml:"enabled" json:"enabled"`
 	NativeEnabled                       bool              `yaml:"native_enabled" json:"native_enabled"`
+	Executor                            string            `yaml:"executor" json:"executor"`
 	NativeSignalDelaySeconds            int               `yaml:"native_signal_delay_seconds" json:"native_signal_delay_seconds"`
 	NativeIdleCheckIntervalSeconds      int               `yaml:"native_idle_check_interval_seconds" json:"native_idle_check_interval_seconds"`
 	NativeOrphanIntervalSeconds         int               `yaml:"native_orphan_interval_seconds" json:"native_orphan_interval_seconds"`
 	NativeOrphanInactiveIntervalSeconds int               `yaml:"native_orphan_inactive_interval_seconds" json:"native_orphan_inactive_interval_seconds"`
+	NativeMaxSelectedInputBytes         int64             `yaml:"native_max_selected_input_bytes" json:"native_max_selected_input_bytes"`
+	NativeMaxSelectedFiles              int               `yaml:"native_max_selected_files" json:"native_max_selected_files"`
+	NativeMaxEqualityDeleteFiles        int               `yaml:"native_max_equality_delete_files" json:"native_max_equality_delete_files"`
+	NativeTargetFileSizeBytes           int64             `yaml:"native_target_file_size_bytes" json:"native_target_file_size_bytes"`
+	NativeScanConcurrency               int               `yaml:"native_scan_concurrency" json:"native_scan_concurrency"`
+	NativeTimeoutSeconds                int               `yaml:"native_timeout_seconds" json:"native_timeout_seconds"`
+	WorkerTempDirectory                 string            `yaml:"worker_temp_directory" json:"worker_temp_directory"`
 	RunnerURI                           string            `yaml:"runner_uri" json:"runner_uri"`
 	RunnerAPIToken                      string            `yaml:"runner_api_token" json:"runner_api_token,omitempty"`
 	RunnerResourceProfile               string            `yaml:"runner_resource_profile" json:"runner_resource_profile"`

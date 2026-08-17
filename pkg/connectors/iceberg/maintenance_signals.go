@@ -158,7 +158,6 @@ func (s *nativeMaintenanceSignaler) persistSignal(ctx context.Context, signal na
 			ctx,
 			s.jobID,
 			*signal.barrierSnapshotComplete,
-			s.cfg.TableMaintenance.DataFilesThreshold,
 			s.cfg.TableMaintenance.EqualityDeleteFilesThreshold,
 			due,
 		); err != nil {
@@ -177,7 +176,6 @@ func (s *nativeMaintenanceSignaler) persistSignal(ctx context.Context, signal na
 		signal.addedDataFiles,
 		signal.addedEqualityDeletes,
 		signal.snapshotComplete,
-		s.cfg.TableMaintenance.DataFilesThreshold,
 		s.cfg.TableMaintenance.EqualityDeleteFilesThreshold,
 		due,
 		orphanDue,

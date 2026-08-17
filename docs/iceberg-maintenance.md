@@ -76,12 +76,15 @@ sink:
       runner_resource_profile: small
       catalog_name: rivus
 
-      # hybrid native-compaction boundary
+      # hybrid native-compaction boundary. A table becomes eligible after
+      # 200 active small files, 50 active equality-delete files, or 10 small
+      # files totaling 256 MiB.
       small_file_size_bytes: 67108864
       small_files_min_count: 10
       small_files_min_total_bytes: 268435456
       native_max_selected_input_bytes: 536870912
-      native_max_selected_files: 100
+      native_max_selected_files: 250
+      native_max_equality_delete_files: 100
       native_target_file_size_bytes: 134217728
       native_scan_concurrency: 1
       native_timeout_seconds: 600
@@ -106,6 +109,9 @@ sink:
 ```
 
 If `executor` is omitted while maintenance is enabled, Rivus defaults it to `hybrid` for backward compatibility.
+
+The 256 MiB value is an additional compaction trigger. It is not required once
+the active small-file count reaches 200 or equality deletes reach 50.
 
 ## Durable metadata schema
 
@@ -160,25 +166,37 @@ The existing per-job manual maintenance endpoint remains available. Manual reque
 Rivus runs the `iceberg-go` compaction planner and bases routing on selected rewrite groups rather than total table size. By default, compaction routes to Spark when any of these apply:
 
 - selected input is greater than 512 MiB;
-- more than 100 selected input files are involved;
+- more than 250 selected input files (data plus delete files) are involved;
+- more than 100 equality-delete files are involved;
 - position-delete files are present;
-- multiple substantial compaction groups make process isolation preferable.
 
-Otherwise the rewrite runs natively. Every result records the actual `engine` and `routing_reason`.
+Otherwise the rewrite runs natively. It becomes eligible when the current
+snapshot has 200 active small files, 50 active equality-delete files, or at
+least 10 small files totaling 256 MiB. Every result records the actual `engine`
+and `routing_reason`.
 
 ### `executor: native`
 
-The same planner determines the rewrite groups, but Spark routing is disabled. Even when the hybrid policy would have preferred Spark, the task stays in the native `iceberg-go` rewrite path. A native failure is retried/failed according to the normal worker retry policy; it is never silently handed to Spark.
+The same planner determines the rewrite groups, but Spark routing is disabled.
+If a workload exceeds a native safety boundary, Rivus records it as skipped
+instead of doing an unsafe native rewrite. A native failure is retried/failed
+according to the normal worker retry policy; it is never silently handed to
+Spark.
 
 ### `executor: spark`
 
-A compaction task is sent directly to the configured Spark/runner backend rather than using native analysis to choose an engine. Snapshot expiration and orphan cleanup are still performed natively by the maintenance worker.
+After the normal inventory and planner eligibility check, a compaction task is
+sent to the configured Spark/runner backend. Snapshot expiration and orphan
+cleanup are still performed natively by the maintenance worker.
 
 Native compaction uses atomic `RewriteDataFiles`, applies equality deletes while reading, and uses Iceberg dead-equality-delete cleanup before removing equality-delete files. Sort/Z-order and other Spark-specific rewrite strategies remain Spark-only.
 
 ## CDC priority and snapshot barrier
 
-CDC never pauses for maintenance. Successful Rivus commits send only snapshot/file-count signals to the durable store. Reaching data-file or equality-delete thresholds brings a table check forward.
+CDC never pauses for maintenance. Successful Rivus commits mark the table
+inventory dirty and bring its metadata scan forward. The worker uses the
+resulting *active* small-file and equality-delete counts—not raw commit
+counts—to decide whether compaction is due.
 
 Initial snapshots remain protected by a snapshot-complete barrier. Native compaction verifies its starting snapshot before staging work. Iceberg commit conflicts are retryable maintenance failures, so CDC wins concurrent writes.
 
@@ -204,6 +222,8 @@ Recommended rollout:
 ## Current limitations
 
 - Native sort/Z-order is not implemented; use Spark for those strategies.
-- Hybrid mode routes position-delete compaction to Spark. Native mode explicitly overrides that routing guard.
+- Hybrid mode routes position-delete work, more than 100 equality deletes, and
+  workloads beyond the native file/byte limits to Spark. Native mode skips
+  those workloads instead of bypassing its safety limits.
 - Heavy Spark execution keeps the existing per-table runner/Spark submission behavior.
 - Native rewrite output is committed atomically, but exact per-attempt uncommitted output paths are not exposed by the current high-level `iceberg-go` rewrite API; the seven-day orphan-cleanup safety window protects cleanup.
