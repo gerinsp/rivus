@@ -66,6 +66,28 @@ func TestNativeMaintenanceSettingsDefaults(t *testing.T) {
 	}
 }
 
+func TestNativeMaintenanceSettingsEnvOverrides(t *testing.T) {
+	t.Setenv("RIVUS_MAINTENANCE_NATIVE_MAX_SELECTED_INPUT_BYTES", "1073741824")
+	t.Setenv("RIVUS_MAINTENANCE_NATIVE_MAX_SELECTED_FILES", "300")
+	t.Setenv("RIVUS_MAINTENANCE_NATIVE_MAX_EQUALITY_DELETE_FILES", "150")
+
+	settings, err := nativeMaintenanceSettingsFromRaw(map[string]any{
+		"table_maintenance": map[string]any{"enabled": true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings.MaxSelectedInputBytes != 1073741824 {
+		t.Fatalf("max input bytes = %d, want 1073741824", settings.MaxSelectedInputBytes)
+	}
+	if settings.MaxSelectedFiles != 300 {
+		t.Fatalf("max selected files = %d, want 300", settings.MaxSelectedFiles)
+	}
+	if settings.MaxEqualityDeleteFiles != 150 {
+		t.Fatalf("max equality delete files = %d, want 150", settings.MaxEqualityDeleteFiles)
+	}
+}
+
 func TestAccumulateActiveFileInventory(t *testing.T) {
 	const megabyte = int64(1024 * 1024)
 	inventory := activeFileInventory{SnapshotID: 123}

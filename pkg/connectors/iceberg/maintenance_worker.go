@@ -852,6 +852,18 @@ func intEnv(key string, fallback int) int {
 	return value
 }
 
+func int64Env(key string, fallback int64) int64 {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value <= 0 {
+		return fallback
+	}
+	return value
+}
+
 func timePtr(t time.Time) *time.Time { return &t }
 
 func minDuration(a, b time.Duration) time.Duration {
