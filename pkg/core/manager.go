@@ -473,11 +473,12 @@ func (m *JobManager) Delete(id string) error {
 
 	// The API should not wait for a connector to drain or a metadata DB round trip.
 	// Detach first so late shutdown transitions cannot restore a deleted job record.
+	job.markPersistenceDeleted()
 	job.setStatusListener(nil)
 	job.setProgressListener(nil)
 	job.requestStop()
 	go func() {
-		if err := m.deletePersistedJob(context.Background(), id); err != nil {
+		if err := m.deletePersistedJobForJob(context.Background(), job, id); err != nil {
 			log.Printf("[job-manager] delete persisted job failed job=%s: %v", id, err)
 		}
 		if !job.waitRunDone(30 * time.Second) {
@@ -515,7 +516,7 @@ func (m *JobManager) attachStatusListener(job *Job) {
 			m.enqueueFailureNotification(job)
 		}
 		desired := m.desiredStateForJobStatus(job.Config.ID, status)
-		if err := m.saveJobRecord(context.Background(), job, desired, status); err != nil {
+		if err := m.saveManagedJobRecord(context.Background(), job, desired, status); err != nil {
 			log.Printf("[job-manager] persist job state failed job=%s status=%s: %v", job.Config.ID, status, err)
 		}
 		if snapshotStatusReleasesSlot(status) {
@@ -566,7 +567,7 @@ func (m *JobManager) Shutdown(ctx context.Context) error {
 	var persistErrs []error
 	for _, job := range jobs {
 		status := job.GetStatus()
-		if err := m.saveJobRecord(ctx, job, meta.DesiredStateRunning, status); err != nil {
+		if err := m.saveManagedJobRecord(ctx, job, meta.DesiredStateRunning, status); err != nil {
 			persistErrs = append(persistErrs, fmt.Errorf("persist restart intent job=%s: %w", job.Config.ID, err))
 		}
 
@@ -605,7 +606,7 @@ func (m *JobManager) Shutdown(ctx context.Context) error {
 
 	for _, job := range jobs {
 		status := job.GetStatus()
-		if err := m.saveJobRecord(ctx, job, meta.DesiredStateRunning, status); err != nil {
+		if err := m.saveManagedJobRecord(ctx, job, meta.DesiredStateRunning, status); err != nil {
 			persistErrs = append(persistErrs, fmt.Errorf("persist drained job=%s: %w", job.Config.ID, err))
 		}
 	}
@@ -999,6 +1000,24 @@ func (m *JobManager) saveJobRecord(ctx context.Context, job *Job, desired meta.D
 	})
 }
 
+// saveManagedJobRecord serializes persisted writes with deletion and refuses
+// to save a job after deletion has started. Without this guard, a status
+// callback already in flight can recreate a record after Delete removes it.
+func (m *JobManager) saveManagedJobRecord(ctx context.Context, job *Job, desired meta.DesiredState, status JobStatus) error {
+	if job == nil || job.Config == nil {
+		return nil
+	}
+
+	job.persistenceMu.Lock()
+	defer job.persistenceMu.Unlock()
+
+	if job.isPersistenceDeleted() {
+		return nil
+	}
+
+	return m.saveJobRecord(ctx, job, desired, status)
+}
+
 func (m *JobManager) deletePersistedJob(ctx context.Context, id string) error {
 	if m.jobStore == nil {
 		return nil
@@ -1011,6 +1030,17 @@ func (m *JobManager) deletePersistedJob(ctx context.Context, id string) error {
 		return err
 	}
 	return m.jobStore.DeleteJob(deleteCtx, id)
+}
+
+func (m *JobManager) deletePersistedJobForJob(ctx context.Context, job *Job, id string) error {
+	if job == nil {
+		return m.deletePersistedJob(ctx, id)
+	}
+
+	job.markPersistenceDeleted()
+	job.persistenceMu.Lock()
+	defer job.persistenceMu.Unlock()
+	return m.deletePersistedJob(ctx, id)
 }
 
 func desiredStateForStatus(status JobStatus) meta.DesiredState {
@@ -1067,7 +1097,7 @@ func (m *JobManager) startJob(job *Job, mode config.JobMode, removeOnStartFailur
 	if err == nil {
 		status := job.GetStatus()
 		desired := m.desiredStateForJobStatus(job.Config.ID, status)
-		if saveErr := m.saveJobRecord(context.Background(), job, desired, status); saveErr != nil {
+		if saveErr := m.saveManagedJobRecord(context.Background(), job, desired, status); saveErr != nil {
 			job.requestStop()
 			err = saveErr
 		}
@@ -1081,7 +1111,7 @@ func (m *JobManager) startJob(job *Job, mode config.JobMode, removeOnStartFailur
 		job.setStatusListener(nil)
 		job.setProgressListener(nil)
 		job.requestStop()
-		if deleteErr := m.deletePersistedJob(context.Background(), job.Config.ID); deleteErr != nil {
+		if deleteErr := m.deletePersistedJobForJob(context.Background(), job, job.Config.ID); deleteErr != nil {
 			log.Printf("[job-manager] delete failed submit record job=%s: %v", job.Config.ID, deleteErr)
 		}
 	}
@@ -1136,7 +1166,7 @@ func (m *JobManager) startQueuedSnapshotJobs() {
 		}
 		status := job.GetStatus()
 		desired := m.desiredStateForJobStatus(job.Config.ID, status)
-		if err := m.saveJobRecord(context.Background(), job, desired, status); err != nil {
+		if err := m.saveManagedJobRecord(context.Background(), job, desired, status); err != nil {
 			log.Printf("[job-manager] persist queued job start failed job=%s: %v", id, err)
 		}
 		m.mu.Lock()

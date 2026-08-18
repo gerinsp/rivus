@@ -124,8 +124,10 @@ type Job struct {
 	runDone          chan struct{}
 	pauseRequested   bool
 
-	statusListener   func(JobStatus)
-	progressListener func(*JobProgress)
+	statusListener     func(JobStatus)
+	progressListener   func(*JobProgress)
+	persistenceMu      sync.Mutex
+	persistenceDeleted bool
 
 	// runtime deps
 	registry *connector.Registry
@@ -953,6 +955,18 @@ func (j *Job) setProgressListener(listener func(*JobProgress)) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	j.progressListener = listener
+}
+
+func (j *Job) markPersistenceDeleted() {
+	j.mu.Lock()
+	j.persistenceDeleted = true
+	j.mu.Unlock()
+}
+
+func (j *Job) isPersistenceDeleted() bool {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	return j.persistenceDeleted
 }
 
 func (j *Job) failStart(component string, err error, cancel context.CancelFunc) error {

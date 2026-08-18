@@ -575,6 +575,55 @@ func TestDeleteReturnsBeforePipelineFinishesDraining(t *testing.T) {
 	}
 }
 
+func TestDeleteWinsOverInFlightJobPersistence(t *testing.T) {
+	store := newBlockingSaveJobStore()
+	manager := NewJobManager(nil, WithJobStore(store))
+	job := NewJob(newTestJobConfig("job-delete-persistence-race"), nil)
+
+	manager.mu.Lock()
+	manager.jobs[job.Config.ID] = job
+	manager.mu.Unlock()
+	manager.attachStatusListener(job)
+
+	if err := manager.saveManagedJobRecord(context.Background(), job, meta.DesiredStateRunning, JobStatusRunning); err != nil {
+		t.Fatalf("initial persistence failed: %v", err)
+	}
+
+	store.armNextSave()
+	saveDone := make(chan error, 1)
+	go func() {
+		saveDone <- manager.saveManagedJobRecord(context.Background(), job, meta.DesiredStateRunning, JobStatusRunning)
+	}()
+
+	select {
+	case <-store.saveStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for persisted write to start")
+	}
+
+	deleteDone := make(chan error, 1)
+	go func() {
+		deleteDone <- manager.Delete(job.Config.ID)
+	}()
+	select {
+	case err := <-deleteDone:
+		if err != nil {
+			t.Fatalf("Delete returned error: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Delete waited for an in-flight persisted write")
+	}
+
+	close(store.releaseSave)
+	if err := <-saveDone; err != nil {
+		t.Fatalf("in-flight persistence failed: %v", err)
+	}
+	waitForCondition(t, "job record deletion after in-flight persistence", func() bool {
+		_, ok := store.Get(job.Config.ID)
+		return !ok
+	})
+}
+
 func TestRestorePersistedFailedJobRetainsErrorHistory(t *testing.T) {
 	failedAt := time.Now().Add(-time.Minute).UTC()
 	store := newMemoryJobStore()
@@ -1032,6 +1081,48 @@ type memoryJobStore struct {
 	mu            sync.Mutex
 	jobs          map[string]meta.PersistedJob
 	notifications map[string]meta.FailureNotification
+}
+
+type blockingSaveJobStore struct {
+	*memoryJobStore
+
+	blockMu     sync.Mutex
+	blockNext   bool
+	saveStarted chan struct{}
+	releaseSave chan struct{}
+}
+
+func newBlockingSaveJobStore() *blockingSaveJobStore {
+	return &blockingSaveJobStore{
+		memoryJobStore: newMemoryJobStore(),
+		saveStarted:    make(chan struct{}),
+		releaseSave:    make(chan struct{}),
+	}
+}
+
+func (s *blockingSaveJobStore) armNextSave() {
+	s.blockMu.Lock()
+	s.blockNext = true
+	s.blockMu.Unlock()
+}
+
+func (s *blockingSaveJobStore) SaveJob(ctx context.Context, job meta.PersistedJob) error {
+	s.blockMu.Lock()
+	block := s.blockNext
+	if block {
+		s.blockNext = false
+	}
+	s.blockMu.Unlock()
+
+	if block {
+		close(s.saveStarted)
+		select {
+		case <-s.releaseSave:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return s.memoryJobStore.SaveJob(ctx, job)
 }
 
 func newMemoryJobStore() *memoryJobStore {
