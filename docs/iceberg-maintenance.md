@@ -85,6 +85,7 @@ sink:
       native_max_selected_input_bytes: 536870912
       native_max_selected_files: 250
       native_max_equality_delete_files: 100
+      position_delete_files_threshold: 25 # Spark compaction after this many active position deletes
       native_target_file_size_bytes: 134217728
       native_scan_concurrency: 1
       native_timeout_seconds: 600

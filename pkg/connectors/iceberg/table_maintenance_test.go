@@ -244,8 +244,8 @@ func TestNormalizeIcebergConfigDefaultsAutomaticMaintenancePolicy(t *testing.T) 
 		TableMaintenance: config.IcebergTableMaintenanceConfig{Enabled: true},
 	})
 	maintenance := cfg.TableMaintenance
-	if maintenance.DataFilesThreshold != 200 || maintenance.EqualityDeleteFilesThreshold != 50 {
-		t.Fatalf("file thresholds = %d/%d, want 200/50", maintenance.DataFilesThreshold, maintenance.EqualityDeleteFilesThreshold)
+	if maintenance.DataFilesThreshold != 200 || maintenance.EqualityDeleteFilesThreshold != 50 || maintenance.PositionDeleteFilesThreshold != 25 {
+		t.Fatalf("file thresholds = %d/%d/%d, want 200/50/25", maintenance.DataFilesThreshold, maintenance.EqualityDeleteFilesThreshold, maintenance.PositionDeleteFilesThreshold)
 	}
 	if maintenance.ExpireSnapshotsIntervalSeconds != 6*60*60 || maintenance.OrphanCleanupIntervalSeconds != 24*60*60 {
 		t.Fatalf("time intervals = %d/%d", maintenance.ExpireSnapshotsIntervalSeconds, maintenance.OrphanCleanupIntervalSeconds)

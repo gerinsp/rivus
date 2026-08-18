@@ -102,6 +102,9 @@ func normalizeIcebergConfig(c config.IcebergConfig) config.IcebergConfig {
 		if c.TableMaintenance.EqualityDeleteFilesThreshold == 0 {
 			c.TableMaintenance.EqualityDeleteFilesThreshold = 50
 		}
+		if c.TableMaintenance.PositionDeleteFilesThreshold == 0 {
+			c.TableMaintenance.PositionDeleteFilesThreshold = 25
+		}
 		if c.TableMaintenance.SmallFileSizeBytes == 0 {
 			c.TableMaintenance.SmallFileSizeBytes = 64 * 1024 * 1024
 		}

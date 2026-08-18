@@ -44,6 +44,7 @@ sink:
     #   catalog_name: rivus
     #   data_files_threshold: 200
     #   equality_delete_files_threshold: 50
+    #   position_delete_files_threshold: 25 # Spark only; intended for Trino snapshot replacement
     #   small_file_size_bytes: 67108864       # active files below 64 MiB
     #   small_files_min_count: 10
     #   small_files_min_total_bytes: 268435456 # additional trigger; 200 active small files or 50 equality deletes also trigger

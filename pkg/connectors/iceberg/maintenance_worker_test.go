@@ -40,8 +40,8 @@ func TestNativeMaintenanceSettingsDefaults(t *testing.T) {
 	if settings.MaxSelectedInputBytes != 512*1024*1024 {
 		t.Fatalf("unexpected native byte limit: %d", settings.MaxSelectedInputBytes)
 	}
-	if settings.DataFilesThreshold != 200 || settings.EqualityDeleteThreshold != 50 {
-		t.Fatalf("unexpected maintenance thresholds: data=%d deletes=%d", settings.DataFilesThreshold, settings.EqualityDeleteThreshold)
+	if settings.DataFilesThreshold != 200 || settings.EqualityDeleteThreshold != 50 || settings.PositionDeleteThreshold != 25 {
+		t.Fatalf("unexpected maintenance thresholds: data=%d equality=%d position=%d", settings.DataFilesThreshold, settings.EqualityDeleteThreshold, settings.PositionDeleteThreshold)
 	}
 	if settings.MaxSelectedFiles != 250 {
 		t.Fatalf("unexpected native file limit: %d", settings.MaxSelectedFiles)
@@ -242,11 +242,18 @@ func TestCompactionTriggersFor(t *testing.T) {
 			want: compactionTriggers{EqualityDelete: true},
 		},
 		{
-			name: "one active position delete triggers Spark maintenance",
+			name: "25 active position deletes trigger Spark maintenance",
 			state: meta.IcebergMaintenanceState{
-				ActivePositionDeleteFiles: 1,
+				ActivePositionDeleteFiles: 25,
 			},
 			want: compactionTriggers{PositionDelete: true},
+		},
+		{
+			name: "position deletes below threshold wait",
+			state: meta.IcebergMaintenanceState{
+				ActivePositionDeleteFiles: 24,
+			},
+			want: compactionTriggers{},
 		},
 		{
 			name: "200 active small files trigger below byte floor",
@@ -296,6 +303,7 @@ func TestDurableMaintenanceTableStateUsesSmallFileAndDeleteTriggers(t *testing.T
 	cfg := config.IcebergTableMaintenanceConfig{
 		DataFilesThreshold:           200,
 		EqualityDeleteFilesThreshold: 50,
+		PositionDeleteFilesThreshold: 25,
 		SmallFilesMinCount:           10,
 		SmallFilesMinTotalBytes:      256 * 1024 * 1024,
 	}
@@ -318,9 +326,16 @@ func TestDurableMaintenanceTableStateUsesSmallFileAndDeleteTriggers(t *testing.T
 	if got := durableMaintenanceTableState(meta.IcebergMaintenanceState{
 		SnapshotComplete:          true,
 		LastInventoryAt:           &now,
-		ActivePositionDeleteFiles: 1,
+		ActivePositionDeleteFiles: 25,
 	}, cfg); got != "ready" {
-		t.Fatalf("one position delete state=%q, want ready", got)
+		t.Fatalf("25 position deletes state=%q, want ready", got)
+	}
+	if got := durableMaintenanceTableState(meta.IcebergMaintenanceState{
+		SnapshotComplete:          true,
+		LastInventoryAt:           &now,
+		ActivePositionDeleteFiles: 24,
+	}, cfg); got != "healthy" {
+		t.Fatalf("24 position deletes state=%q, want healthy", got)
 	}
 }
 

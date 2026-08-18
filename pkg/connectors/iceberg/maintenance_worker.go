@@ -499,6 +499,7 @@ func nativeMaintenanceSettingsFromRaw(sinkCfg any) (nativeMaintenanceSettings, e
 	settings.Executor = normalizeMaintenanceExecutor(rawString(maintenance, "executor", maintenanceExecutorHybrid))
 	settings.DataFilesThreshold = rawInt(maintenance, "data_files_threshold", settings.DataFilesThreshold)
 	settings.EqualityDeleteThreshold = rawInt(maintenance, "equality_delete_files_threshold", settings.EqualityDeleteThreshold)
+	settings.PositionDeleteThreshold = rawInt(maintenance, "position_delete_files_threshold", settings.PositionDeleteThreshold)
 	settings.MaxSelectedInputBytes = rawInt64(maintenance, "native_max_selected_input_bytes", settings.MaxSelectedInputBytes)
 	settings.MaxSelectedFiles = rawInt(maintenance, "native_max_selected_files", settings.MaxSelectedFiles)
 	settings.MaxEqualityDeleteFiles = rawInt(maintenance, "native_max_equality_delete_files", settings.MaxEqualityDeleteFiles)
@@ -528,6 +529,8 @@ func nativeMaintenanceSettingsFromRaw(sinkCfg any) (nativeMaintenanceSettings, e
 		return settings, fmt.Errorf("data_files_threshold must be > 0")
 	case settings.EqualityDeleteThreshold <= 0:
 		return settings, fmt.Errorf("equality_delete_files_threshold must be > 0")
+	case settings.PositionDeleteThreshold <= 0:
+		return settings, fmt.Errorf("position_delete_files_threshold must be > 0")
 	case settings.MaxSelectedInputBytes <= 0:
 		return settings, fmt.Errorf("native_max_selected_input_bytes must be > 0")
 	case settings.MaxSelectedFiles <= 0:

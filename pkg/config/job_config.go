@@ -149,6 +149,7 @@ type IcebergTableMaintenanceConfig struct {
 	MaxConcurrentJobs                   int               `yaml:"max_concurrent_jobs" json:"max_concurrent_jobs"`
 	DataFilesThreshold                  int               `yaml:"data_files_threshold" json:"data_files_threshold"`
 	EqualityDeleteFilesThreshold        int               `yaml:"equality_delete_files_threshold" json:"equality_delete_files_threshold"`
+	PositionDeleteFilesThreshold        int               `yaml:"position_delete_files_threshold" json:"position_delete_files_threshold"`
 	SmallFileSizeBytes                  int64             `yaml:"small_file_size_bytes" json:"small_file_size_bytes"`
 	SmallFilesMinCount                  int               `yaml:"small_files_min_count" json:"small_files_min_count"`
 	SmallFilesMinTotalBytes             int64             `yaml:"small_files_min_total_bytes" json:"small_files_min_total_bytes"`

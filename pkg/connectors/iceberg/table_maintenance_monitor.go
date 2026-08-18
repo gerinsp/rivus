@@ -121,6 +121,7 @@ func (m *tableMaintenanceMonitor) setStatusReporter(reporter connector.TableMain
 		MaxConcurrentJobs:            1,
 		DataFilesThreshold:           m.cfg.TableMaintenance.DataFilesThreshold,
 		EqualityDeleteFilesThreshold: m.cfg.TableMaintenance.EqualityDeleteFilesThreshold,
+		PositionDeleteFilesThreshold: m.cfg.TableMaintenance.PositionDeleteFilesThreshold,
 		SmallFileSizeBytes:           m.cfg.TableMaintenance.SmallFileSizeBytes,
 		SmallFilesMinCount:           m.cfg.TableMaintenance.SmallFilesMinCount,
 		SmallFilesMinTotalBytes:      m.cfg.TableMaintenance.SmallFilesMinTotalBytes,
@@ -204,6 +205,7 @@ func (m *tableMaintenanceMonitor) publishDurableStatus(parent context.Context, s
 		MaxConcurrentJobs:            1,
 		DataFilesThreshold:           m.cfg.TableMaintenance.DataFilesThreshold,
 		EqualityDeleteFilesThreshold: m.cfg.TableMaintenance.EqualityDeleteFilesThreshold,
+		PositionDeleteFilesThreshold: m.cfg.TableMaintenance.PositionDeleteFilesThreshold,
 		SmallFileSizeBytes:           m.cfg.TableMaintenance.SmallFileSizeBytes,
 		SmallFilesMinCount:           m.cfg.TableMaintenance.SmallFilesMinCount,
 		SmallFilesMinTotalBytes:      m.cfg.TableMaintenance.SmallFilesMinTotalBytes,
@@ -320,7 +322,8 @@ func durableMaintenanceTableState(state meta.IcebergMaintenanceState, cfg config
 	dataReady := cfg.DataFilesThreshold > 0 && state.ActiveSmallFiles >= cfg.DataFilesThreshold
 	deleteReady := cfg.EqualityDeleteFilesThreshold > 0 &&
 		state.ActiveEqualityDeleteFiles >= cfg.EqualityDeleteFilesThreshold
-	positionDeleteReady := state.ActivePositionDeleteFiles > 0
+	positionDeleteReady := cfg.PositionDeleteFilesThreshold > 0 &&
+		state.ActivePositionDeleteFiles >= cfg.PositionDeleteFilesThreshold
 	smallBytesReady := cfg.SmallFilesMinCount > 0 && cfg.SmallFilesMinTotalBytes > 0 &&
 		state.ActiveSmallFiles >= cfg.SmallFilesMinCount && state.ActiveSmallBytes >= cfg.SmallFilesMinTotalBytes
 	if dataReady || deleteReady || positionDeleteReady || smallBytesReady {
@@ -407,6 +410,7 @@ func (m *tableMaintenanceMonitor) statusLocked(now time.Time) *connector.TableMa
 		MaxConcurrentJobs:            m.cfg.TableMaintenance.MaxConcurrentJobs,
 		DataFilesThreshold:           m.cfg.TableMaintenance.DataFilesThreshold,
 		EqualityDeleteFilesThreshold: m.cfg.TableMaintenance.EqualityDeleteFilesThreshold,
+		PositionDeleteFilesThreshold: m.cfg.TableMaintenance.PositionDeleteFilesThreshold,
 		SmallFileSizeBytes:           m.cfg.TableMaintenance.SmallFileSizeBytes,
 		SmallFilesMinCount:           m.cfg.TableMaintenance.SmallFilesMinCount,
 		SmallFilesMinTotalBytes:      m.cfg.TableMaintenance.SmallFilesMinTotalBytes,

@@ -69,6 +69,7 @@ type TableMaintenanceStatus struct {
 	MaxConcurrentJobs            int                           `json:"max_concurrent_jobs,omitempty"`
 	DataFilesThreshold           int                           `json:"data_files_threshold,omitempty"`
 	EqualityDeleteFilesThreshold int                           `json:"equality_delete_files_threshold,omitempty"`
+	PositionDeleteFilesThreshold int                           `json:"position_delete_files_threshold,omitempty"`
 	SmallFileSizeBytes           int64                         `json:"small_file_size_bytes,omitempty"`
 	SmallFilesMinCount           int                           `json:"small_files_min_count,omitempty"`
 	SmallFilesMinTotalBytes      int64                         `json:"small_files_min_total_bytes,omitempty"`

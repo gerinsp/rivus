@@ -34,6 +34,7 @@ const (
 	defaultNativeMinSmallBytes          = int64(256 * 1024 * 1024)
 	defaultDataFilesThreshold           = 200
 	defaultEqualityDeleteFilesThreshold = 50
+	defaultPositionDeleteFilesThreshold = 25
 	defaultNativeTimeout                = 10 * time.Minute
 	defaultNativeOrphanAge              = 7 * 24 * time.Hour
 	defaultNativeOrphanInactiveInterval = 90 * 24 * time.Hour
@@ -45,6 +46,7 @@ type nativeMaintenanceSettings struct {
 	Executor                string
 	DataFilesThreshold      int
 	EqualityDeleteThreshold int
+	PositionDeleteThreshold int
 	MaxSelectedInputBytes   int64
 	MaxSelectedFiles        int
 	MaxEqualityDeleteFiles  int
@@ -112,6 +114,7 @@ func defaultNativeMaintenanceSettings() nativeMaintenanceSettings {
 		Executor:                maintenanceExecutorHybrid,
 		DataFilesThreshold:      intEnv("RIVUS_MAINTENANCE_DATA_FILES_THRESHOLD", defaultDataFilesThreshold),
 		EqualityDeleteThreshold: intEnv("RIVUS_MAINTENANCE_EQUALITY_DELETE_FILES_THRESHOLD", defaultEqualityDeleteFilesThreshold),
+		PositionDeleteThreshold: intEnv("RIVUS_MAINTENANCE_POSITION_DELETE_FILES_THRESHOLD", defaultPositionDeleteFilesThreshold),
 		MaxSelectedInputBytes:   int64Env("RIVUS_MAINTENANCE_NATIVE_MAX_SELECTED_INPUT_BYTES", defaultNativeMaxInputBytes),
 		MaxSelectedFiles:        intEnv("RIVUS_MAINTENANCE_NATIVE_MAX_SELECTED_FILES", defaultNativeMaxInputFiles),
 		MaxEqualityDeleteFiles:  intEnv("RIVUS_MAINTENANCE_NATIVE_MAX_EQUALITY_DELETE_FILES", defaultNativeMaxEqualityDeleteFiles),
@@ -350,10 +353,11 @@ func compactionTriggersFor(state meta.IcebergMaintenanceState, settings nativeMa
 		SmallFileBytes: settings.MinSmallFiles > 0 && settings.MinSmallBytes > 0 &&
 			state.ActiveSmallFiles >= settings.MinSmallFiles && state.ActiveSmallBytes >= settings.MinSmallBytes,
 		EqualityDelete: settings.EqualityDeleteThreshold > 0 && state.ActiveEqualityDeleteFiles >= settings.EqualityDeleteThreshold,
-		// Position deletes are always delegated to Spark while native rewrite
-		// support is intentionally conservative. Do not wait for 50 files: even
-		// one active position-delete file should make the table eligible.
-		PositionDelete: state.ActivePositionDeleteFiles > 0,
+		// Trino snapshot replacement intentionally leaves a small number of
+		// position-delete files while it replaces the recent history window.
+		// They are handled by Spark after the per-table threshold is reached,
+		// rather than causing one Spark job for every initial snapshot.
+		PositionDelete: settings.PositionDeleteThreshold > 0 && state.ActivePositionDeleteFiles >= settings.PositionDeleteThreshold,
 	}
 }
 
