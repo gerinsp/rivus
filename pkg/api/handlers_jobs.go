@@ -23,6 +23,11 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
+		if err := s.jobManager.RefreshPersistedViews(r.Context()); err != nil {
+			// The local view remains useful if the durable store is temporarily
+			// unavailable; do not turn a dashboard refresh into a hard failure.
+			fmt.Printf("[api] refresh persisted job views failed: %v\n", err)
+		}
 		jobs := s.jobManager.List()
 		writeJSON(w, http.StatusOK, jobs)
 	case http.MethodPost:
@@ -207,6 +212,9 @@ func (s *Server) handleJobByID(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.Method == http.MethodGet {
+		if err := s.jobManager.RefreshPersistedViews(r.Context()); err != nil {
+			fmt.Printf("[api] refresh persisted job view failed job=%s: %v\n", id, err)
+		}
 		job, err := s.jobManager.Get(id)
 		if err != nil {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "job not found"})

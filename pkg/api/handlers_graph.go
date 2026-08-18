@@ -8,6 +8,7 @@ import (
 
 func (s *Server) handleGetJobGraph(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("id")
+	_ = s.jobManager.RefreshPersistedViews(r.Context())
 
 	job, err := s.jobManager.Get(jobID)
 	if err != nil {

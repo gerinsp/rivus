@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -23,6 +24,7 @@ var (
 	ErrJobStillStopping       = errors.New("job pipeline is still stopping")
 	ErrJobPauseNotAllowed     = errors.New("job pause not allowed")
 	ErrJobManagerShuttingDown = errors.New("job manager is shutting down")
+	ErrJobWorkerLeaseLost     = errors.New("job worker lease is no longer owned")
 )
 
 const defaultMaxConcurrentSnapshotJobs = 2
@@ -88,6 +90,8 @@ type JobManager struct {
 	workerLeaseDuration time.Duration
 	executionRoles      map[string]meta.JobExecutionRole
 	workerLeases        map[string]struct{}
+	progressPersistMu   sync.Mutex
+	lastProgressPersist map[string]time.Time
 
 	maxConcurrentSnapshotJobs int
 	snapshotQueue             []string
@@ -198,6 +202,7 @@ func NewJobManager(reg *connector.Registry, opts ...JobManagerOption) *JobManage
 		workerLeaseDuration:       defaultWorkerLeaseDuration,
 		executionRoles:            make(map[string]meta.JobExecutionRole),
 		workerLeases:              make(map[string]struct{}),
+		lastProgressPersist:       make(map[string]time.Time),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -461,6 +466,32 @@ func (m *JobManager) List() []JobInfo {
 	return out
 }
 
+// RefreshPersistedViews lets the API process display progress written by the
+// other split worker. Active local jobs keep their in-memory progress, which
+// is newer than the durable copy.
+func (m *JobManager) RefreshPersistedViews(ctx context.Context) error {
+	if m.jobStore == nil || m.workerRole == WorkerRoleAll {
+		return nil
+	}
+	if err := m.ensureJobStoreReady(ctx); err != nil {
+		return err
+	}
+	records, err := m.jobStore.LoadJobs(ctx)
+	if err != nil {
+		return err
+	}
+	for _, record := range records {
+		m.mu.RLock()
+		job := m.jobs[record.ID]
+		m.mu.RUnlock()
+		if job == nil || job.runActive() {
+			continue
+		}
+		m.restoreJobSnapshot(job, record, false)
+	}
+	return nil
+}
+
 func sinkTypeFromConfig(cfg *config.JobConfig) string {
 	if cfg == nil {
 		return ""
@@ -629,7 +660,7 @@ func (m *JobManager) attachStatusListener(job *Job) {
 			persistedStatus = JobStatusStopped
 			log.Printf("[job-manager] snapshot handoff ready job=%s next_role=streaming", job.Config.ID)
 		}
-		if err := m.saveManagedJobRecord(context.Background(), job, desired, persistedStatus); err != nil {
+		if err := m.saveManagedJobRecord(context.Background(), job, desired, persistedStatus); err != nil && !errors.Is(err, ErrJobWorkerLeaseLost) {
 			log.Printf("[job-manager] persist job state failed job=%s status=%s: %v", job.Config.ID, status, err)
 		}
 		if m.workerRole != WorkerRoleAll && snapshotStatusReleasesSlot(status) {
@@ -640,11 +671,40 @@ func (m *JobManager) attachStatusListener(job *Job) {
 		}
 	})
 	job.setProgressListener(func(progress *JobProgress) {
+		m.persistSnapshotProgress(job)
 		if snapshotProgressReleasesSlot(progress) {
 			m.startQueuedSnapshotJobsAsync()
 		}
 		m.maybeNotifyJobHealth(job, progress)
 	})
+}
+
+// Snapshot and streaming workers run in separate containers. Persist a
+// throttled snapshot view so the API/UI container can show the actual table,
+// phase, and row count while the snapshot is running elsewhere.
+func (m *JobManager) persistSnapshotProgress(job *Job) {
+	if m.workerRole != WorkerRoleSnapshot || job == nil || job.Config == nil || job.isPersistenceDeleted() {
+		return
+	}
+
+	now := time.Now()
+	m.progressPersistMu.Lock()
+	last := m.lastProgressPersist[job.Config.ID]
+	if !last.IsZero() && now.Sub(last) < time.Second {
+		m.progressPersistMu.Unlock()
+		return
+	}
+	m.lastProgressPersist[job.Config.ID] = now
+	m.progressPersistMu.Unlock()
+
+	go func(id string) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		status := job.GetStatus()
+		if err := m.saveManagedJobRecord(ctx, job, m.desiredStateForJobStatus(id, status), status); err != nil && !errors.Is(err, ErrJobWorkerLeaseLost) {
+			log.Printf("[job-manager] persist snapshot progress failed job=%s: %v", id, err)
+		}
+	}(job.Config.ID)
 }
 
 // Shutdown drains active jobs to their latest committed checkpoint while
@@ -1035,6 +1095,12 @@ func (m *JobManager) restoreJobSnapshot(job *Job, record meta.PersistedJob, resu
 		updated = created
 	}
 	status := parsePersistedStatus(record.LastStatus)
+	var progress *JobProgress
+	if len(record.ProgressJSON) > 0 {
+		if err := json.Unmarshal(record.ProgressJSON, &progress); err != nil {
+			log.Printf("[job-manager] ignore invalid persisted progress job=%s: %v", record.ID, err)
+		}
+	}
 	if resumeOnBoot {
 		switch status {
 		case JobStatusCreated, JobStatusQueued, JobStatusPending, JobStatusRunning, JobStatusPausing:
@@ -1046,6 +1112,7 @@ func (m *JobManager) restoreJobSnapshot(job *Job, record meta.PersistedJob, resu
 	job.Created = created
 	job.Updated = updated
 	job.status = status
+	job.progress = progress
 	job.errors = make([]JobError, len(record.Errors))
 	for i, persistedErr := range record.Errors {
 		job.errors[i] = JobError{
@@ -1088,6 +1155,15 @@ func (m *JobManager) saveJobRecord(ctx context.Context, job *Job, desired meta.D
 	}
 	created := job.Created
 	updated := job.Updated
+	var progressJSON []byte
+	if job.progress != nil {
+		var err error
+		progressJSON, err = json.Marshal(job.progress)
+		if err != nil {
+			job.mu.RUnlock()
+			return fmt.Errorf("encode job progress: %w", err)
+		}
+	}
 	errorHistory := make([]meta.PersistedJobError, len(job.errors))
 	for i, jobErr := range job.errors {
 		errorHistory[i] = meta.PersistedJobError{
@@ -1109,7 +1185,7 @@ func (m *JobManager) saveJobRecord(ctx context.Context, job *Job, desired meta.D
 		return err
 	}
 
-	return m.jobStore.SaveJob(saveCtx, meta.PersistedJob{
+	record := meta.PersistedJob{
 		ID:            cfg.ID,
 		Name:          name,
 		Config:        m.normalizeConfig(cfg),
@@ -1117,9 +1193,37 @@ func (m *JobManager) saveJobRecord(ctx context.Context, job *Job, desired meta.D
 		ExecutionRole: m.executionRoleForJob(cfg.ID),
 		LastStatus:    string(status),
 		Errors:        errorHistory,
+		ProgressJSON:  progressJSON,
 		CreatedAt:     created,
 		UpdatedAt:     updated,
-	})
+	}
+	if owner := m.claimedWorkerLeaseOwner(cfg.ID); owner != "" {
+		if claimedStore, ok := m.jobStore.(meta.ClaimedJobStore); ok {
+			saved, err := claimedStore.SaveClaimedJob(saveCtx, record, owner)
+			if err != nil {
+				return err
+			}
+			if !saved {
+				return ErrJobWorkerLeaseLost
+			}
+			return nil
+		}
+	}
+	return m.jobStore.SaveJob(saveCtx, record)
+}
+
+func (m *JobManager) claimedWorkerLeaseOwner(jobID string) string {
+	if m.workerRole == WorkerRoleAll || strings.TrimSpace(jobID) == "" {
+		return ""
+	}
+	m.mu.RLock()
+	_, claimed := m.workerLeases[jobID]
+	owner := m.workerID
+	m.mu.RUnlock()
+	if !claimed {
+		return ""
+	}
+	return owner
 }
 
 // saveManagedJobRecord serializes persisted writes with deletion and refuses
@@ -1370,7 +1474,21 @@ func (m *JobManager) startClaimedWorkerJob(record meta.PersistedJob) error {
 
 	mode := config.JobModeResume
 	if m.workerRole == WorkerRoleSnapshot {
-		firstAttempt := strings.EqualFold(record.LastStatus, string(JobStatusCreated)) || strings.EqualFold(record.LastStatus, string(JobStatusQueued))
+		firstAttempt := snapshotFirstAttempt(record.LastStatus, true)
+		// A job can be paused while it is waiting in the snapshot queue, before
+		// MySQL has written its first snapshot checkpoint. In that case PAUSED
+		// must not turn an initial job into a resume attempt: there is nothing to
+		// resume yet, and the source correctly rejects it. Treat it as a fresh
+		// initial snapshot instead.
+		if !firstAttempt && normalizeMode(cfg.Mode) == config.JobModeInitial {
+			checkpointExists, err := m.snapshotCheckpointExists(job)
+			if err != nil {
+				log.Printf("[job-manager] snapshot checkpoint inspection skipped job=%s: %v", cfg.ID, err)
+			} else if !checkpointExists {
+				firstAttempt = snapshotFirstAttempt(record.LastStatus, false)
+				log.Printf("[job-manager] starting initial snapshot without checkpoint job=%s previous_status=%s", cfg.ID, record.LastStatus)
+			}
+		}
 		if normalizeMode(cfg.Mode) == config.JobModeInitial {
 			mode = config.JobModeSnapshotHandoffResume
 			if firstAttempt {
@@ -1394,6 +1512,12 @@ func (m *JobManager) startClaimedWorkerJob(record meta.PersistedJob) error {
 		return nil
 	}
 	return m.startJob(job, mode, false)
+}
+
+func snapshotFirstAttempt(lastStatus string, checkpointExists bool) bool {
+	return strings.EqualFold(lastStatus, string(JobStatusCreated)) ||
+		strings.EqualFold(lastStatus, string(JobStatusQueued)) ||
+		!checkpointExists
 }
 
 func (m *JobManager) releaseWorkerLease(jobID string) {
@@ -1581,6 +1705,56 @@ func (m *JobManager) resumeCanBypassSnapshotGate(job *Job) bool {
 		return false
 	}
 	return off != nil && strings.TrimSpace(off.BinlogFile) != "" && off.BinlogPos > 0
+}
+
+// snapshotCheckpointExists reports whether an initial job has any durable
+// checkpoint that can safely be resumed. A PAUSED durable job without one is
+// a queued/cancelled first attempt, not an interrupted snapshot.
+func (m *JobManager) snapshotCheckpointExists(job *Job) (bool, error) {
+	if job == nil || job.Config == nil {
+		return false, errors.New("job config is unavailable")
+	}
+
+	dsn := strings.TrimSpace(job.Config.Meta.MySQLDSN)
+	if dsn == "" {
+		return false, errors.New("meta MySQL DSN is unavailable")
+	}
+
+	srcType, srcCfg := job.pickSource()
+	sinkType, sinkCfg := job.pickSink()
+	metaKey := buildMetaKey(job.Config.ID, string(normalizeMode(job.Config.Mode)), srcType, srcCfg, sinkType, sinkCfg)
+
+	store, err := meta.NewMySQLOffsetStore(dsn)
+	if err != nil {
+		return false, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := store.Init(ctx); err != nil {
+		return false, err
+	}
+
+	state, err := store.GetSnapshotState(ctx, metaKey)
+	if err != nil {
+		return false, err
+	}
+	if state != nil {
+		return true, nil
+	}
+
+	progress, err := store.GetSnapshotProgress(ctx, metaKey)
+	if err != nil {
+		return false, err
+	}
+	if progress != nil {
+		return true, nil
+	}
+
+	offset, err := store.GetOffset(ctx, metaKey)
+	if err != nil {
+		return false, err
+	}
+	return offset != nil && strings.TrimSpace(offset.BinlogFile) != "" && offset.BinlogPos > 0, nil
 }
 
 func (m *JobManager) hasSnapshotSlotLocked() bool {

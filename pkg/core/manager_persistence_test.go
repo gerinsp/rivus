@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -79,6 +80,96 @@ func TestRestorePersistedJobsLoadsStoppedAndResumesRunning(t *testing.T) {
 
 	if err := manager.Cancel("job-running"); err != nil {
 		t.Fatalf("Cancel returned error: %v", err)
+	}
+}
+
+func TestSnapshotFirstAttemptWithoutCheckpoint(t *testing.T) {
+	tests := []struct {
+		name             string
+		lastStatus       string
+		checkpointExists bool
+		want             bool
+	}{
+		{name: "new job", lastStatus: string(JobStatusCreated), checkpointExists: false, want: true},
+		{name: "queued job", lastStatus: string(JobStatusQueued), checkpointExists: false, want: true},
+		{name: "paused before first checkpoint", lastStatus: string(JobStatusPaused), checkpointExists: false, want: true},
+		{name: "paused interrupted snapshot", lastStatus: string(JobStatusPaused), checkpointExists: true, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := snapshotFirstAttempt(tt.lastStatus, tt.checkpointExists); got != tt.want {
+				t.Fatalf("snapshotFirstAttempt(%q, %t) = %t, want %t", tt.lastStatus, tt.checkpointExists, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRestoreJobSnapshotRestoresPersistedProgress(t *testing.T) {
+	progressJSON, err := json.Marshal(&JobProgress{
+		Phase:            "snapshot",
+		Summary:          "Reading source table",
+		CurrentTable:     "scraping_operator.schedule_scraping",
+		CompletedTables:  2,
+		TotalTables:      7,
+		CurrentTableRows: 12345,
+	})
+	if err != nil {
+		t.Fatalf("marshal progress: %v", err)
+	}
+
+	reg, _ := newTestRegistry()
+	manager := NewJobManager(reg)
+	job := NewJob(newTestJobConfig("persisted-progress"), manager.reg)
+	manager.restoreJobSnapshot(job, meta.PersistedJob{
+		ID:           job.Config.ID,
+		LastStatus:   string(JobStatusRunning),
+		ProgressJSON: progressJSON,
+	}, false)
+
+	got := job.Progress()
+	if got == nil || got.CurrentTable != "scraping_operator.schedule_scraping" || got.CurrentTableRows != 12345 || got.CompletedTables != 2 || got.TotalTables != 7 {
+		t.Fatalf("restored progress = %#v, want persisted snapshot progress", got)
+	}
+}
+
+func TestRefreshPersistedViewsReadsRemoteSnapshotProgress(t *testing.T) {
+	store := newMemoryJobStore()
+	reg, _ := newTestRegistry()
+	manager := NewJobManager(reg, WithJobStore(store), WithWorkerRole(WorkerRoleStreaming), WithWorkerID("api"))
+	job := NewJob(newTestJobConfig("remote-snapshot-progress"), reg)
+	manager.mu.Lock()
+	manager.jobs[job.Config.ID] = job
+	manager.mu.Unlock()
+
+	progressJSON, err := json.Marshal(&JobProgress{
+		Phase:            "snapshot",
+		CurrentTable:     "scraping_operator.schedule_scraping",
+		CompletedTables:  3,
+		TotalTables:      7,
+		CurrentTableRows: 45678,
+	})
+	if err != nil {
+		t.Fatalf("marshal progress: %v", err)
+	}
+	if err := store.SaveJob(context.Background(), meta.PersistedJob{
+		ID:            job.Config.ID,
+		Name:          job.Config.Name,
+		Config:        job.Config,
+		DesiredState:  meta.DesiredStateRunning,
+		ExecutionRole: meta.JobExecutionRoleSnapshot,
+		LastStatus:    string(JobStatusRunning),
+		ProgressJSON:  progressJSON,
+	}); err != nil {
+		t.Fatalf("save remote snapshot view: %v", err)
+	}
+
+	if err := manager.RefreshPersistedViews(context.Background()); err != nil {
+		t.Fatalf("RefreshPersistedViews returned error: %v", err)
+	}
+	got := job.Progress()
+	if got == nil || got.CurrentTable != "scraping_operator.schedule_scraping" || got.CompletedTables != 3 || got.CurrentTableRows != 45678 {
+		t.Fatalf("refreshed progress = %#v, want remote snapshot progress", got)
 	}
 }
 
@@ -820,6 +911,47 @@ func TestDeleteWinsOverInFlightJobPersistence(t *testing.T) {
 	})
 }
 
+func TestClaimedWorkerCannotRecreateDeletedJob(t *testing.T) {
+	store := newMemoryJobStore()
+	reg, _ := newTestRegistry()
+	manager := NewJobManager(
+		reg,
+		WithJobStore(store),
+		WithWorkerRole(WorkerRoleSnapshot),
+		WithWorkerID("snapshot-delete-race"),
+	)
+	job := NewJob(newTestJobConfig("claimed-worker-delete"), reg)
+
+	if err := store.SaveJob(context.Background(), meta.PersistedJob{
+		ID:            job.Config.ID,
+		Name:          job.Config.Name,
+		Config:        job.Config,
+		DesiredState:  meta.DesiredStateRunning,
+		ExecutionRole: meta.JobExecutionRoleSnapshot,
+		LastStatus:    string(JobStatusRunning),
+	}); err != nil {
+		t.Fatalf("seed job record: %v", err)
+	}
+	if _, err := store.ClaimJobs(context.Background(), meta.JobExecutionRoleSnapshot, "snapshot-delete-race", 1, time.Minute); err != nil {
+		t.Fatalf("claim job: %v", err)
+	}
+
+	manager.mu.Lock()
+	manager.workerLeases[job.Config.ID] = struct{}{}
+	manager.executionRoles[job.Config.ID] = meta.JobExecutionRoleSnapshot
+	manager.mu.Unlock()
+
+	if err := store.DeleteJob(context.Background(), job.Config.ID); err != nil {
+		t.Fatalf("delete job: %v", err)
+	}
+	if err := manager.saveManagedJobRecord(context.Background(), job, meta.DesiredStateRunning, JobStatusDone); !errors.Is(err, ErrJobWorkerLeaseLost) {
+		t.Fatalf("claimed write after deletion = %v, want ErrJobWorkerLeaseLost", err)
+	}
+	if _, ok := store.Get(job.Config.ID); ok {
+		t.Fatal("late snapshot worker write recreated the deleted job")
+	}
+}
+
 func TestRestorePersistedFailedJobRetainsErrorHistory(t *testing.T) {
 	failedAt := time.Now().Add(-time.Minute).UTC()
 	store := newMemoryJobStore()
@@ -1354,6 +1486,28 @@ func (s *memoryJobStore) SaveJob(_ context.Context, job meta.PersistedJob) error
 	}
 	s.jobs[job.ID] = record
 	return nil
+}
+
+func (s *memoryJobStore) SaveClaimedJob(_ context.Context, job meta.PersistedJob, owner string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	existing, ok := s.jobs[job.ID]
+	if !ok || existing.LeaseOwner != owner || !existing.LeaseUntil.After(time.Now()) {
+		return false, nil
+	}
+	record := job
+	record.Config = cloneTestJobConfig(job.Config)
+	record.LeaseOwner = existing.LeaseOwner
+	record.LeaseUntil = existing.LeaseUntil
+	if record.CreatedAt.IsZero() {
+		record.CreatedAt = existing.CreatedAt
+	}
+	if record.UpdatedAt.IsZero() {
+		record.UpdatedAt = time.Now()
+	}
+	s.jobs[job.ID] = record
+	return true, nil
 }
 
 func (s *memoryJobStore) ClaimJobs(_ context.Context, role meta.JobExecutionRole, owner string, limit int, leaseDuration time.Duration) ([]meta.PersistedJob, error) {
