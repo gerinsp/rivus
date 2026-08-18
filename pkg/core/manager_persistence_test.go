@@ -911,6 +911,59 @@ func TestDeleteWinsOverInFlightJobPersistence(t *testing.T) {
 	})
 }
 
+func TestSubmitWithDeletedJobIDWaitsForDeletionToFinish(t *testing.T) {
+	store := newBlockingSaveJobStore()
+	manager := NewJobManager(nil, WithJobStore(store), WithWorkerRole(WorkerRoleStreaming))
+	job := NewJob(newTestJobConfig("job-delete-submit-race"), nil)
+
+	manager.mu.Lock()
+	manager.jobs[job.Config.ID] = job
+	manager.executionRoles[job.Config.ID] = meta.JobExecutionRoleSnapshot
+	manager.mu.Unlock()
+	manager.attachStatusListener(job)
+
+	if err := manager.saveManagedJobRecord(context.Background(), job, meta.DesiredStateRunning, JobStatusRunning); err != nil {
+		t.Fatalf("initial persistence failed: %v", err)
+	}
+
+	store.armNextSave()
+	saveDone := make(chan error, 1)
+	go func() {
+		saveDone <- manager.saveManagedJobRecord(context.Background(), job, meta.DesiredStateRunning, JobStatusRunning)
+	}()
+	select {
+	case <-store.saveStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for persisted write to start")
+	}
+
+	if err := manager.Delete(job.Config.ID); err != nil {
+		t.Fatalf("Delete returned error: %v", err)
+	}
+	if _, err := manager.Submit(newTestJobConfig(job.Config.ID)); !errors.Is(err, ErrJobDeleting) {
+		t.Fatalf("Submit during deletion error = %v, want ErrJobDeleting", err)
+	}
+
+	close(store.releaseSave)
+	if err := <-saveDone; err != nil {
+		t.Fatalf("in-flight persistence failed: %v", err)
+	}
+	waitForCondition(t, "job deletion finalization", func() bool {
+		manager.mu.RLock()
+		_, deleting := manager.deletingJobs[job.Config.ID]
+		manager.mu.RUnlock()
+		return !deleting
+	})
+
+	resubmitted, err := manager.Submit(newTestJobConfig(job.Config.ID))
+	if err != nil {
+		t.Fatalf("Submit after deletion finalization returned error: %v", err)
+	}
+	if got := resubmitted.GetStatus(); got != JobStatusQueued {
+		t.Fatalf("resubmitted job status = %s, want %s", got, JobStatusQueued)
+	}
+}
+
 func TestClaimedWorkerCannotRecreateDeletedJob(t *testing.T) {
 	store := newMemoryJobStore()
 	reg, _ := newTestRegistry()

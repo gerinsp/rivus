@@ -80,6 +80,12 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request) {
 				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 				return
 			}
+			if errors.Is(err, core.ErrJobDeleting) {
+				writeJSON(w, http.StatusConflict, map[string]string{
+					"error": "the previous job with this id is still being deleted; retry in a moment",
+				})
+				return
+			}
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}

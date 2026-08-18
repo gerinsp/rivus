@@ -25,6 +25,7 @@ var (
 	ErrJobPauseNotAllowed     = errors.New("job pause not allowed")
 	ErrJobManagerShuttingDown = errors.New("job manager is shutting down")
 	ErrJobWorkerLeaseLost     = errors.New("job worker lease is no longer owned")
+	ErrJobDeleting            = errors.New("job deletion is still being finalized")
 )
 
 const defaultMaxConcurrentSnapshotJobs = 2
@@ -65,6 +66,7 @@ type JobManager struct {
 	lifecycleMu     sync.RWMutex
 	mu              sync.RWMutex
 	jobs            map[string]*Job
+	deletingJobs    map[string]struct{}
 	reg             *connector.Registry
 	failureNotifier jobFailureNotifier
 	healthNotifier  jobHealthNotifier
@@ -182,6 +184,7 @@ func NewJobManager(reg *connector.Registry, opts ...JobManagerOption) *JobManage
 	telegramNotifier := newTelegramJobFailureNotifier(nil)
 	m := &JobManager{
 		jobs:                      make(map[string]*Job),
+		deletingJobs:              make(map[string]struct{}),
 		reg:                       reg,
 		failureNotifier:           telegramNotifier,
 		healthNotifier:            telegramNotifier,
@@ -226,6 +229,10 @@ func (m *JobManager) Submit(cfg *config.JobConfig) (*Job, error) {
 	if m.shuttingDown {
 		m.mu.Unlock()
 		return nil, ErrJobManagerShuttingDown
+	}
+	if _, deleting := m.deletingJobs[cfg.ID]; deleting {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("job id %q: %w", cfg.ID, ErrJobDeleting)
 	}
 	if _, exists := m.jobs[cfg.ID]; exists {
 		m.mu.Unlock()
@@ -602,6 +609,7 @@ func (m *JobManager) Delete(id string) error {
 	delete(m.jobs, id)
 	delete(m.executionRoles, id)
 	delete(m.workerLeases, id)
+	m.deletingJobs[id] = struct{}{}
 	m.removeSnapshotQueueLocked(id)
 	delete(m.startingSnapshotJobs, id)
 	m.mu.Unlock()
@@ -613,6 +621,11 @@ func (m *JobManager) Delete(id string) error {
 	job.setProgressListener(nil)
 	job.requestStop()
 	go func() {
+		defer func() {
+			m.mu.Lock()
+			delete(m.deletingJobs, id)
+			m.mu.Unlock()
+		}()
 		if err := m.deletePersistedJobForJob(context.Background(), job, id); err != nil {
 			log.Printf("[job-manager] delete persisted job failed job=%s: %v", id, err)
 		}
