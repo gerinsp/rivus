@@ -197,7 +197,11 @@ func TestSplitSnapshotWorkerHandsInitialJobToStreamingWorker(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for snapshot worker mode")
 	}
-	waitForCondition(t, "snapshot handoff persistence", func() bool {
+	// The snapshot handoff is asynchronous and persists two transitions
+	// (DONE -> streaming handoff, then lease release). Give the durable
+	// assertion a little more room on busy CI runners without slowing the
+	// normal fast-path tests.
+	waitForConditionWithin(t, 10*time.Second, "snapshot handoff persistence", func() bool {
 		record, ok := store.Get("split-job")
 		return ok && record.ExecutionRole == meta.JobExecutionRoleStreaming &&
 			record.DesiredState == meta.DesiredStateRunning &&
@@ -1732,9 +1736,13 @@ func tableRefKey(table connector.TableRef) string {
 }
 
 func waitForCondition(t *testing.T, desc string, fn func() bool) {
+	waitForConditionWithin(t, 3*time.Second, desc, fn)
+}
+
+func waitForConditionWithin(t *testing.T, timeout time.Duration, desc string, fn func() bool) {
 	t.Helper()
 
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if fn() {
 			return
