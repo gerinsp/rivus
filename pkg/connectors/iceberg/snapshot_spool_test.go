@@ -3,6 +3,7 @@ package iceberg
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -92,6 +93,56 @@ func TestRolledSnapshotCombinesSourceBatchesIntoOneDataFile(t *testing.T) {
 	if rowCount != 4 {
 		t.Fatalf("visible rows = %d, want 4", rowCount)
 	}
+}
+
+func TestRollingSnapshotBoundsLargeSourceBatchBeforeBuildingArrow(t *testing.T) {
+	ctx := context.Background()
+	tbl, _ := newEqualityDeltaTestTable(t)
+	spoolDir, err := prepareSnapshotSpoolDirectory(t.TempDir(), "job-1", "state-1")
+	if err != nil {
+		t.Fatalf("prepareSnapshotSpoolDirectory: %v", err)
+	}
+	sink := &Sink{
+		jobID: "job-1",
+		cfg: normalizeIcebergConfig(config.IcebergConfig{
+			SnapshotWriteMode: snapshotWriteModeAppend,
+			SnapshotBatchSize: 100,
+			MaxBatchBytes:     300,
+		}),
+		snapshotSpoolDir: spoolDir,
+	}
+	state := &tableState{
+		sourceKey: "app.orders",
+		sourceSchema: &model.TableSchema{
+			SchemaName: "app",
+			TableName:  "orders",
+			Columns: []model.TableColumn{
+				{Name: "id", DataType: "bigint", IsPK: true},
+				{Name: "status", DataType: "varchar"},
+			},
+		},
+		table:              tbl,
+		snapshotAppendSafe: true,
+	}
+
+	err = sink.appendSnapshotSpool(ctx, state, []map[string]interface{}{
+		{"id": int64(1), "status": strings.Repeat("a", 256)},
+		{"id": int64(2), "status": strings.Repeat("b", 256)},
+		{"id": int64(3), "status": strings.Repeat("c", 256)},
+	}, time.Now(), 0)
+	if err != nil {
+		t.Fatalf("appendSnapshotSpool: %v", err)
+	}
+	if state.snapshotSpool == nil {
+		t.Fatal("snapshot spool was not created")
+	}
+	if got, want := state.snapshotSpool.batchCount, 3; got != want {
+		t.Fatalf("spool batches = %d, want %d; a large source batch must be bounded by MaxBatchBytes before Arrow conversion", got, want)
+	}
+	if got, want := state.snapshotSpool.rowCount, int64(3); got != want {
+		t.Fatalf("spool rows = %d, want %d", got, want)
+	}
+	sink.resetSnapshotSpool(state)
 }
 
 func TestResetSnapshotSpoolDiscardsPartialTable(t *testing.T) {

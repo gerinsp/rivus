@@ -34,6 +34,7 @@ type snapshotSpool struct {
 	rowCount   int64
 	batchCount int
 	bytes      int64
+	cacheFreed int64
 }
 
 func snapshotRollingEnabled(cfg config.IcebergConfig) bool {
@@ -97,6 +98,25 @@ func (s *Sink) appendSnapshotSpool(ctx context.Context, state *tableState, rows 
 		}
 	}
 
+	// A MySQL snapshot event may contain a very large source batch (for
+	// example, 50,000 wide rows). The direct snapshot writer has always split
+	// such a batch by both row count and MaxBatchBytes. Do the same before
+	// cloning rows, enriching metadata, and building Arrow records for the
+	// disk spool. Otherwise rolling snapshots can temporarily retain several
+	// copies of the whole source event and bypass the configured memory bound.
+	for _, chunk := range splitRowsByLimits(rows, s.cfg.SnapshotBatchSize, int64(s.cfg.MaxBatchBytes)) {
+		if err := s.appendSnapshotSpoolChunk(ctx, state, chunk, ts); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Sink) appendSnapshotSpoolChunk(ctx context.Context, state *tableState, rows []map[string]interface{}, ts time.Time) error {
+	if len(rows) == 0 {
+		return nil
+	}
+
 	pkCols, err := s.primaryKeysFor(state.sourceKey, state.sourceSchema)
 	if err != nil {
 		return util.Permanent(err)
@@ -157,6 +177,15 @@ func (s *Sink) appendSnapshotSpool(ctx context.Context, state *tableState, rows 
 	spool.rowCount += int64(len(enrichedRows))
 	spool.batchCount++
 	spool.bytes = info.Size()
+	// The spool is deliberately durable on local disk until the source table
+	// completes. On Linux, those written pages can otherwise remain charged to
+	// the container's cgroup cache and make a large snapshot look like an
+	// unbounded heap leak. This is best effort: a filesystem which does not
+	// support the hint still works correctly.
+	if spool.bytes > spool.cacheFreed {
+		releaseSnapshotSpoolCache(spool.file, spool.cacheFreed, spool.bytes-spool.cacheFreed)
+		spool.cacheFreed = spool.bytes
+	}
 	state.lastTouchedAt = time.Now()
 	if s.cfg.SnapshotSpoolMaxBytes > 0 && spool.bytes > s.cfg.SnapshotSpoolMaxBytes {
 		return util.Permanent(fmt.Errorf("iceberg snapshot spool for %s reached %d bytes, above snapshot_spool_max_bytes=%d", state.sourceKey, spool.bytes, s.cfg.SnapshotSpoolMaxBytes))
