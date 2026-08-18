@@ -1419,7 +1419,7 @@ func (j *Job) startWithMode(mode config.JobMode) (err error) {
 
 func normalizeMode(m config.JobMode) config.JobMode {
 	switch m {
-	case config.JobModeInitial, config.JobModeSnapshotOnly, config.JobModeResume, config.JobModeLatestOffset, config.JobModeLatest:
+	case config.JobModeInitial, config.JobModeSnapshotOnly, config.JobModeSnapshotHandoff, config.JobModeSnapshotHandoffResume, config.JobModeResume, config.JobModeLatestOffset, config.JobModeLatest:
 		return m
 	default:
 		return config.JobModeInitial
@@ -1431,7 +1431,7 @@ func snapshotOnlyCountResumeEnabled(metadata map[string]string) bool {
 }
 
 func snapshotCountResumeSupported(mode config.JobMode) bool {
-	return mode == config.JobModeInitial || mode == config.JobModeSnapshotOnly
+	return mode == config.JobModeInitial || mode == config.JobModeSnapshotOnly || mode == config.JobModeSnapshotHandoff
 }
 
 func metadataBool(metadata map[string]string, key string) bool {

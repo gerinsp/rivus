@@ -27,6 +27,20 @@ var (
 
 const defaultMaxConcurrentSnapshotJobs = 2
 
+type WorkerRole string
+
+const (
+	WorkerRoleAll       WorkerRole = "all"
+	WorkerRoleSnapshot  WorkerRole = "snapshot"
+	WorkerRoleStreaming WorkerRole = "streaming"
+)
+
+const (
+	defaultWorkerPollInterval  = 2 * time.Second
+	defaultWorkerLeaseDuration = 30 * time.Second
+	defaultWorkerClaimLimit    = 1000
+)
+
 const (
 	defaultFailureNotificationRetryInitial = time.Second
 	defaultFailureNotificationRetryMax     = 10 * time.Minute
@@ -63,11 +77,17 @@ type JobManager struct {
 	failureRetryInitial      time.Duration
 	failureRetryMax          time.Duration
 
-	jobStore          meta.JobStore
-	defaultMetaMySQL  string
-	autoResume        bool
-	jobStoreReady     bool
-	jobStoreReadyLock sync.Mutex
+	jobStore            meta.JobStore
+	defaultMetaMySQL    string
+	autoResume          bool
+	jobStoreReady       bool
+	jobStoreReadyLock   sync.Mutex
+	workerRole          WorkerRole
+	workerID            string
+	workerPollInterval  time.Duration
+	workerLeaseDuration time.Duration
+	executionRoles      map[string]meta.JobExecutionRole
+	workerLeases        map[string]struct{}
 
 	maxConcurrentSnapshotJobs int
 	snapshotQueue             []string
@@ -103,6 +123,31 @@ func WithAutoResume(enabled bool) JobManagerOption {
 func WithMaxConcurrentSnapshotJobs(limit int) JobManagerOption {
 	return func(m *JobManager) {
 		m.maxConcurrentSnapshotJobs = limit
+	}
+}
+
+func WithWorkerRole(role WorkerRole) JobManagerOption {
+	return func(m *JobManager) {
+		m.workerRole = normalizeWorkerRole(role)
+	}
+}
+
+func WithWorkerID(id string) JobManagerOption {
+	return func(m *JobManager) {
+		if id = strings.TrimSpace(id); id != "" {
+			m.workerID = id
+		}
+	}
+}
+
+func WithWorkerTiming(pollInterval, leaseDuration time.Duration) JobManagerOption {
+	return func(m *JobManager) {
+		if pollInterval > 0 {
+			m.workerPollInterval = pollInterval
+		}
+		if leaseDuration > 0 {
+			m.workerLeaseDuration = leaseDuration
+		}
 	}
 }
 
@@ -147,6 +192,12 @@ func NewJobManager(reg *connector.Registry, opts ...JobManagerOption) *JobManage
 		snapshotQueueModes:        make(map[string]config.JobMode),
 		startingSnapshotJobs:      make(map[string]struct{}),
 		restartResumeJobs:         make(map[string]struct{}),
+		workerRole:                WorkerRoleAll,
+		workerID:                  defaultWorkerID(),
+		workerPollInterval:        defaultWorkerPollInterval,
+		workerLeaseDuration:       defaultWorkerLeaseDuration,
+		executionRoles:            make(map[string]meta.JobExecutionRole),
+		workerLeases:              make(map[string]struct{}),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -176,6 +227,29 @@ func (m *JobManager) Submit(cfg *config.JobConfig) (*Job, error) {
 		return nil, errors.New("job id already exists")
 	}
 	m.jobs[cfg.ID] = job
+	executionRole := meta.JobExecutionRoleAll
+	if m.workerRole != WorkerRoleAll {
+		executionRole = executionRoleForConfig(cfg)
+	}
+	m.executionRoles[cfg.ID] = executionRole
+	if m.workerRole != WorkerRoleAll {
+		m.mu.Unlock()
+		job.setStatus(JobStatusQueued)
+		job.updateProgress(connector.ProgressInfo{
+			Phase:   "queued",
+			Summary: "Waiting for " + strings.ToLower(string(executionRole)) + " worker",
+			Detail:  "The durable worker lease prevents duplicate execution",
+		})
+		m.attachStatusListener(job)
+		if err := m.saveManagedJobRecord(context.Background(), job, meta.DesiredStateRunning, JobStatusQueued); err != nil {
+			m.mu.Lock()
+			delete(m.jobs, cfg.ID)
+			delete(m.executionRoles, cfg.ID)
+			m.mu.Unlock()
+			return nil, err
+		}
+		return job, nil
+	}
 	shouldQueue := m.shouldQueueSnapshotStartLocked(job, cfg.Mode)
 	if shouldQueue {
 		m.enqueueSnapshotJobLocked(cfg.ID, cfg.Mode)
@@ -306,6 +380,15 @@ func (m *JobManager) Resubmit(id string) (*Job, error) {
 
 	switch job.GetStatus() {
 	case JobStatusFailed, JobStatusStopped, JobStatusPaused:
+		if m.workerRole != WorkerRoleAll {
+			job.setStatus(JobStatusQueued)
+			job.updateProgress(connector.ProgressInfo{
+				Phase:   "queued",
+				Summary: "Waiting for assigned worker",
+				Detail:  "The job will resume from its durable checkpoint",
+			})
+			return job, nil
+		}
 		if job.runActive() {
 			if !job.waitRunDone(500 * time.Millisecond) {
 				return nil, ErrJobStillStopping
@@ -398,6 +481,11 @@ func (m *JobManager) RestorePersistedJobs(ctx context.Context) error {
 	if err := m.ensureJobStoreReady(ctx); err != nil {
 		return err
 	}
+	if m.workerRole != WorkerRoleAll {
+		if _, ok := m.jobStore.(meta.JobWorkerStore); !ok {
+			return errors.New("split snapshot/streaming workers require a durable JobWorkerStore")
+		}
+	}
 
 	records, err := m.jobStore.LoadJobs(ctx)
 	if err != nil {
@@ -426,8 +514,8 @@ func (m *JobManager) RestorePersistedJobs(ctx context.Context) error {
 
 		job := m.newManagedJob(cfg)
 		resumeRequested := strings.EqualFold(string(record.DesiredState), string(meta.DesiredStateRunning))
-		shouldResume := m.autoResume && resumeRequested
-		m.restoreJobSnapshot(job, record, resumeRequested)
+		shouldResume := m.workerRole == WorkerRoleAll && m.autoResume && resumeRequested
+		m.restoreJobSnapshot(job, record, m.workerRole == WorkerRoleAll && resumeRequested)
 
 		m.mu.Lock()
 		if _, exists := m.jobs[cfg.ID]; exists {
@@ -436,7 +524,21 @@ func (m *JobManager) RestorePersistedJobs(ctx context.Context) error {
 			continue
 		}
 		m.jobs[cfg.ID] = job
+		executionRole := record.ExecutionRole
+		if executionRole == "" || executionRole == meta.JobExecutionRoleAll {
+			if m.workerRole == WorkerRoleAll {
+				executionRole = meta.JobExecutionRoleAll
+			} else {
+				executionRole = executionRoleForConfig(cfg)
+			}
+		}
+		m.executionRoles[cfg.ID] = executionRole
 		m.mu.Unlock()
+		if m.workerRole != WorkerRoleAll && (record.ExecutionRole == "" || record.ExecutionRole == meta.JobExecutionRoleAll) {
+			if err := m.saveManagedJobRecord(ctx, job, record.DesiredState, parsePersistedStatus(record.LastStatus)); err != nil {
+				return fmt.Errorf("assign persisted job worker role job=%s: %w", cfg.ID, err)
+			}
+		}
 
 		if !shouldResume {
 			continue
@@ -467,6 +569,8 @@ func (m *JobManager) Delete(id string) error {
 		return ErrJobNotFound
 	}
 	delete(m.jobs, id)
+	delete(m.executionRoles, id)
+	delete(m.workerLeases, id)
 	m.removeSnapshotQueueLocked(id)
 	delete(m.startingSnapshotJobs, id)
 	m.mu.Unlock()
@@ -515,9 +619,21 @@ func (m *JobManager) attachStatusListener(job *Job) {
 			// before asynchronous delivery begins.
 			m.enqueueFailureNotification(job)
 		}
+		persistedStatus := status
 		desired := m.desiredStateForJobStatus(job.Config.ID, status)
-		if err := m.saveManagedJobRecord(context.Background(), job, desired, status); err != nil {
+		if m.workerRole == WorkerRoleSnapshot && status == JobStatusDone && normalizeMode(job.Config.Mode) == config.JobModeInitial {
+			m.mu.Lock()
+			m.executionRoles[job.Config.ID] = meta.JobExecutionRoleStreaming
+			m.mu.Unlock()
+			desired = meta.DesiredStateRunning
+			persistedStatus = JobStatusStopped
+			log.Printf("[job-manager] snapshot handoff ready job=%s next_role=streaming", job.Config.ID)
+		}
+		if err := m.saveManagedJobRecord(context.Background(), job, desired, persistedStatus); err != nil {
 			log.Printf("[job-manager] persist job state failed job=%s status=%s: %v", job.Config.ID, status, err)
+		}
+		if m.workerRole != WorkerRoleAll && snapshotStatusReleasesSlot(status) {
+			m.releaseWorkerLease(job.Config.ID)
 		}
 		if snapshotStatusReleasesSlot(status) {
 			m.startQueuedSnapshotJobsAsync()
@@ -548,6 +664,11 @@ func (m *JobManager) Shutdown(ctx context.Context) error {
 	for id, job := range m.jobs {
 		if job == nil {
 			continue
+		}
+		if m.workerRole != WorkerRoleAll {
+			if _, leased := m.workerLeases[id]; !leased {
+				continue
+			}
 		}
 		switch job.GetStatus() {
 		case JobStatusCreated, JobStatusQueued, JobStatusPending, JobStatusRunning, JobStatusPausing:
@@ -989,14 +1110,15 @@ func (m *JobManager) saveJobRecord(ctx context.Context, job *Job, desired meta.D
 	}
 
 	return m.jobStore.SaveJob(saveCtx, meta.PersistedJob{
-		ID:           cfg.ID,
-		Name:         name,
-		Config:       m.normalizeConfig(cfg),
-		DesiredState: desired,
-		LastStatus:   string(status),
-		Errors:       errorHistory,
-		CreatedAt:    created,
-		UpdatedAt:    updated,
+		ID:            cfg.ID,
+		Name:          name,
+		Config:        m.normalizeConfig(cfg),
+		DesiredState:  desired,
+		ExecutionRole: m.executionRoleForJob(cfg.ID),
+		LastStatus:    string(status),
+		Errors:        errorHistory,
+		CreatedAt:     created,
+		UpdatedAt:     updated,
 	})
 }
 
@@ -1077,6 +1199,218 @@ func snapshotJobLimitFromEnv() int {
 	return limit
 }
 
+func ParseWorkerRole(raw string) (WorkerRole, error) {
+	role := normalizeWorkerRole(WorkerRole(raw))
+	if role == "" {
+		return "", fmt.Errorf("invalid RIVUS_WORKER_ROLE %q; expected all, snapshot, or streaming", raw)
+	}
+	return role, nil
+}
+
+func normalizeWorkerRole(role WorkerRole) WorkerRole {
+	switch WorkerRole(strings.ToLower(strings.TrimSpace(string(role)))) {
+	case "", WorkerRoleAll:
+		return WorkerRoleAll
+	case WorkerRoleSnapshot:
+		return WorkerRoleSnapshot
+	case WorkerRoleStreaming:
+		return WorkerRoleStreaming
+	default:
+		return ""
+	}
+}
+
+func defaultWorkerID() string {
+	host, err := os.Hostname()
+	if err != nil || strings.TrimSpace(host) == "" {
+		host = "rivus"
+	}
+	return fmt.Sprintf("%s-%d", host, os.Getpid())
+}
+
+func executionRoleForConfig(cfg *config.JobConfig) meta.JobExecutionRole {
+	if cfg == nil {
+		return meta.JobExecutionRoleStreaming
+	}
+	switch normalizeMode(cfg.Mode) {
+	case config.JobModeInitial, config.JobModeSnapshotOnly, config.JobModeSnapshotHandoff, config.JobModeSnapshotHandoffResume:
+		return meta.JobExecutionRoleSnapshot
+	default:
+		return meta.JobExecutionRoleStreaming
+	}
+}
+
+func (m *JobManager) executionRoleForJob(jobID string) meta.JobExecutionRole {
+	if m.workerRole == WorkerRoleAll {
+		return meta.JobExecutionRoleAll
+	}
+	m.mu.RLock()
+	role := m.executionRoles[jobID]
+	m.mu.RUnlock()
+	if role == "" {
+		return meta.JobExecutionRoleStreaming
+	}
+	return role
+}
+
+func (m *JobManager) durableWorkerRole() meta.JobExecutionRole {
+	switch m.workerRole {
+	case WorkerRoleSnapshot:
+		return meta.JobExecutionRoleSnapshot
+	case WorkerRoleStreaming:
+		return meta.JobExecutionRoleStreaming
+	default:
+		return meta.JobExecutionRoleAll
+	}
+}
+
+// RunWorker continuously reconciles jobs assigned to this process role. It is
+// used by the standalone snapshot-worker command and by a streaming API
+// server configured with RIVUS_WORKER_ROLE=streaming.
+func (m *JobManager) RunWorker(ctx context.Context) error {
+	if m.workerRole == WorkerRoleAll {
+		return errors.New("durable worker loop requires snapshot or streaming role")
+	}
+	store, ok := m.jobStore.(meta.JobWorkerStore)
+	if !ok {
+		return errors.New("durable worker loop requires a JobWorkerStore")
+	}
+	if err := m.ensureJobStoreReady(ctx); err != nil {
+		return err
+	}
+
+	log.Printf("[job-manager] worker started role=%s owner=%s poll=%s lease=%s", m.workerRole, m.workerID, m.workerPollInterval, m.workerLeaseDuration)
+	if err := m.reconcileWorkerJobs(ctx, store); err != nil {
+		log.Printf("[job-manager] initial worker reconciliation failed role=%s: %v", m.workerRole, err)
+	}
+	ticker := time.NewTicker(m.workerPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			if err := m.reconcileWorkerJobs(ctx, store); err != nil && ctx.Err() == nil {
+				log.Printf("[job-manager] worker reconciliation failed role=%s: %v", m.workerRole, err)
+			}
+		}
+	}
+}
+
+func (m *JobManager) reconcileWorkerJobs(ctx context.Context, store meta.JobWorkerStore) error {
+	role := m.durableWorkerRole()
+
+	m.mu.RLock()
+	owned := make([]*Job, 0)
+	for id := range m.workerLeases {
+		job := m.jobs[id]
+		if job == nil || m.executionRoles[id] != role {
+			continue
+		}
+		switch job.GetStatus() {
+		case JobStatusCreated, JobStatusQueued, JobStatusPending, JobStatusRunning, JobStatusPausing:
+			owned = append(owned, job)
+		}
+	}
+	m.mu.RUnlock()
+	for _, job := range owned {
+		renewed, err := store.RenewJobLease(ctx, job.Config.ID, m.workerID, m.workerLeaseDuration)
+		if err != nil {
+			return err
+		}
+		if !renewed {
+			if job.runActive() {
+				log.Printf("[job-manager] worker lease lost; stopping job=%s role=%s", job.Config.ID, m.workerRole)
+				// This process no longer owns the durable record. Stop only the
+				// local pipeline; a late status callback must not overwrite the
+				// desired state or lease now controlled by another worker.
+				job.setStatusListener(nil)
+				job.setProgressListener(nil)
+				job.requestStop()
+			}
+			m.releaseWorkerLease(job.Config.ID)
+		}
+	}
+
+	records, err := store.ClaimJobs(ctx, role, m.workerID, defaultWorkerClaimLimit, m.workerLeaseDuration)
+	if err != nil {
+		return err
+	}
+	for _, record := range records {
+		if err := m.startClaimedWorkerJob(record); err != nil {
+			log.Printf("[job-manager] claimed job start failed job=%s role=%s: %v", record.ID, m.workerRole, err)
+		}
+	}
+	return nil
+}
+
+func (m *JobManager) startClaimedWorkerJob(record meta.PersistedJob) error {
+	cfg := m.normalizeConfig(record.Config)
+	if cfg == nil || strings.TrimSpace(cfg.ID) == "" {
+		return errors.New("claimed job has empty config or id")
+	}
+
+	m.mu.Lock()
+	job := m.jobs[cfg.ID]
+	if job == nil {
+		job = m.newManagedJob(cfg)
+		m.jobs[cfg.ID] = job
+	}
+	m.executionRoles[cfg.ID] = m.durableWorkerRole()
+	m.workerLeases[cfg.ID] = struct{}{}
+	m.mu.Unlock()
+	// A job may be reclaimed by this process after a previous lease was lost.
+	// Restore manager callbacks before starting or observing the new lease.
+	m.attachStatusListener(job)
+
+	if job.runActive() {
+		return nil
+	}
+	m.restoreJobSnapshot(job, record, true)
+
+	mode := config.JobModeResume
+	if m.workerRole == WorkerRoleSnapshot {
+		firstAttempt := strings.EqualFold(record.LastStatus, string(JobStatusCreated)) || strings.EqualFold(record.LastStatus, string(JobStatusQueued))
+		if normalizeMode(cfg.Mode) == config.JobModeInitial {
+			mode = config.JobModeSnapshotHandoffResume
+			if firstAttempt {
+				mode = config.JobModeSnapshotHandoff
+			}
+		} else {
+			// Resuming snapshot-only through the ordinary resume mode can enter
+			// CDC after completing an interrupted snapshot. Reuse the internal
+			// handoff-resume boundary, but keep the durable role as SNAPSHOT so
+			// the job finishes instead of being handed to streaming.
+			mode = config.JobModeSnapshotHandoffResume
+			if firstAttempt {
+				mode = config.JobModeSnapshotOnly
+			}
+		}
+	} else if strings.EqualFold(record.LastStatus, string(JobStatusCreated)) || strings.EqualFold(record.LastStatus, string(JobStatusQueued)) {
+		mode = normalizeMode(cfg.Mode)
+	}
+
+	if m.queueOrStart(job, mode, false) {
+		return nil
+	}
+	return m.startJob(job, mode, false)
+}
+
+func (m *JobManager) releaseWorkerLease(jobID string) {
+	m.mu.Lock()
+	delete(m.workerLeases, jobID)
+	m.mu.Unlock()
+	store, ok := m.jobStore.(meta.JobWorkerStore)
+	if !ok || strings.TrimSpace(jobID) == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := store.ReleaseJobLease(ctx, jobID, m.workerID); err != nil {
+		log.Printf("[job-manager] release worker lease failed job=%s owner=%s: %v", jobID, m.workerID, err)
+	}
+}
+
 func (m *JobManager) startJob(job *Job, mode config.JobMode, removeOnStartFailure bool) error {
 	if job == nil || job.Config == nil {
 		return errors.New("job is nil")
@@ -1105,6 +1439,8 @@ func (m *JobManager) startJob(job *Job, mode config.JobMode, removeOnStartFailur
 	if err != nil && removeOnStartFailure {
 		m.mu.Lock()
 		delete(m.jobs, job.Config.ID)
+		delete(m.executionRoles, job.Config.ID)
+		delete(m.workerLeases, job.Config.ID)
 		m.removeSnapshotQueueLocked(job.Config.ID)
 		delete(m.startingSnapshotJobs, job.Config.ID)
 		m.mu.Unlock()
@@ -1183,11 +1519,11 @@ func (m *JobManager) shouldQueueSnapshotStartLocked(job *Job, mode config.JobMod
 }
 
 func (m *JobManager) snapshotGateApplies(cfg *config.JobConfig, mode config.JobMode) bool {
-	if cfg == nil || m.maxConcurrentSnapshotJobs == 0 {
+	if cfg == nil || m.maxConcurrentSnapshotJobs == 0 || m.workerRole == WorkerRoleStreaming {
 		return false
 	}
 	switch normalizeMode(mode) {
-	case config.JobModeInitial, config.JobModeSnapshotOnly:
+	case config.JobModeInitial, config.JobModeSnapshotOnly, config.JobModeSnapshotHandoff, config.JobModeSnapshotHandoffResume:
 		return true
 	case config.JobModeResume:
 		stored := normalizeMode(cfg.Mode)
@@ -1256,9 +1592,17 @@ func (m *JobManager) hasSnapshotSlotLocked() bool {
 
 func (m *JobManager) activeSnapshotJobsLocked() int {
 	active := len(m.startingSnapshotJobs)
-	for _, job := range m.jobs {
+	for id, job := range m.jobs {
 		if job == nil || job.Config == nil || !m.snapshotGateApplies(job.Config, job.Config.Mode) {
 			continue
+		}
+		if m.workerRole != WorkerRoleAll {
+			if m.executionRoles[id] != m.durableWorkerRole() {
+				continue
+			}
+			if _, leased := m.workerLeases[id]; !leased {
+				continue
+			}
 		}
 		status := job.GetStatus()
 		if status != JobStatusPending && status != JobStatusRunning && status != JobStatusPausing {

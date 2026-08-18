@@ -2740,11 +2740,18 @@ func (s *Source) runFull(ctx context.Context, out chan<- model.Event, mode confi
 	// 1️⃣ INITIAL (DEFAULT)
 	// fresh snapshot + CDC
 	// =========================
-	case config.JobModeInitial:
+	case config.JobModeInitial, config.JobModeSnapshotHandoff:
+		snapshotHandoff := mode == config.JobModeSnapshotHandoff
+		summary := "Preparing initial snapshot"
+		detail := fmt.Sprintf("Queued %d table(s) for snapshot", len(s.cfg.Tables))
+		if snapshotHandoff {
+			summary = "Preparing snapshot worker load"
+			detail = fmt.Sprintf("Queued %d table(s) for snapshot before CDC handoff", len(s.cfg.Tables))
+		}
 		s.reportProgress(connector.ProgressInfo{
 			Phase:       "snapshot",
-			Summary:     "Preparing initial snapshot",
-			Detail:      fmt.Sprintf("Queued %d table(s) for snapshot", len(s.cfg.Tables)),
+			Summary:     summary,
+			Detail:      detail,
 			TotalTables: len(s.cfg.Tables),
 		})
 		if s.offsetSto != nil {
@@ -2787,13 +2794,20 @@ func (s *Source) runFull(ctx context.Context, out chan<- model.Event, mode confi
 		if err := s.emitSnapshotBarrier(ctx, out, model.EventTypeSnapshotComplete); err != nil {
 			return fmt.Errorf("complete snapshot barrier failed: %w", err)
 		}
+		completeDetail := fmt.Sprintf("Starting CDC for %d table(s)", len(s.cfg.Tables))
+		if snapshotHandoff {
+			completeDetail = fmt.Sprintf("Ready to hand %d table(s) to the streaming worker", len(s.cfg.Tables))
+		}
 		s.reportProgress(connector.ProgressInfo{
 			Phase:           "snapshot_complete",
 			Summary:         "Initial snapshot complete",
-			Detail:          fmt.Sprintf("Starting CDC for %d table(s)", len(s.cfg.Tables)),
+			Detail:          completeDetail,
 			CompletedTables: len(s.cfg.Tables),
 			TotalTables:     len(s.cfg.Tables),
 		})
+		if snapshotHandoff {
+			return nil
+		}
 
 		return s.runBinlogCanal(ctx, out, startPos)
 
@@ -2842,7 +2856,8 @@ func (s *Source) runFull(ctx context.Context, out chan<- model.Event, mode confi
 	// 2️⃣ RESUME
 	// lanjut dari checkpoint snapshot atau offset terakhir
 	// =========================
-	case config.JobModeResume:
+	case config.JobModeResume, config.JobModeSnapshotHandoffResume:
+		snapshotHandoff := mode == config.JobModeSnapshotHandoffResume
 		if s.offsetSto == nil {
 			return fmt.Errorf("resume requires meta store")
 		}
@@ -2860,6 +2875,16 @@ func (s *Source) runFull(ctx context.Context, out chan<- model.Event, mode confi
 
 		if st != nil {
 			if st.Done {
+				if snapshotHandoff {
+					s.reportProgress(connector.ProgressInfo{
+						Phase:           "snapshot_complete",
+						Summary:         "Initial snapshot already complete",
+						Detail:          fmt.Sprintf("Ready to hand %d table(s) to the streaming worker", len(s.cfg.Tables)),
+						CompletedTables: len(s.cfg.Tables),
+						TotalTables:     len(s.cfg.Tables),
+					})
+					return nil
+				}
 				off, err := s.resumeOffset(ctx)
 				if err != nil {
 					return fmt.Errorf("get offset failed: %w", err)
@@ -2897,13 +2922,20 @@ func (s *Source) runFull(ctx context.Context, out chan<- model.Event, mode confi
 			if err := s.emitSnapshotBarrier(ctx, out, model.EventTypeSnapshotComplete); err != nil {
 				return fmt.Errorf("complete snapshot barrier failed: %w", err)
 			}
+			completeDetail := fmt.Sprintf("Starting CDC for %d table(s)", len(s.cfg.Tables))
+			if snapshotHandoff {
+				completeDetail = fmt.Sprintf("Ready to hand %d table(s) to the streaming worker", len(s.cfg.Tables))
+			}
 			s.reportProgress(connector.ProgressInfo{
 				Phase:           "snapshot_complete",
 				Summary:         "Snapshot resume complete",
-				Detail:          fmt.Sprintf("Starting CDC for %d table(s)", len(s.cfg.Tables)),
+				Detail:          completeDetail,
 				CompletedTables: len(s.cfg.Tables),
 				TotalTables:     len(s.cfg.Tables),
 			})
+			if snapshotHandoff {
+				return nil
+			}
 
 			p := gomysql.Position{Name: st.StartFile, Pos: st.StartPos}
 			log.Printf("[mysql][job %s] snapshot resume complete, continuing CDC from %s:%d", s.jobID, p.Name, p.Pos)

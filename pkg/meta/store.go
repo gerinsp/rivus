@@ -230,3 +230,11 @@ func isDuplicateColumnError(err error) bool {
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "duplicate column") || strings.Contains(msg, "already exists")
 }
+
+func isDuplicateKeyNameError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "duplicate key name") || strings.Contains(msg, "already exists")
+}

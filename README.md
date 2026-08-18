@@ -273,6 +273,10 @@ RIVUS_UI_LOGIN_PASSWORD=change-me
 RIVUS_UI_SESSION_SECRET=change-me
 RIVUS_API_TOKEN=
 RIVUS_AUTO_RESUME=false
+RIVUS_WORKER_ROLE=all
+RIVUS_WORKER_ID=
+RIVUS_WORKER_POLL_INTERVAL_SECONDS=2
+RIVUS_WORKER_LEASE_SECONDS=30
 RIVUS_SHUTDOWN_TIMEOUT_SECONDS=90
 RIVUS_LOG_DIR=/app/logs
 RIVUS_LOG_STDERR=true
@@ -309,6 +313,60 @@ sink:
     snapshot_spool_directory: /tmp/rivus-snapshot-spool
     snapshot_spool_max_bytes: 21474836480
 ```
+
+### Isolated snapshot worker
+
+Large initial snapshots can run in a separate container so their temporary
+heap, local spool, and CPU usage do not compete with CDC streaming. Both
+containers use the same image, metadata DSN, Iceberg catalog, and object-store
+credentials.
+
+```yaml
+services:
+  rivus-streaming:
+    image: ghcr.io/gerinsp/rivus:latest
+    command: ["/app/rivus", "-addr", ":8080", "-ui-dir", "./ui"]
+    environment:
+      RIVUS_META_MYSQL_DSN: ${RIVUS_META_MYSQL_DSN}
+      RIVUS_WORKER_ROLE: streaming
+      RIVUS_WORKER_ID: streaming-1
+      GOMEMLIMIT: 4GiB
+    ports:
+      - "8080:8080"
+
+  rivus-snapshot:
+    image: ghcr.io/gerinsp/rivus:latest
+    command: ["/app/rivus", "snapshot-worker", "--worker-id", "snapshot-1"]
+    environment:
+      RIVUS_META_MYSQL_DSN: ${RIVUS_META_MYSQL_DSN}
+      RIVUS_MAX_CONCURRENT_SNAPSHOT_JOBS: "1"
+      GOMEMLIMIT: 6GiB
+    volumes:
+      - ./snapshot-spool:/tmp/rivus-snapshot-spool
+```
+
+Submit the normal job YAML to the streaming API with `mode: initial`. The API
+stores it as durable snapshot work instead of running it locally. The snapshot
+worker leases the job, writes the initial snapshot, and stops before CDC. It
+then changes the durable assignment to `STREAMING`; the streaming process
+leases the same job and resumes from the binlog position captured before the
+snapshot began.
+
+The lease is renewed while work is active. If a worker exits, another replica
+of the same role may continue after `RIVUS_WORKER_LEASE_SECONDS`. Interrupted
+snapshots resume from saved table progress and still stop at the handoff
+boundary. `snapshot-only` jobs finish in the snapshot worker and are not handed
+to streaming.
+
+`RIVUS_WORKER_ROLE=all` is the default and preserves the original
+single-container behavior. Do not run an old `all` process beside the split
+workers for the same metadata database.
+
+For memory-sensitive workloads, start with one concurrent snapshot and a
+source `snapshot_batch_size` around 5,000. Raising
+`RIVUS_MAX_CONCURRENT_SNAPSHOT_JOBS` to `2` permits two large snapshot batches,
+Parquet writers, and spools to exist at the same time, so size the snapshot
+container independently from streaming.
 
 ## Docker
 

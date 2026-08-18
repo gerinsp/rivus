@@ -153,6 +153,198 @@ func TestRestorePersistedJobsDefaultsToNoAutoResume(t *testing.T) {
 	}
 }
 
+func TestSplitSnapshotWorkerHandsInitialJobToStreamingWorker(t *testing.T) {
+	store := newMemoryJobStore()
+	reg, modes := newSplitWorkerTestRegistry()
+
+	streaming := NewJobManager(reg,
+		WithJobStore(store),
+		WithWorkerRole(WorkerRoleStreaming),
+		WithWorkerID("streaming-1"),
+	)
+	job, err := streaming.Submit(newTestJobConfig("split-job"))
+	if err != nil {
+		t.Fatalf("Submit returned error: %v", err)
+	}
+	if got := job.GetStatus(); got != JobStatusQueued {
+		t.Fatalf("submitted status = %s, want %s", got, JobStatusQueued)
+	}
+	record, ok := store.Get("split-job")
+	if !ok {
+		t.Fatal("submitted job was not persisted")
+	}
+	if record.ExecutionRole != meta.JobExecutionRoleSnapshot {
+		t.Fatalf("submitted role = %s, want %s", record.ExecutionRole, meta.JobExecutionRoleSnapshot)
+	}
+
+	snapshot := NewJobManager(reg,
+		WithJobStore(store),
+		WithWorkerRole(WorkerRoleSnapshot),
+		WithWorkerID("snapshot-1"),
+	)
+	if err := snapshot.RestorePersistedJobs(context.Background()); err != nil {
+		t.Fatalf("snapshot RestorePersistedJobs returned error: %v", err)
+	}
+	if err := snapshot.reconcileWorkerJobs(context.Background(), store); err != nil {
+		t.Fatalf("snapshot reconciliation returned error: %v", err)
+	}
+
+	select {
+	case mode := <-modes:
+		if mode != config.JobModeSnapshotHandoff {
+			t.Fatalf("snapshot worker mode = %s, want %s", mode, config.JobModeSnapshotHandoff)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for snapshot worker mode")
+	}
+	waitForCondition(t, "snapshot handoff persistence", func() bool {
+		record, ok := store.Get("split-job")
+		return ok && record.ExecutionRole == meta.JobExecutionRoleStreaming &&
+			record.DesiredState == meta.DesiredStateRunning &&
+			record.LastStatus == string(JobStatusStopped) && record.LeaseOwner == ""
+	})
+
+	if err := streaming.reconcileWorkerJobs(context.Background(), store); err != nil {
+		t.Fatalf("streaming reconciliation returned error: %v", err)
+	}
+	select {
+	case mode := <-modes:
+		if mode != config.JobModeResume {
+			t.Fatalf("streaming worker mode = %s, want %s", mode, config.JobModeResume)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for streaming worker mode")
+	}
+	waitForCondition(t, "streaming worker to run", func() bool {
+		return job.GetStatus() == JobStatusRunning
+	})
+	if err := streaming.Cancel("split-job"); err != nil {
+		t.Fatalf("Cancel returned error: %v", err)
+	}
+}
+
+func TestSplitSnapshotOnlyJobDoesNotHandoffToStreaming(t *testing.T) {
+	store := newMemoryJobStore()
+	reg, _ := newSplitWorkerTestRegistry()
+	cfg := newTestJobConfig("snapshot-only-job")
+	cfg.Mode = config.JobModeSnapshotOnly
+
+	apiManager := NewJobManager(reg, WithJobStore(store), WithWorkerRole(WorkerRoleStreaming), WithWorkerID("api"))
+	if _, err := apiManager.Submit(cfg); err != nil {
+		t.Fatalf("Submit returned error: %v", err)
+	}
+	snapshot := NewJobManager(reg, WithJobStore(store), WithWorkerRole(WorkerRoleSnapshot), WithWorkerID("snapshot"))
+	if err := snapshot.RestorePersistedJobs(context.Background()); err != nil {
+		t.Fatalf("RestorePersistedJobs returned error: %v", err)
+	}
+	if err := snapshot.reconcileWorkerJobs(context.Background(), store); err != nil {
+		t.Fatalf("snapshot reconciliation returned error: %v", err)
+	}
+	waitForCondition(t, "snapshot-only completion", func() bool {
+		record, ok := store.Get(cfg.ID)
+		return ok && record.LastStatus == string(JobStatusDone)
+	})
+	record, _ := store.Get(cfg.ID)
+	if record.ExecutionRole != meta.JobExecutionRoleSnapshot || record.DesiredState != meta.DesiredStateStopped {
+		t.Fatalf("snapshot-only result role=%s desired=%s, want SNAPSHOT/STOPPED", record.ExecutionRole, record.DesiredState)
+	}
+}
+
+func TestSplitSnapshotOnlyResumeStopsBeforeCDC(t *testing.T) {
+	store := newMemoryJobStore()
+	reg, modes := newSplitWorkerTestRegistry()
+	cfg := newTestJobConfig("snapshot-only-resume")
+	cfg.Mode = config.JobModeSnapshotOnly
+	if err := store.SaveJob(context.Background(), meta.PersistedJob{
+		ID:            cfg.ID,
+		Name:          cfg.Name,
+		Config:        cfg,
+		DesiredState:  meta.DesiredStateRunning,
+		ExecutionRole: meta.JobExecutionRoleSnapshot,
+		LastStatus:    string(JobStatusRunning),
+	}); err != nil {
+		t.Fatalf("SaveJob returned error: %v", err)
+	}
+
+	snapshot := NewJobManager(reg,
+		WithJobStore(store),
+		WithWorkerRole(WorkerRoleSnapshot),
+		WithWorkerID("snapshot-resume"),
+	)
+	if err := snapshot.RestorePersistedJobs(context.Background()); err != nil {
+		t.Fatalf("RestorePersistedJobs returned error: %v", err)
+	}
+	if err := snapshot.reconcileWorkerJobs(context.Background(), store); err != nil {
+		t.Fatalf("snapshot reconciliation returned error: %v", err)
+	}
+	select {
+	case mode := <-modes:
+		if mode != config.JobModeSnapshotHandoffResume {
+			t.Fatalf("snapshot-only resume mode = %s, want %s", mode, config.JobModeSnapshotHandoffResume)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for snapshot-only resume mode")
+	}
+	waitForCondition(t, "snapshot-only resumed completion", func() bool {
+		record, ok := store.Get(cfg.ID)
+		return ok && record.LastStatus == string(JobStatusDone) && record.LeaseOwner == ""
+	})
+	record, _ := store.Get(cfg.ID)
+	if record.ExecutionRole != meta.JobExecutionRoleSnapshot || record.DesiredState != meta.DesiredStateStopped {
+		t.Fatalf("snapshot-only resumed result role=%s desired=%s, want SNAPSHOT/STOPPED", record.ExecutionRole, record.DesiredState)
+	}
+}
+
+func TestSplitSnapshotWorkerIgnoresRemoteStreamingJobsForConcurrency(t *testing.T) {
+	store := newMemoryJobStore()
+	reg, modes := newSplitWorkerTestRegistry()
+	streamingCfg := newTestJobConfig("existing-streaming")
+	snapshotCfg := newTestJobConfig("new-snapshot")
+	for _, record := range []meta.PersistedJob{
+		{
+			ID:            streamingCfg.ID,
+			Name:          streamingCfg.Name,
+			Config:        streamingCfg,
+			DesiredState:  meta.DesiredStateRunning,
+			ExecutionRole: meta.JobExecutionRoleStreaming,
+			LastStatus:    string(JobStatusRunning),
+		},
+		{
+			ID:            snapshotCfg.ID,
+			Name:          snapshotCfg.Name,
+			Config:        snapshotCfg,
+			DesiredState:  meta.DesiredStateRunning,
+			ExecutionRole: meta.JobExecutionRoleSnapshot,
+			LastStatus:    string(JobStatusQueued),
+		},
+	} {
+		if err := store.SaveJob(context.Background(), record); err != nil {
+			t.Fatalf("SaveJob(%s) returned error: %v", record.ID, err)
+		}
+	}
+
+	snapshot := NewJobManager(reg,
+		WithJobStore(store),
+		WithWorkerRole(WorkerRoleSnapshot),
+		WithWorkerID("snapshot-one"),
+		WithMaxConcurrentSnapshotJobs(1),
+	)
+	if err := snapshot.RestorePersistedJobs(context.Background()); err != nil {
+		t.Fatalf("RestorePersistedJobs returned error: %v", err)
+	}
+	if err := snapshot.reconcileWorkerJobs(context.Background(), store); err != nil {
+		t.Fatalf("snapshot reconciliation returned error: %v", err)
+	}
+	select {
+	case mode := <-modes:
+		if mode != config.JobModeSnapshotHandoff {
+			t.Fatalf("snapshot worker mode = %s, want %s", mode, config.JobModeSnapshotHandoff)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("remote streaming job incorrectly consumed the only snapshot slot")
+	}
+}
+
 func TestSubmitCancelResubmitAndDeletePersistLifecycle(t *testing.T) {
 	store := newMemoryJobStore()
 	reg, modes := newTestRegistry()
@@ -1142,6 +1334,10 @@ func (s *memoryJobStore) SaveJob(_ context.Context, job meta.PersistedJob) error
 
 	record := job
 	record.Config = cloneTestJobConfig(job.Config)
+	if existing, ok := s.jobs[job.ID]; ok {
+		record.LeaseOwner = existing.LeaseOwner
+		record.LeaseUntil = existing.LeaseUntil
+	}
 	if record.CreatedAt.IsZero() {
 		if existing, ok := s.jobs[job.ID]; ok && !existing.CreatedAt.IsZero() {
 			record.CreatedAt = existing.CreatedAt
@@ -1153,6 +1349,63 @@ func (s *memoryJobStore) SaveJob(_ context.Context, job meta.PersistedJob) error
 		record.UpdatedAt = time.Now()
 	}
 	s.jobs[job.ID] = record
+	return nil
+}
+
+func (s *memoryJobStore) ClaimJobs(_ context.Context, role meta.JobExecutionRole, owner string, limit int, leaseDuration time.Duration) ([]meta.PersistedJob, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if limit <= 0 {
+		limit = 100
+	}
+	now := time.Now()
+	out := make([]meta.PersistedJob, 0)
+	for id, record := range s.jobs {
+		if record.ExecutionRole != role || record.DesiredState != meta.DesiredStateRunning {
+			continue
+		}
+		if record.LeaseOwner != "" && record.LeaseUntil.After(now) && record.LeaseOwner != owner {
+			continue
+		}
+		if record.LeaseOwner == "" || !record.LeaseUntil.After(now) {
+			record.LeaseOwner = owner
+			record.LeaseUntil = now.Add(leaseDuration)
+			s.jobs[id] = record
+		}
+		if record.LeaseOwner == owner {
+			copyRecord := record
+			copyRecord.Config = cloneTestJobConfig(record.Config)
+			out = append(out, copyRecord)
+			if len(out) >= limit {
+				break
+			}
+		}
+	}
+	return out, nil
+}
+
+func (s *memoryJobStore) RenewJobLease(_ context.Context, jobID, owner string, leaseDuration time.Duration) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	record, ok := s.jobs[jobID]
+	if !ok || record.LeaseOwner != owner || record.DesiredState != meta.DesiredStateRunning {
+		return false, nil
+	}
+	record.LeaseUntil = time.Now().Add(leaseDuration)
+	s.jobs[jobID] = record
+	return true, nil
+}
+
+func (s *memoryJobStore) ReleaseJobLease(_ context.Context, jobID, owner string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	record, ok := s.jobs[jobID]
+	if !ok || record.LeaseOwner != owner {
+		return nil
+	}
+	record.LeaseOwner = ""
+	record.LeaseUntil = time.Time{}
+	s.jobs[jobID] = record
 	return nil
 }
 
@@ -1241,6 +1494,36 @@ func newTestRegistry() (*connector.Registry, <-chan config.JobMode) {
 		}), nil
 	})
 
+	return reg, modes
+}
+
+func newSplitWorkerTestRegistry() (*connector.Registry, <-chan config.JobMode) {
+	reg := connector.NewRegistry()
+	modes := make(chan config.JobMode, 8)
+	reg.RegisterSource("test_source", func(jctx connector.JobContext, cfg any) (connector.Source, error) {
+		modes <- jctx.Mode
+		return sourceFunc(func(ctx context.Context, out chan<- model.Event) error {
+			if jctx.Mode == config.JobModeSnapshotHandoff || jctx.Mode == config.JobModeSnapshotHandoffResume || jctx.Mode == config.JobModeSnapshotOnly {
+				return nil
+			}
+			<-ctx.Done()
+			return ctx.Err()
+		}), nil
+	})
+	reg.RegisterSink("test_sink", func(jctx connector.JobContext, cfg any) (connector.Sink, error) {
+		return sinkFunc(func(ctx context.Context, in <-chan model.Event) error {
+			for {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case _, ok := <-in:
+					if !ok {
+						return nil
+					}
+				}
+			}
+		}), nil
+	})
 	return reg, modes
 }
 

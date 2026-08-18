@@ -40,10 +40,58 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "snapshot-worker" {
+		if err := runSnapshotWorkerCommand(os.Args[2:]); err != nil {
+			log.Fatalf("snapshot worker error: %v", err)
+		}
+		return
+	}
 
 	if err := runServer(os.Args[1:]); err != nil {
 		log.Fatalf("server error: %v", err)
 	}
+}
+
+func runSnapshotWorkerCommand(args []string) error {
+	fs := flag.NewFlagSet("snapshot-worker", flag.ContinueOnError)
+	workerID := fs.String("worker-id", strings.TrimSpace(os.Getenv("RIVUS_WORKER_ID")), "stable worker identity (defaults to hostname-pid)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	dsn := strings.TrimSpace(os.Getenv("RIVUS_META_MYSQL_DSN"))
+	if dsn == "" {
+		return errors.New("snapshot-worker requires RIVUS_META_MYSQL_DSN")
+	}
+	jobStore, err := meta.NewMySQLJobStore(dsn)
+	if err != nil {
+		return err
+	}
+	reg := connector.NewRegistry()
+	mysql.Register(reg)
+	doris.Register(reg)
+	iceberg.Register(reg)
+	manager := core.NewJobManager(reg,
+		core.WithJobStore(jobStore),
+		core.WithDefaultMetaMySQLDSN(dsn),
+		core.WithWorkerRole(core.WorkerRoleSnapshot),
+		core.WithWorkerID(*workerID),
+		core.WithWorkerTiming(workerTimingFromEnv()),
+	)
+	restoreCtx, restoreCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	err = manager.RestorePersistedJobs(restoreCtx)
+	restoreCancel()
+	if err != nil {
+		return err
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := manager.RunWorker(ctx); err != nil {
+		return err
+	}
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), gracefulShutdownTimeoutFromEnv())
+	defer cancel()
+	return manager.Shutdown(shutdownCtx)
 }
 
 func runMaintenanceWorkerCommand(args []string) error {
@@ -92,7 +140,16 @@ func runServer(args []string) error {
 	iceberg.Register(reg)
 
 	jobManagerOpts := make([]core.JobManagerOption, 0, 3)
+	workerRole, err := core.ParseWorkerRole(os.Getenv("RIVUS_WORKER_ROLE"))
+	if err != nil {
+		return err
+	}
 	jobManagerOpts = append(jobManagerOpts, core.WithAutoResume(envBool("RIVUS_AUTO_RESUME", false)))
+	jobManagerOpts = append(jobManagerOpts, core.WithWorkerRole(workerRole))
+	jobManagerOpts = append(jobManagerOpts,
+		core.WithWorkerID(strings.TrimSpace(os.Getenv("RIVUS_WORKER_ID"))),
+		core.WithWorkerTiming(workerTimingFromEnv()),
+	)
 	if dsn := strings.TrimSpace(os.Getenv("RIVUS_META_MYSQL_DSN")); dsn != "" {
 		jobStore, err := meta.NewMySQLJobStore(dsn)
 		if err != nil {
@@ -108,6 +165,14 @@ func runServer(args []string) error {
 	defer cancel()
 	if err := jobManager.RestorePersistedJobs(restoreCtx); err != nil {
 		return err
+	}
+	workerCtx, stopWorker := context.WithCancel(context.Background())
+	defer stopWorker()
+	var workerErr <-chan error
+	if workerRole != core.WorkerRoleAll {
+		ch := make(chan error, 1)
+		workerErr = ch
+		go func() { ch <- jobManager.RunWorker(workerCtx) }()
 	}
 	authConfig, err := api.LoadAuthConfigFromEnv()
 	if err != nil {
@@ -132,11 +197,19 @@ func runServer(args []string) error {
 
 	select {
 	case err := <-serverErr:
+		stopWorker()
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
 		}
 		return err
+	case err := <-workerErr:
+		if err != nil {
+			_ = httpServer.Close()
+			return err
+		}
+		return nil
 	case <-signalCtx.Done():
+		stopWorker()
 		timeout := gracefulShutdownTimeoutFromEnv()
 		log.Printf("Shutdown signal received; draining jobs for up to %s", timeout)
 
@@ -156,6 +229,12 @@ func runServer(args []string) error {
 		log.Printf("Rivus shutdown complete")
 		return nil
 	}
+}
+
+func workerTimingFromEnv() (time.Duration, time.Duration) {
+	poll := time.Duration(envInt("RIVUS_WORKER_POLL_INTERVAL_SECONDS", 2)) * time.Second
+	lease := time.Duration(envInt("RIVUS_WORKER_LEASE_SECONDS", 30)) * time.Second
+	return poll, lease
 }
 
 func gracefulShutdownTimeoutFromEnv() time.Duration {

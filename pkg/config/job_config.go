@@ -22,9 +22,15 @@ type JobMode string
 const (
 	JobModeInitial      JobMode = "initial"       // snapshot + streaming
 	JobModeSnapshotOnly JobMode = "snapshot-only" // snapshot only, no CDC/binlog
-	JobModeResume       JobMode = "resume"        // lanjutkan dari checkpoint snapshot/offset terakhir
-	JobModeLatestOffset JobMode = "latest-offset" // resume dari offset (error kalau belum ada)
-	JobModeLatest       JobMode = "latest"        // streaming dari latest (ignore offset/snapshot)
+	// JobModeSnapshotHandoff is an internal split-worker phase. It writes a
+	// resumable initial snapshot checkpoint but stops before starting CDC.
+	JobModeSnapshotHandoff JobMode = "snapshot-handoff"
+	// JobModeSnapshotHandoffResume resumes an interrupted split-worker snapshot
+	// and stops at the same handoff boundary before CDC.
+	JobModeSnapshotHandoffResume JobMode = "snapshot-handoff-resume"
+	JobModeResume                JobMode = "resume"        // lanjutkan dari checkpoint snapshot/offset terakhir
+	JobModeLatestOffset          JobMode = "latest-offset" // resume dari offset (error kalau belum ada)
+	JobModeLatest                JobMode = "latest"        // streaming dari latest (ignore offset/snapshot)
 )
 
 type RetryPolicy struct {
