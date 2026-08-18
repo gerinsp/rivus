@@ -100,10 +100,11 @@ type compactionTriggers struct {
 	SmallFileCount bool
 	SmallFileBytes bool
 	EqualityDelete bool
+	PositionDelete bool
 }
 
 func (t compactionTriggers) Any() bool {
-	return t.SmallFileCount || t.SmallFileBytes || t.EqualityDelete
+	return t.SmallFileCount || t.SmallFileBytes || t.EqualityDelete || t.PositionDelete
 }
 
 func defaultNativeMaintenanceSettings() nativeMaintenanceSettings {
@@ -349,6 +350,10 @@ func compactionTriggersFor(state meta.IcebergMaintenanceState, settings nativeMa
 		SmallFileBytes: settings.MinSmallFiles > 0 && settings.MinSmallBytes > 0 &&
 			state.ActiveSmallFiles >= settings.MinSmallFiles && state.ActiveSmallBytes >= settings.MinSmallBytes,
 		EqualityDelete: settings.EqualityDeleteThreshold > 0 && state.ActiveEqualityDeleteFiles >= settings.EqualityDeleteThreshold,
+		// Position deletes are always delegated to Spark while native rewrite
+		// support is intentionally conservative. Do not wait for 50 files: even
+		// one active position-delete file should make the table eligible.
+		PositionDelete: state.ActivePositionDeleteFiles > 0,
 	}
 }
 
@@ -410,7 +415,7 @@ func executeHybridCompaction(
 	// Delete-driven maintenance must be able to rewrite a single affected data
 	// file. Ordinary small-file compaction keeps the higher minimum so one
 	// small file is never rewritten in a loop.
-	if triggers.EqualityDelete {
+	if triggers.EqualityDelete || triggers.PositionDelete {
 		cfg.MinInputFiles = 1
 	}
 	cfg.DeleteFileThreshold = 1
@@ -437,6 +442,7 @@ func executeHybridCompaction(
 		"trigger_small_file_count":         triggers.SmallFileCount,
 		"trigger_small_file_bytes":         triggers.SmallFileBytes,
 		"trigger_equality_delete_files":    triggers.EqualityDelete,
+		"trigger_position_delete_files":    triggers.PositionDelete,
 		"starting_snapshot_id":             startSnapshotID,
 		"estimated_output_files":           plan.EstOutputFiles,
 		"estimated_output_bytes":           plan.EstOutputBytes,

@@ -242,6 +242,13 @@ func TestCompactionTriggersFor(t *testing.T) {
 			want: compactionTriggers{EqualityDelete: true},
 		},
 		{
+			name: "one active position delete triggers Spark maintenance",
+			state: meta.IcebergMaintenanceState{
+				ActivePositionDeleteFiles: 1,
+			},
+			want: compactionTriggers{PositionDelete: true},
+		},
+		{
 			name: "200 active small files trigger below byte floor",
 			state: meta.IcebergMaintenanceState{
 				ActiveSmallFiles: 200,
@@ -307,6 +314,13 @@ func TestDurableMaintenanceTableStateUsesSmallFileAndDeleteTriggers(t *testing.T
 		ActiveEqualityDeleteFiles: 50,
 	}, cfg); got != "ready" {
 		t.Fatalf("50 equality deletes state=%q, want ready", got)
+	}
+	if got := durableMaintenanceTableState(meta.IcebergMaintenanceState{
+		SnapshotComplete:          true,
+		LastInventoryAt:           &now,
+		ActivePositionDeleteFiles: 1,
+	}, cfg); got != "ready" {
+		t.Fatalf("one position delete state=%q, want ready", got)
 	}
 }
 

@@ -182,9 +182,11 @@ export function renderIcebergMaintenance(job, options = {}) {
           <div class="mt-1 text-[11px] text-slate-500">${escapeHtml(fmtBytes(Number(table?.eligible_small_bytes || 0)))}</div>
         </td>
         <td class="mono px-4 py-3 text-right text-xs font-semibold text-slate-800">${fmtWholeNumber(table?.active_equality_delete_files || 0)}</td>
+        <td class="mono px-4 py-3 text-right text-xs font-semibold text-slate-800">${fmtWholeNumber(table?.active_position_delete_files || 0)}</td>
         <td class="px-4 py-3 text-xs text-slate-600">
           <div>Small: <span class="mono font-semibold text-slate-800">${fmtWholeNumber(table?.eligible_small_files || 0)} / ${fmtWholeNumber(dataThreshold)}</span></div>
-          <div class="mt-1">Deletes: <span class="mono font-semibold text-slate-800">${fmtWholeNumber(table?.active_equality_delete_files || 0)} / ${fmtWholeNumber(deleteThreshold)}</span></div>
+          <div class="mt-1">Equality: <span class="mono font-semibold text-slate-800">${fmtWholeNumber(table?.active_equality_delete_files || 0)} / ${fmtWholeNumber(deleteThreshold)}</span></div>
+          <div class="mt-1">Position: <span class="mono font-semibold text-slate-800">${fmtWholeNumber(table?.active_position_delete_files || 0)}</span>${Number(table?.active_position_delete_files || 0) > 0 ? ' <span class="text-amber-700">→ Spark</span>' : ''}</div>
         </td>
         <td class="px-4 py-3">
           <span class="inline-flex rounded-full border px-2.5 py-1 text-[11px] font-semibold ${maintenanceStateClass(table?.state)}">${escapeHtml(maintenanceStateLabel(table?.state))}</span>
@@ -250,13 +252,14 @@ export function renderIcebergMaintenance(job, options = {}) {
                 <th class="px-4 py-3 text-right text-[11px] font-semibold uppercase tracking-[0.14em]">Data files</th>
                 <th class="px-4 py-3 text-right text-[11px] font-semibold uppercase tracking-[0.14em]">Small files</th>
                 <th class="px-4 py-3 text-right text-[11px] font-semibold uppercase tracking-[0.14em]">Equality deletes</th>
+                <th class="px-4 py-3 text-right text-[11px] font-semibold uppercase tracking-[0.14em]">Position deletes</th>
                 <th class="min-w-44 px-4 py-3 text-left text-[11px] font-semibold uppercase tracking-[0.14em]">Current / trigger</th>
                 <th class="min-w-32 px-4 py-3 text-left text-[11px] font-semibold uppercase tracking-[0.14em]">Status</th>
                 <th class="min-w-64 px-4 py-3 text-left text-[11px] font-semibold uppercase tracking-[0.14em]">Maintenance reason</th>
               </tr>
             </thead>
             <tbody class="bg-white">
-              ${tableRows || '<tr><td colspan="7" class="px-4 py-8 text-center text-sm text-slate-500">No Iceberg table inventory is available yet.</td></tr>'}
+              ${tableRows || '<tr><td colspan="8" class="px-4 py-8 text-center text-sm text-slate-500">No Iceberg table inventory is available yet.</td></tr>'}
             </tbody>
           </table>
         </div>

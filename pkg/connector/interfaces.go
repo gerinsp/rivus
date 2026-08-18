@@ -74,6 +74,7 @@ type TableMaintenanceStatus struct {
 	SmallFilesMinTotalBytes      int64                         `json:"small_files_min_total_bytes,omitempty"`
 	ActiveDataFiles              int                           `json:"active_data_files"`
 	ActiveEqualityDeleteFiles    int                           `json:"active_equality_delete_files"`
+	ActivePositionDeleteFiles    int                           `json:"active_position_delete_files"`
 	EligibleSmallFiles           int                           `json:"eligible_small_files"`
 	EligibleSmallBytes           int64                         `json:"eligible_small_bytes"`
 	TablesTotal                  int                           `json:"tables_total"`
@@ -93,6 +94,7 @@ type TableMaintenanceTableStatus struct {
 	State                     string   `json:"state"`
 	ActiveDataFiles           int      `json:"active_data_files"`
 	ActiveEqualityDeleteFiles int      `json:"active_equality_delete_files"`
+	ActivePositionDeleteFiles int      `json:"active_position_delete_files"`
 	EligibleSmallFiles        int      `json:"eligible_small_files"`
 	EligibleSmallBytes        int64    `json:"eligible_small_bytes"`
 	NewDataFiles              int      `json:"new_data_files"`

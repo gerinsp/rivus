@@ -244,6 +244,7 @@ func (m *tableMaintenanceMonitor) publishDurableStatus(parent context.Context, s
 			State:                     tableState,
 			ActiveDataFiles:           state.ActiveDataFiles,
 			ActiveEqualityDeleteFiles: state.ActiveEqualityDeleteFiles,
+			ActivePositionDeleteFiles: state.ActivePositionDeleteFiles,
 			EligibleSmallFiles:        state.ActiveSmallFiles,
 			EligibleSmallBytes:        state.ActiveSmallBytes,
 			NewDataFiles:              state.NewDataFiles,
@@ -254,6 +255,7 @@ func (m *tableMaintenanceMonitor) publishDurableStatus(parent context.Context, s
 		})
 		status.ActiveDataFiles += state.ActiveDataFiles
 		status.ActiveEqualityDeleteFiles += state.ActiveEqualityDeleteFiles
+		status.ActivePositionDeleteFiles += state.ActivePositionDeleteFiles
 		status.EligibleSmallFiles += state.ActiveSmallFiles
 		status.EligibleSmallBytes += state.ActiveSmallBytes
 		if tableState == "ready" || tableState == "running" {
@@ -318,9 +320,10 @@ func durableMaintenanceTableState(state meta.IcebergMaintenanceState, cfg config
 	dataReady := cfg.DataFilesThreshold > 0 && state.ActiveSmallFiles >= cfg.DataFilesThreshold
 	deleteReady := cfg.EqualityDeleteFilesThreshold > 0 &&
 		state.ActiveEqualityDeleteFiles >= cfg.EqualityDeleteFilesThreshold
+	positionDeleteReady := state.ActivePositionDeleteFiles > 0
 	smallBytesReady := cfg.SmallFilesMinCount > 0 && cfg.SmallFilesMinTotalBytes > 0 &&
 		state.ActiveSmallFiles >= cfg.SmallFilesMinCount && state.ActiveSmallBytes >= cfg.SmallFilesMinTotalBytes
-	if dataReady || deleteReady || smallBytesReady {
+	if dataReady || deleteReady || positionDeleteReady || smallBytesReady {
 		return "ready"
 	}
 	return "healthy"
