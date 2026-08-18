@@ -177,12 +177,46 @@ Useful worker environment variables:
 
 ```env
 RIVUS_META_MYSQL_DSN=rivus:change-me@tcp(meta-mysql:3306)/rivus_meta?parseTime=true
-RIVUS_MAINTENANCE_GOMAXPROCS=1
+RIVUS_MAINTENANCE_GOMAXPROCS=4
 RIVUS_MAINTENANCE_POLL_INTERVAL_SECONDS=30
 RIVUS_MAINTENANCE_LEASE_SECONDS=900
 RIVUS_MAINTENANCE_TASK_PAGE_SIZE=1
 RIVUS_MAINTENANCE_DUE_PAGE_SIZE=100
-GOMEMLIMIT=256MiB
+GOMEMLIMIT=3GiB
+
+# Global overrides for native compaction boundaries (optional)
+RIVUS_MAINTENANCE_NATIVE_MAX_SELECTED_INPUT_BYTES=1073741824   # 1 GB
+RIVUS_MAINTENANCE_NATIVE_MAX_SELECTED_FILES=300
+RIVUS_MAINTENANCE_NATIVE_MAX_EQUALITY_DELETE_FILES=150
+
+# Global overrides for snapshot expiration & orphan cleanup (optional)
+RIVUS_MAINTENANCE_NATIVE_EXPIRE_INTERVAL_SECONDS=86400         # Check 1x per day
+RIVUS_MAINTENANCE_NATIVE_SNAPSHOT_MAX_AGE_HOURS=168            # Delete snapshots > 7 days
+RIVUS_MAINTENANCE_NATIVE_SNAPSHOT_RETAIN_LAST=10               # Retain last 10 snapshots
+RIVUS_MAINTENANCE_NATIVE_ORPHAN_INTERVAL_SECONDS=2592000       # 1x per 30 days
+RIVUS_MAINTENANCE_NATIVE_ORPHAN_MIN_AGE_HOURS=168              # Delete orphan files > 7 days
+RIVUS_MAINTENANCE_NATIVE_ORPHAN_DRY_RUN=false
+```
+
+Example Docker Compose service setup:
+
+```yaml
+  rivus-maintenance:
+    image: ghcr.io/gerinsp/rivus:latest
+    container_name: rivus-maintenance
+    command: ["/app/rivus", "maintenance-worker", "--queue"]
+    restart: unless-stopped
+    mem_limit: 4g
+    depends_on:
+      meta-mysql:
+        condition: service_healthy
+    environment:
+      TZ: Asia/Jakarta
+      GOMEMLIMIT: 3GiB
+      RIVUS_MAINTENANCE_GOMAXPROCS: 4
+      RIVUS_META_MYSQL_DSN: rivus:password@tcp(meta-mysql:3306)/rivus_meta?parseTime=true
+    volumes:
+      - ./maintenance-tmp:/tmp/rivus-maintenance
 ```
 
 One-shot and queue modes:
