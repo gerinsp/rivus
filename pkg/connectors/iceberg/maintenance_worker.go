@@ -113,7 +113,7 @@ func RunMaintenanceWorker(ctx context.Context, dsn string, opts MaintenanceWorke
 			lastStateSync = now
 		}
 		for {
-			claimed, err := scanPriorityInventoryBatch(ctx, store, jobs, opts, now, 100, interactiveInventoryBatchSize)
+			claimed, err := scanPriorityInventoryBatch(ctx, store, jobStore, jobs, opts, now, 100, interactiveInventoryBatchSize)
 			if err != nil {
 				log.Printf("[maintenance-worker %s] interactive inventory scan error: %v", opts.WorkerID, err)
 				break
@@ -123,7 +123,7 @@ func RunMaintenanceWorker(ctx context.Context, dsn string, opts MaintenanceWorke
 			}
 		}
 		for {
-			claimed, err := scanPriorityInventoryBatch(ctx, store, jobs, opts, now, 1, interactiveInventoryBatchSize)
+			claimed, err := scanPriorityInventoryBatch(ctx, store, jobStore, jobs, opts, now, 1, interactiveInventoryBatchSize)
 			if err != nil {
 				log.Printf("[maintenance-worker %s] commit inventory scan error: %v", opts.WorkerID, err)
 				break
@@ -132,13 +132,13 @@ func RunMaintenanceWorker(ctx context.Context, dsn string, opts MaintenanceWorke
 				break
 			}
 		}
-		if _, err := scanOnePendingInventory(ctx, store, jobs, opts, now, 0); err != nil {
+		if _, err := scanOnePendingInventory(ctx, store, jobStore, jobs, opts, now, 0); err != nil {
 			log.Printf("[maintenance-worker %s] pending inventory scan error: %v", opts.WorkerID, err)
 		}
 		if err := enqueueDueMaintenance(ctx, store, jobs, now, opts.DuePageSize); err != nil {
 			return err
 		}
-		processed, err := processMaintenancePage(ctx, store, jobs, opts, now)
+		processed, err := processMaintenancePage(ctx, store, jobStore, jobs, opts, now)
 		if err != nil {
 			return err
 		}
@@ -219,19 +219,19 @@ func syncMaintenanceStates(ctx context.Context, store *meta.IcebergMaintenanceSt
 // scanOnePendingInventory performs one background metadata scan per poll. It
 // intentionally remains slow so a 6,000-table first scan never becomes a
 // burst. Detail-page requests use scanPriorityInventoryBatch instead.
-func scanOnePendingInventory(ctx context.Context, store *meta.IcebergMaintenanceStore, jobs map[string]maintenanceWorkerJob, opts MaintenanceWorkerOptions, now time.Time, minimumPriority int) (bool, error) {
+func scanOnePendingInventory(ctx context.Context, store *meta.IcebergMaintenanceStore, jobStore meta.JobStore, jobs map[string]maintenanceWorkerJob, opts MaintenanceWorkerOptions, now time.Time, minimumPriority int) (bool, error) {
 	state, err := store.ClaimPendingInventoryState(ctx, opts.WorkerID, now, opts.LeaseDuration, minimumPriority)
 	if err != nil || state == nil {
 		return false, err
 	}
-	return true, scanClaimedInventory(ctx, store, jobs, opts, now, *state)
+	return true, scanClaimedInventory(ctx, store, jobStore, jobs, opts, now, *state)
 }
 
 // scanPriorityInventoryBatch drains manual refreshes and commit-triggered
 // inventory updates without the normal poll delay. Each batch reads only a
 // few table metadata files concurrently, so a checkpoint that commits many
 // tables does not become an unbounded burst.
-func scanPriorityInventoryBatch(ctx context.Context, store *meta.IcebergMaintenanceStore, jobs map[string]maintenanceWorkerJob, opts MaintenanceWorkerOptions, now time.Time, minimumPriority, limit int) (int, error) {
+func scanPriorityInventoryBatch(ctx context.Context, store *meta.IcebergMaintenanceStore, jobStore meta.JobStore, jobs map[string]maintenanceWorkerJob, opts MaintenanceWorkerOptions, now time.Time, minimumPriority, limit int) (int, error) {
 	if limit <= 0 {
 		limit = interactiveInventoryBatchSize
 	}
@@ -259,7 +259,7 @@ func scanPriorityInventoryBatch(ctx context.Context, store *meta.IcebergMaintena
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := scanClaimedInventory(ctx, store, jobs, opts, now, item.state); err != nil {
+			if err := scanClaimedInventory(ctx, store, jobStore, jobs, opts, now, item.state); err != nil {
 				log.Printf("[maintenance-worker %s] priority inventory table=%s error: %v", opts.WorkerID, item.state.TableKey, err)
 			}
 		}()
@@ -268,8 +268,13 @@ func scanPriorityInventoryBatch(ctx context.Context, store *meta.IcebergMaintena
 	return len(claimed), nil
 }
 
-func scanClaimedInventory(ctx context.Context, store *meta.IcebergMaintenanceStore, jobs map[string]maintenanceWorkerJob, opts MaintenanceWorkerOptions, now time.Time, state meta.IcebergMaintenanceState) error {
-	job, ok := jobs[state.OwnerJobID]
+func scanClaimedInventory(ctx context.Context, store *meta.IcebergMaintenanceStore, jobStore meta.JobStore, jobs map[string]maintenanceWorkerJob, opts MaintenanceWorkerOptions, now time.Time, state meta.IcebergMaintenanceState) error {
+	job, ok, err := resolveMaintenanceWorkerJob(ctx, jobStore, jobs, state.OwnerJobID)
+	if err != nil {
+		message := fmt.Sprintf("load owner job configuration for inventory scan: %v", err)
+		_ = store.RecordStateError(ctx, state.TableKey, message)
+		return store.RetryInventoryClaim(ctx, state.TableKey, opts.WorkerID, now.Add(defaultInventoryRetryBackoff))
+	}
 	if !ok || job.Job.Config == nil {
 		message := "owner job configuration is unavailable for inventory scan"
 		_ = store.RecordStateError(ctx, state.TableKey, message)
@@ -277,7 +282,7 @@ func scanClaimedInventory(ctx context.Context, store *meta.IcebergMaintenanceSto
 	}
 
 	scanCtx, cancel := context.WithTimeout(ctx, job.Settings.Timeout)
-	err := refreshPendingInventory(scanCtx, store, job.Job.Config, state, job.Settings)
+	err = refreshPendingInventory(scanCtx, store, job.Job.Config, state, job.Settings)
 	cancel()
 	if err != nil {
 		_ = store.RecordStateError(ctx, state.TableKey, err.Error())
@@ -287,6 +292,44 @@ func scanClaimedInventory(ctx context.Context, store *meta.IcebergMaintenanceSto
 		return nil
 	}
 	return store.FinishInventoryClaim(ctx, state.TableKey, opts.WorkerID, state.LastSnapshotID)
+}
+
+// resolveMaintenanceWorkerJob uses the periodically refreshed job map during
+// normal operation. If a job was deleted and immediately re-submitted, that
+// map can briefly be stale. In that case reload only the owning job from the
+// durable registry instead of waiting for the next full state sync, which may
+// touch thousands of tables.
+func resolveMaintenanceWorkerJob(ctx context.Context, jobStore meta.JobStore, jobs map[string]maintenanceWorkerJob, jobID string) (maintenanceWorkerJob, bool, error) {
+	if job, ok := jobs[jobID]; ok && job.Job.Config != nil {
+		return job, true, nil
+	}
+	persisted, err := jobStore.LoadJobs(ctx)
+	if err != nil {
+		return maintenanceWorkerJob{}, false, err
+	}
+	for _, job := range persisted {
+		id := firstNonEmpty(strings.TrimSpace(job.ID), jobConfigID(job.Config))
+		if id != jobID || job.Config == nil {
+			continue
+		}
+		sinkType, sinkCfg := jobSinkSpec(job.Config)
+		if !strings.EqualFold(sinkType, "iceberg_native") || !nativeMaintenanceEnabledFromRaw(sinkCfg) {
+			return maintenanceWorkerJob{}, false, nil
+		}
+		settings, err := nativeMaintenanceSettingsFromRaw(sinkCfg)
+		if err != nil {
+			return maintenanceWorkerJob{}, false, err
+		}
+		return maintenanceWorkerJob{Job: job, Settings: settings}, true, nil
+	}
+	return maintenanceWorkerJob{}, false, nil
+}
+
+func jobConfigID(cfg *config.JobConfig) string {
+	if cfg == nil {
+		return ""
+	}
+	return strings.TrimSpace(cfg.ID)
 }
 
 func maintenanceSnapshotComplete(ctx context.Context, store *meta.IcebergMaintenanceStore, job meta.PersistedJob) bool {
@@ -358,7 +401,7 @@ func enqueueDueMaintenance(ctx context.Context, store *meta.IcebergMaintenanceSt
 	return nil
 }
 
-func processMaintenancePage(ctx context.Context, store *meta.IcebergMaintenanceStore, jobs map[string]maintenanceWorkerJob, opts MaintenanceWorkerOptions, now time.Time) (int, error) {
+func processMaintenancePage(ctx context.Context, store *meta.IcebergMaintenanceStore, jobStore meta.JobStore, jobs map[string]maintenanceWorkerJob, opts MaintenanceWorkerOptions, now time.Time) (int, error) {
 	tasks, err := store.ClaimTasks(ctx, opts.WorkerID, now, opts.LeaseDuration, opts.TaskPageSize)
 	if err != nil {
 		return 0, fmt.Errorf("claim maintenance tasks: %w", err)
@@ -391,7 +434,10 @@ func processMaintenancePage(ctx context.Context, store *meta.IcebergMaintenanceS
 			}
 			continue
 		}
-		job, ok := jobs[task.OwnerJobID]
+		job, ok, resolveErr := resolveMaintenanceWorkerJob(ctx, jobStore, jobs, task.OwnerJobID)
+		if resolveErr != nil {
+			return len(tasks), fmt.Errorf("load owner job configuration task=%d: %w", task.ID, resolveErr)
+		}
 		if !ok || job.Job.Config == nil {
 			failures++
 			message := "owner job configuration is unavailable"
