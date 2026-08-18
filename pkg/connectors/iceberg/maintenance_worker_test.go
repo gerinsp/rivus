@@ -70,6 +70,10 @@ func TestNativeMaintenanceSettingsEnvOverrides(t *testing.T) {
 	t.Setenv("RIVUS_MAINTENANCE_NATIVE_MAX_SELECTED_INPUT_BYTES", "1073741824")
 	t.Setenv("RIVUS_MAINTENANCE_NATIVE_MAX_SELECTED_FILES", "300")
 	t.Setenv("RIVUS_MAINTENANCE_NATIVE_MAX_EQUALITY_DELETE_FILES", "150")
+	t.Setenv("RIVUS_MAINTENANCE_NATIVE_SNAPSHOT_MAX_AGE_HOURS", "48")
+	t.Setenv("RIVUS_MAINTENANCE_NATIVE_SNAPSHOT_RETAIN_LAST", "20")
+	t.Setenv("RIVUS_MAINTENANCE_NATIVE_ORPHAN_MIN_AGE_HOURS", "240")
+	t.Setenv("RIVUS_MAINTENANCE_NATIVE_ORPHAN_DRY_RUN", "true")
 
 	settings, err := nativeMaintenanceSettingsFromRaw(map[string]any{
 		"table_maintenance": map[string]any{"enabled": true},
@@ -85,6 +89,18 @@ func TestNativeMaintenanceSettingsEnvOverrides(t *testing.T) {
 	}
 	if settings.MaxEqualityDeleteFiles != 150 {
 		t.Fatalf("max equality delete files = %d, want 150", settings.MaxEqualityDeleteFiles)
+	}
+	if settings.SnapshotMaxAge != 48*time.Hour {
+		t.Fatalf("snapshot max age = %s, want 48h", settings.SnapshotMaxAge)
+	}
+	if settings.SnapshotRetainLast != 20 {
+		t.Fatalf("snapshot retain last = %d, want 20", settings.SnapshotRetainLast)
+	}
+	if settings.OrphanMinAge != 240*time.Hour {
+		t.Fatalf("orphan min age = %s, want 240h", settings.OrphanMinAge)
+	}
+	if !settings.OrphanDryRun {
+		t.Fatalf("orphan dry run = false, want true")
 	}
 }
 
