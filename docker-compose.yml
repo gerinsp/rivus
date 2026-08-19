@@ -3,6 +3,8 @@ name: rivus
 x-rivus-common: &rivus-common
   image: ghcr.io/gerinsp/rivus:${RIVUS_IMAGE_TAG:-latest}
   restart: unless-stopped
+  # Must be longer than RIVUS_SHUTDOWN_TIMEOUT_SECONDS so Docker does not
+  # SIGKILL snapshot/streaming workers before their checkpoint drain finishes.
   stop_grace_period: ${RIVUS_STOP_GRACE_PERIOD:-2m}
   depends_on:
     meta-mysql:
@@ -12,6 +14,7 @@ x-rivus-common: &rivus-common
   environment: &rivus-environment
     TZ: ${TZ:-UTC}
     RIVUS_IMAGE_TAG: ${RIVUS_IMAGE_TAG:-latest}
+    RIVUS_SHUTDOWN_TIMEOUT_SECONDS: ${RIVUS_SHUTDOWN_TIMEOUT_SECONDS:-90}
     RIVUS_LOG_DIR: ${RIVUS_LOG_DIR:-/app/logs}
     RIVUS_LOG_RETENTION_DAYS: ${RIVUS_LOG_RETENTION_DAYS:-7}
     RIVUS_LOG_MAX_SIZE_MB: ${RIVUS_LOG_MAX_SIZE_MB:-64}
