@@ -761,7 +761,7 @@ func (m *JobManager) Shutdown(ctx context.Context) error {
 	var persistErrs []error
 	for _, job := range jobs {
 		status := job.GetStatus()
-		if err := m.saveManagedJobRecord(ctx, job, meta.DesiredStateRunning, status); err != nil {
+		if err := m.saveManagedJobRecordIfCurrent(ctx, job, status, meta.DesiredStateRunning, status); err != nil {
 			persistErrs = append(persistErrs, fmt.Errorf("persist restart intent job=%s: %w", job.Config.ID, err))
 		}
 
@@ -800,7 +800,7 @@ func (m *JobManager) Shutdown(ctx context.Context) error {
 
 	for _, job := range jobs {
 		status := job.GetStatus()
-		if err := m.saveManagedJobRecord(ctx, job, meta.DesiredStateRunning, status); err != nil {
+		if err := m.saveManagedJobRecordIfCurrent(ctx, job, status, meta.DesiredStateRunning, status); err != nil {
 			persistErrs = append(persistErrs, fmt.Errorf("persist drained job=%s: %w", job.Config.ID, err))
 		}
 	}
