@@ -238,6 +238,63 @@ func TestResubmitConditionalUpdateDoesNotFenceRunningJob(t *testing.T) {
 	}
 }
 
+func TestStaleWorkerPersistenceCannotOverwriteTerminalStatus(t *testing.T) {
+	store := newMemoryJobStore()
+	manager := NewJobManager(nil,
+		WithJobStore(store),
+		WithWorkerRole(WorkerRoleSnapshot),
+		WithWorkerID("snapshot-race"),
+	)
+	job := NewJob(newTestJobConfig("stale-status-race"), nil)
+
+	if err := store.SaveJob(context.Background(), meta.PersistedJob{
+		ID:            job.Config.ID,
+		Name:          job.Config.Name,
+		Config:        job.Config,
+		DesiredState:  meta.DesiredStateRunning,
+		ExecutionRole: meta.JobExecutionRoleSnapshot,
+		LastStatus:    string(JobStatusRunning),
+	}); err != nil {
+		t.Fatalf("seed job: %v", err)
+	}
+	if _, err := store.ClaimJobs(context.Background(), meta.JobExecutionRoleSnapshot, "snapshot-race", 1, time.Minute); err != nil {
+		t.Fatalf("claim job: %v", err)
+	}
+
+	manager.mu.Lock()
+	manager.jobs[job.Config.ID] = job
+	manager.executionRoles[job.Config.ID] = meta.JobExecutionRoleSnapshot
+	manager.workerLeases[job.Config.ID] = struct{}{}
+	manager.mu.Unlock()
+
+	setObservedJobStatus(job, JobStatusDone)
+	store.mu.Lock()
+	record := store.jobs[job.Config.ID]
+	record.DesiredState = meta.DesiredStateStopped
+	record.LastStatus = string(JobStatusDone)
+	store.jobs[job.Config.ID] = record
+	store.mu.Unlock()
+
+	if err := manager.saveManagedJobRecordIfCurrent(context.Background(), job, JobStatusRunning, meta.DesiredStateRunning, JobStatusRunning); err != nil {
+		t.Fatalf("stale save returned error: %v", err)
+	}
+	record, _ = store.Get(job.Config.ID)
+	if record.LastStatus != string(JobStatusDone) || record.DesiredState != meta.DesiredStateStopped {
+		t.Fatalf("stale save overwrote terminal row: status=%s desired=%s", record.LastStatus, record.DesiredState)
+	}
+
+	manager.mu.Lock()
+	manager.executionRoles[job.Config.ID] = meta.JobExecutionRoleStreaming
+	manager.mu.Unlock()
+	if err := manager.saveManagedJobRecordIfCurrent(context.Background(), job, JobStatusDone, meta.DesiredStateRunning, JobStatusStopped); err != nil {
+		t.Fatalf("handoff save returned error: %v", err)
+	}
+	record, _ = store.Get(job.Config.ID)
+	if record.LastStatus != string(JobStatusStopped) || record.DesiredState != meta.DesiredStateRunning || record.ExecutionRole != meta.JobExecutionRoleStreaming {
+		t.Fatalf("handoff save status=%s desired=%s role=%s", record.LastStatus, record.DesiredState, record.ExecutionRole)
+	}
+}
+
 func TestWorkerAppliesDurablePauseGracefully(t *testing.T) {
 	store := newMemoryJobStore()
 	drainStarted := make(chan struct{}, 1)
