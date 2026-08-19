@@ -37,6 +37,16 @@ func NewServer(jm *core.JobManager, uiDir string, auth AuthConfig) *Server {
 	}
 }
 
+func noStoreUI(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The dashboard is shipped inside the Rivus image and changes together
+		// with the backend. Revalidate on every navigation so a browser cannot
+		// keep an old ES module after a container/image rollout.
+		w.Header().Set("Cache-Control", "no-store")
+		next.ServeHTTP(w, r)
+	})
+}
+
 func (s *Server) Router() http.Handler {
 	mux := http.NewServeMux()
 
@@ -74,7 +84,7 @@ func (s *Server) Router() http.Handler {
 	mux.Handle("GET /api/jobs/{id}/graph", s.requireAPIAuth(s.handleGetJobGraph))
 
 	fs := http.FileServer(http.Dir(s.uiDir))
-	mux.Handle("/", s.requirePageAuth(fs))
+	mux.Handle("/", s.requirePageAuth(noStoreUI(fs)))
 
 	return mux
 }
