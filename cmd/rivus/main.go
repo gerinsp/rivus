@@ -34,46 +34,69 @@ func main() {
 		defer logCloser.Close()
 	}
 
-	if len(os.Args) > 1 && os.Args[1] == "maintenance-worker" {
-		if err := runMaintenanceWorkerCommand(os.Args[2:]); err != nil {
-			log.Fatalf("maintenance worker error: %v", err)
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "maintenance-worker":
+			if err := runMaintenanceWorkerCommand(os.Args[2:]); err != nil {
+				log.Fatalf("maintenance worker error: %v", err)
+			}
+			return
+		case "snapshot-worker":
+			if err := runJobWorkerCommand("snapshot-worker", os.Args[2:], core.WorkerRoleSnapshot); err != nil {
+				log.Fatalf("snapshot worker error: %v", err)
+			}
+			return
+		case "streaming-worker":
+			if err := runJobWorkerCommand("streaming-worker", os.Args[2:], core.WorkerRoleStreaming); err != nil {
+				log.Fatalf("streaming worker error: %v", err)
+			}
+			return
+		case "master":
+			if err := runServerWithRole(os.Args[2:], core.WorkerRoleMaster); err != nil {
+				log.Fatalf("master error: %v", err)
+			}
+			return
 		}
-		return
-	}
-	if len(os.Args) > 1 && os.Args[1] == "snapshot-worker" {
-		if err := runSnapshotWorkerCommand(os.Args[2:]); err != nil {
-			log.Fatalf("snapshot worker error: %v", err)
-		}
-		return
 	}
 
+	// Backward-compatible server mode. Existing deployments may continue using
+	// RIVUS_WORKER_ROLE=all/snapshot/streaming while migrating to explicit
+	// master and standalone worker commands.
 	if err := runServer(os.Args[1:]); err != nil {
 		log.Fatalf("server error: %v", err)
 	}
 }
 
-func runSnapshotWorkerCommand(args []string) error {
-	fs := flag.NewFlagSet("snapshot-worker", flag.ContinueOnError)
+func newConnectorRegistry() *connector.Registry {
+	reg := connector.NewRegistry()
+	mysql.Register(reg)
+	doris.Register(reg)
+	iceberg.Register(reg)
+	return reg
+}
+
+func runJobWorkerCommand(command string, args []string, role core.WorkerRole) error {
+	fs := flag.NewFlagSet(command, flag.ContinueOnError)
 	workerID := fs.String("worker-id", strings.TrimSpace(os.Getenv("RIVUS_WORKER_ID")), "stable worker identity (defaults to hostname-pid)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if role != core.WorkerRoleSnapshot && role != core.WorkerRoleStreaming {
+		return fmt.Errorf("%s requires snapshot or streaming role", command)
+	}
+
 	dsn := strings.TrimSpace(os.Getenv("RIVUS_META_MYSQL_DSN"))
 	if dsn == "" {
-		return errors.New("snapshot-worker requires RIVUS_META_MYSQL_DSN")
+		return fmt.Errorf("%s requires RIVUS_META_MYSQL_DSN", command)
 	}
 	jobStore, err := meta.NewMySQLJobStore(dsn)
 	if err != nil {
 		return err
 	}
-	reg := connector.NewRegistry()
-	mysql.Register(reg)
-	doris.Register(reg)
-	iceberg.Register(reg)
-	manager := core.NewJobManager(reg,
+	manager := core.NewJobManager(newConnectorRegistry(),
 		core.WithJobStore(jobStore),
 		core.WithDefaultMetaMySQLDSN(dsn),
-		core.WithWorkerRole(core.WorkerRoleSnapshot),
+		core.WithWorkerRole(role),
 		core.WithWorkerID(*workerID),
 		core.WithWorkerTiming(workerTimingFromEnv()),
 	)
@@ -86,12 +109,21 @@ func runSnapshotWorkerCommand(args []string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if err := manager.RunWorker(ctx); err != nil {
-		return err
+	errCh := make(chan error, 2)
+	go func() { errCh <- manager.RunWorker(ctx) }()
+	go func() { errCh <- manager.RunControlObserver(ctx) }()
+
+	var runErr error
+	select {
+	case <-ctx.Done():
+	case runErr = <-errCh:
+		stop()
 	}
+
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), gracefulShutdownTimeoutFromEnv())
 	defer cancel()
-	return manager.Shutdown(shutdownCtx)
+	shutdownErr := manager.Shutdown(shutdownCtx)
+	return errors.Join(runErr, shutdownErr)
 }
 
 func runMaintenanceWorkerCommand(args []string) error {
@@ -127,6 +159,10 @@ func runMaintenanceWorkerCommand(args []string) error {
 }
 
 func runServer(args []string) error {
+	return runServerWithRole(args, "")
+}
+
+func runServerWithRole(args []string, forcedRole core.WorkerRole) error {
 	fs := flag.NewFlagSet("rivus", flag.ContinueOnError)
 	addr := fs.String("addr", ":8080", "HTTP listen address")
 	uiDir := fs.String("ui-dir", "./ui", "UI directory")
@@ -134,23 +170,32 @@ func runServer(args []string) error {
 		return err
 	}
 
-	reg := connector.NewRegistry()
-	mysql.Register(reg)
-	doris.Register(reg)
-	iceberg.Register(reg)
-
-	jobManagerOpts := make([]core.JobManagerOption, 0, 3)
-	workerRole, err := core.ParseWorkerRole(os.Getenv("RIVUS_WORKER_ROLE"))
-	if err != nil {
-		return err
+	workerRole := forcedRole
+	if workerRole == "" {
+		var err error
+		workerRole, err = core.ParseWorkerRole(os.Getenv("RIVUS_WORKER_ROLE"))
+		if err != nil {
+			return err
+		}
 	}
+
+	jobManagerOpts := make([]core.JobManagerOption, 0, 5)
 	jobManagerOpts = append(jobManagerOpts, core.WithAutoResume(envBool("RIVUS_AUTO_RESUME", false)))
-	jobManagerOpts = append(jobManagerOpts, core.WithWorkerRole(workerRole))
+	if workerRole == core.WorkerRoleMaster {
+		jobManagerOpts = append(jobManagerOpts, core.WithControlPlaneRole())
+	} else {
+		jobManagerOpts = append(jobManagerOpts, core.WithWorkerRole(workerRole))
+	}
 	jobManagerOpts = append(jobManagerOpts,
 		core.WithWorkerID(strings.TrimSpace(os.Getenv("RIVUS_WORKER_ID"))),
 		core.WithWorkerTiming(workerTimingFromEnv()),
 	)
-	if dsn := strings.TrimSpace(os.Getenv("RIVUS_META_MYSQL_DSN")); dsn != "" {
+
+	dsn := strings.TrimSpace(os.Getenv("RIVUS_META_MYSQL_DSN"))
+	if workerRole == core.WorkerRoleMaster && dsn == "" {
+		return errors.New("master requires RIVUS_META_MYSQL_DSN")
+	}
+	if dsn != "" {
 		jobStore, err := meta.NewMySQLJobStore(dsn)
 		if err != nil {
 			return err
@@ -160,25 +205,29 @@ func runServer(args []string) error {
 			core.WithDefaultMetaMySQLDSN(dsn),
 		)
 	}
-	jobManager := core.NewJobManager(reg, jobManagerOpts...)
+
+	jobManager := core.NewJobManager(newConnectorRegistry(), jobManagerOpts...)
 	restoreCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
 	if err := jobManager.RestorePersistedJobs(restoreCtx); err != nil {
+		cancel()
 		return err
 	}
+	cancel()
+
 	workerCtx, stopWorker := context.WithCancel(context.Background())
 	defer stopWorker()
 	var workerErr <-chan error
-	if workerRole != core.WorkerRoleAll {
-		ch := make(chan error, 1)
+	if workerRole == core.WorkerRoleSnapshot || workerRole == core.WorkerRoleStreaming {
+		ch := make(chan error, 2)
 		workerErr = ch
 		go func() { ch <- jobManager.RunWorker(workerCtx) }()
+		go func() { ch <- jobManager.RunControlObserver(workerCtx) }()
 	}
+
 	authConfig, err := api.LoadAuthConfigFromEnv()
 	if err != nil {
 		return err
 	}
-
 	apiServer := api.NewServer(jobManager, *uiDir, authConfig)
 	httpServer := &http.Server{
 		Addr:              *addr,
@@ -186,7 +235,7 @@ func runServer(args []string) error {
 		ReadHeaderTimeout: 15 * time.Second,
 	}
 
-	log.Printf("Starting rivus on %s ...", *addr)
+	log.Printf("Starting rivus role=%s on %s ...", workerRole, *addr)
 	serverErr := make(chan error, 1)
 	go func() {
 		serverErr <- httpServer.ListenAndServe()
@@ -203,6 +252,7 @@ func runServer(args []string) error {
 		}
 		return err
 	case err := <-workerErr:
+		stopWorker()
 		if err != nil {
 			_ = httpServer.Close()
 			return err
