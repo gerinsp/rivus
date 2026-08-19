@@ -19,7 +19,9 @@ x-rivus-common: &rivus-common
     RIVUS_LOG_RETENTION_DAYS: ${RIVUS_LOG_RETENTION_DAYS:-7}
     RIVUS_LOG_MAX_SIZE_MB: ${RIVUS_LOG_MAX_SIZE_MB:-64}
     RIVUS_LOG_MAX_TOTAL_SIZE_MB: ${RIVUS_LOG_MAX_TOTAL_SIZE_MB:-2048}
-    RIVUS_LOG_STDERR: ${RIVUS_LOG_STDERR:-true}
+    # Streaming/maintenance logs can be very noisy. Keep them in Rivus'
+    # rotating files by default; the master log UI reads those shared files.
+    RIVUS_LOG_STDERR: ${RIVUS_LOG_STDERR:-false}
   logging:
     driver: json-file
     options:
