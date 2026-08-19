@@ -5,7 +5,11 @@
 <h1 align="center">Rivus</h1>
 
 <p align="center">
-  A lightweight streaming data engine for MySQL snapshots, binlog CDC, Doris, and Apache Iceberg.
+  <strong>Lakehouse-first streaming engine.</strong>
+</p>
+
+<p align="center">
+  Stream MySQL snapshots and binlog CDC into Apache Iceberg or Apache Doris with durable state, isolated runtime roles, and built-in lakehouse maintenance.
 </p>
 
 <p align="center">
@@ -15,391 +19,228 @@
   <a href="https://github.com/gerinsp/rivus/pkgs/container/rivus"><img src="https://img.shields.io/badge/ghcr.io-rivus-blue" alt="GHCR"></a>
 </p>
 
-Rivus is a small streaming data engine for moving table data from MySQL into analytical stores. It supports initial snapshots, MySQL binlog CDC, resumable job state, and a lightweight web UI for submitting and monitoring jobs.
+Rivus is a focused CDC engine for continuously moving operational MySQL data into analytical systems. It is designed around the operational needs of a lakehouse rather than general-purpose stream processing: initial snapshots, resumable binlog CDC, durable job ownership, Iceberg commits, table maintenance, and a lightweight control-plane UI all live in one project.
+
+## Project status
+
+Rivus is an early-stage, pre-1.0 open-source project. It is suitable for controlled production use when operators understand the source, sink, checkpoint, and metadata requirements, but the public compatibility and release guarantees are still evolving.
+
+For production adoption, read:
+
+- [Production deployment](docs/production-deployment.md)
+- [Runtime roles](docs/runtime-roles.md)
+- [Compatibility](docs/compatibility.md)
+- [Migration and upgrades](docs/migration.md)
+- [Release policy](docs/release-policy.md)
+- [Benchmarking methodology](docs/benchmarking.md)
+- [Security policy](SECURITY.md)
+
+## Why Rivus
+
+Rivus deliberately keeps the execution model small and lakehouse-oriented:
+
+- **CDC-first** — MySQL binlog streaming is the primary workload.
+- **Snapshot aware** — initial loads run independently from long-lived CDC.
+- **Lakehouse native** — Apache Iceberg is a first-class sink with REST catalog support.
+- **Analytical serving** — Apache Doris is supported as a native sink.
+- **Durable control plane** — job state, checkpoints, leases, and maintenance state live in metadata MySQL.
+- **Operational isolation** — master, streaming, snapshot, and maintenance run as separate processes from the same image.
+- **Built-in maintenance** — Iceberg compaction, snapshot expiration, and orphan cleanup are integrated instead of being treated as an unrelated external workflow.
+- **Small operational surface** — one binary, one image, YAML/JSON job definitions, REST API, and web dashboard.
+
+Rivus is not intended to replace a general-purpose stream processor for arbitrary event-time SQL, complex DAGs, or broad message-bus processing. Its scope is intentionally narrower: reliable database-to-lakehouse and database-to-analytics replication.
+
+## Architecture
+
+One Rivus image can run four independent runtime roles:
+
+```text
+                         ┌──────────────────────┐
+                         │     rivus-master     │
+                         │ API / UI / lifecycle │
+                         └──────────┬───────────┘
+                                    │
+                         durable metadata MySQL
+                                    │
+              ┌─────────────────────┼─────────────────────┐
+              │                     │                     │
+              ▼                     ▼                     ▼
+      rivus-streaming        rivus-snapshot       rivus-maintenance
+         binlog CDC          initial snapshot     compact / expire / orphan
+              │                     │                     │
+              └──────────────┬──────┴─────────────────────┘
+                             │
+                    Iceberg / Doris
+```
+
+The master is a control plane. It does not own CDC or snapshot pipelines. Streaming and snapshot workers claim durable jobs through leases, while the maintenance worker consumes an independent durable maintenance queue.
+
+See [docs/runtime-roles.md](docs/runtime-roles.md) for lifecycle and handoff details.
 
 ## Features
 
 - Chunked initial snapshots from MySQL.
 - `snapshot-only` mode for one-time loads without CDC.
 - MySQL binlog CDC using `go-mysql`.
+- Durable offsets, job registry, execution roles, and worker leases in MySQL metadata storage.
+- Snapshot-to-streaming handoff from a captured binlog checkpoint.
+- Graceful pause, resume, cancel, restart, and checkpoint drain behavior.
 - Doris sink with table creation, DDL forwarding, batching, retries, and stream-load support.
-- Native Iceberg REST catalog sink for object storage-backed tables.
-- Hybrid Iceberg maintenance with a durable MySQL scheduler, native `iceberg-go` operations, and Spark fallback for heavy compaction.
-- Persistent offsets and job registry in MySQL metadata storage.
-- Multi-job REST API and dashboard UI.
-- Pause/resume behavior that drains buffered events before checkpointing.
-- Optional UI and API protection using environment variables.
+- Native Iceberg REST catalog sink for object-storage-backed tables.
+- Hybrid Iceberg maintenance with durable scheduling, native `iceberg-go` operations, and Spark fallback for heavy compaction.
+- Master API/UI with durable worker progress and maintenance state.
+- Central log viewer over role-separated rotating files.
+- Optional UI login and API-token protection.
 - YAML/JSON job configs with `${ENV_VAR}` placeholder expansion.
+- Multi-architecture container images for `linux/amd64` and `linux/arm64`.
 
-## Quick Start
+## Quick start
 
 Prerequisites:
 
-- Docker for the published image.
-- Go 1.25 or newer for source development.
+- Docker with Compose support.
+- A MySQL source with binlog access for CDC jobs.
+- Sink infrastructure for the job you want to run: Apache Doris or an Iceberg REST catalog plus object storage.
+- Go 1.25 or newer only when building from source.
 
-Run the normal CDC/API server:
-
-```sh
-docker pull ghcr.io/gerinsp/rivus:latest
-docker run --rm -p 8080:8080 ghcr.io/gerinsp/rivus:latest
-```
-
-Then open `http://localhost:8080`.
-
-Run from source:
+Clone the repository, create an environment file, and start the reference stack:
 
 ```sh
-go run ./cmd/rivus -addr :8080 -ui-dir ./ui
+git clone https://github.com/gerinsp/rivus.git
+cd rivus
+cp .env.example .env
+docker compose up -d
 ```
 
-## Two-container Iceberg maintenance
+The repository Compose file starts metadata MySQL plus the four Rivus runtime roles. Open the dashboard at `http://localhost:8080` unless `RIVUS_HTTP_PORT` was changed.
 
-The same Rivus image supports two independent process modes. Do not run both processes in one container.
+Before using the reference Compose definition outside local testing, change the example credentials and read [docs/production-deployment.md](docs/production-deployment.md).
 
-```text
-                    same rivus image
-                          |
-             +------------+------------+
-             |                         |
-             v                         v
-      rivus-streaming            rivus-maintenance
-      /app/rivus                 /app/rivus
-        -addr :8080                maintenance-worker --queue
-             |                         |
-      MySQL CDC -> Iceberg       durable MySQL queue
-                                       |
-                                +------+------+
-                                |             |
-                             native          Spark
-                         maintenance       compaction
-```
+## Runtime commands
 
-Example Compose service split:
-
-```yaml
-services:
-  rivus-streaming:
-    image: ghcr.io/gerinsp/rivus:latest
-    command: ["/app/rivus", "-addr", ":8080", "-ui-dir", "./ui"]
-    environment:
-      RIVUS_META_MYSQL_DSN: ${RIVUS_META_MYSQL_DSN}
-
-  rivus-maintenance:
-    image: ghcr.io/gerinsp/rivus:latest
-    command: ["/app/rivus", "maintenance-worker", "--queue"]
-    environment:
-      RIVUS_META_MYSQL_DSN: ${RIVUS_META_MYSQL_DSN}
-      RIVUS_MAINTENANCE_GOMAXPROCS: "1"
-      GOMEMLIMIT: 256MiB
-```
-
-Both containers need the same Iceberg REST/object-storage credentials. The maintenance worker must also be able to reach runner-app/Spark when `executor: hybrid` may route compaction to Spark or when `executor: spark` is configured.
-
-The default Docker command is still the normal Rivus server; the image does not start a maintenance process automatically.
-
-## Hybrid Iceberg maintenance
-
-Automatic maintenance is enabled with one master switch. Compaction behavior is selected independently with `executor`:
-
-```yaml
-sink:
-  type: iceberg_native
-  config:
-    # normal Iceberg REST/S3 settings...
-    table_maintenance:
-      enabled: true
-      executor: hybrid
-      native_signal_delay_seconds: 300
-      native_idle_check_interval_seconds: 604800
-
-      # runner/Spark integration used by hybrid fallback or executor: spark
-      runner_uri: http://runner-app:8001
-      runner_api_token: ${RUNNER_API_TOKEN}
-      runner_resource_profile: small
-      catalog_name: rivus
-
-      # hybrid native-compaction boundary. A table becomes eligible after
-      # 200 active small files, 50 active equality-delete files, or 10 small
-      # files totaling 256 MiB.
-      small_file_size_bytes: 67108864
-      small_files_min_count: 10
-      small_files_min_total_bytes: 268435456
-      native_max_selected_input_bytes: 536870912
-      native_max_selected_files: 250
-      native_max_equality_delete_files: 100
-      position_delete_files_threshold: 25 # Spark compaction after this many active position deletes
-      native_target_file_size_bytes: 134217728
-      native_scan_concurrency: 1
-      native_timeout_seconds: 600
-
-      # metadata cleanup
-      native_expire_interval_seconds: 86400
-      native_snapshot_max_age_hours: 168
-      native_snapshot_retain_last: 10
-      native_orphan_interval_seconds: 2592000
-      native_orphan_inactive_interval_seconds: 7776000
-      native_orphan_min_age_hours: 168
-      native_orphan_dry_run: true
-      worker_temp_directory: /tmp/rivus-maintenance
-```
-
-The 256 MiB value is an additional compaction trigger. It is not required once
-the active small-file count reaches 200 or equality deletes reach 50.
-
-The executor modes are:
-
-- `hybrid` — default; the worker chooses native or Spark for each compaction task.
-- `native` — compaction stays in `iceberg-go`; no Spark fallback.
-- `spark` — every automatic compaction task is submitted to Spark.
-
-Snapshot expiration and orphan cleanup stay native in every executor mode. `enabled: false` disables automatic maintenance completely. The old `native_enabled` rollout flag is retired and is no longer part of the user-facing configuration.
-
-In hybrid mode, total table size is not the routing metric: Rivus sums only selected rewrite groups. By default, selected work up to 512 MiB and 100 files can run natively. Larger rewrites, position-delete workloads, and multiple substantial groups route to the existing Spark maintenance integration.
-
-Native compaction uses atomic `RewriteDataFiles`, applies equality deletes while reading, and uses Iceberg's dead-equality-delete logic before removing equality-delete files. Snapshot expiration is native and keeps at least ten snapshots with a seven-day default maximum age. Orphan cleanup is native and disk-bucketed so the complete referenced/candidate sets do not need to live in memory at once.
-
-CDC is not paused for maintenance. The worker checks the initial snapshot barrier before scheduling a table; commit conflicts are maintenance retries, so CDC wins concurrent writes.
-
-For the complete scheduler schema, executor behavior, safety model, API and rollout guide, see [`docs/iceberg-maintenance.md`](docs/iceberg-maintenance.md).
-
-## Durable scheduler
-
-Maintenance state is stored in metadata MySQL rather than a 6,000-table in-memory priority queue. The worker creates:
-
-- `iceberg_maintenance_state`
-- `iceberg_maintenance_tasks`
-- `iceberg_maintenance_runs`
-- `iceberg_maintenance_results`
-
-Due state is read in bounded pages, tasks use idempotency keys, MySQL 8 leases use `FOR UPDATE SKIP LOCKED`, expired leases are reclaimable, and deterministic jitter prevents every table from waking at the same time.
-
-Useful worker environment variables:
-
-```env
-RIVUS_META_MYSQL_DSN=rivus:change-me@tcp(meta-mysql:3306)/rivus_meta?parseTime=true
-RIVUS_MAINTENANCE_GOMAXPROCS=4
-RIVUS_MAINTENANCE_POLL_INTERVAL_SECONDS=30
-RIVUS_MAINTENANCE_LEASE_SECONDS=900
-RIVUS_MAINTENANCE_TASK_PAGE_SIZE=1
-RIVUS_MAINTENANCE_DUE_PAGE_SIZE=100
-GOMEMLIMIT=3GiB
-
-# Global overrides for native compaction boundaries (optional)
-RIVUS_MAINTENANCE_NATIVE_MAX_SELECTED_INPUT_BYTES=1073741824   # 1 GB
-RIVUS_MAINTENANCE_NATIVE_MAX_SELECTED_FILES=300
-RIVUS_MAINTENANCE_NATIVE_MAX_EQUALITY_DELETE_FILES=150
-
-# Global overrides for snapshot expiration & orphan cleanup (optional)
-RIVUS_MAINTENANCE_NATIVE_EXPIRE_INTERVAL_SECONDS=86400         # Check 1x per day
-RIVUS_MAINTENANCE_NATIVE_SNAPSHOT_MAX_AGE_HOURS=168            # Delete snapshots > 7 days
-RIVUS_MAINTENANCE_NATIVE_SNAPSHOT_RETAIN_LAST=10               # Retain last 10 snapshots
-RIVUS_MAINTENANCE_NATIVE_ORPHAN_INTERVAL_SECONDS=2592000       # 1x per 30 days
-RIVUS_MAINTENANCE_NATIVE_ORPHAN_MIN_AGE_HOURS=168              # Delete orphan files > 7 days
-RIVUS_MAINTENANCE_NATIVE_ORPHAN_DRY_RUN=false
-```
-
-Example Docker Compose service setup:
-
-```yaml
-  rivus-maintenance:
-    image: ghcr.io/gerinsp/rivus:latest
-    container_name: rivus-maintenance
-    command: ["/app/rivus", "maintenance-worker", "--queue"]
-    restart: unless-stopped
-    mem_limit: 4g
-    depends_on:
-      meta-mysql:
-        condition: service_healthy
-    environment:
-      TZ: Asia/Jakarta
-      GOMEMLIMIT: 3GiB
-      RIVUS_MAINTENANCE_GOMAXPROCS: 4
-      RIVUS_META_MYSQL_DSN: rivus:password@tcp(meta-mysql:3306)/rivus_meta?parseTime=true
-    volumes:
-      - ./maintenance-tmp:/tmp/rivus-maintenance
-```
-
-One-shot and queue modes:
+The same binary is used for every role:
 
 ```sh
-/app/rivus maintenance-worker
+/app/rivus master
+/app/rivus streaming-worker
+/app/rivus snapshot-worker
 /app/rivus maintenance-worker --queue
 ```
 
-## Maintenance API
+Job YAML does not need a worker field. Rivus assigns snapshot-capable modes to the snapshot worker and normal CDC/resume execution to the streaming worker through durable metadata.
 
-The API is protected by the same Rivus API authentication as other protected endpoints:
+## Job configuration
 
-```text
-GET /api/iceberg/maintenance/summary
-GET /api/iceberg/maintenance/runs?limit=50&offset=0
-GET /api/iceberg/maintenance/runs/{id}?limit=100
-GET /api/iceberg/maintenance/tables/{catalog.namespace.table}
-```
+Generic examples are available in:
 
-The existing per-job manual maintenance endpoint remains available for compatibility:
+- [`examples/mysql-to-doris.yaml`](examples/mysql-to-doris.yaml)
+- [`examples/mysql-to-iceberg.yaml`](examples/mysql-to-iceberg.yaml)
+
+Jobs can be submitted through the dashboard or API:
 
 ```sh
-curl -X POST -H 'Content-Type: application/json'   -d '{"tables":["analytics.orders"],"operations":[{"type":"rewrite_data_files"}]}'   http://localhost:8080/api/jobs/example-mysql-to-iceberg/iceberg/maintenance
+curl -X POST \
+  -H 'Content-Type: application/x-yaml' \
+  --data-binary @examples/mysql-to-iceberg.yaml \
+  http://localhost:8080/api/jobs
 ```
 
-## Configuration
-
-Rivus jobs are submitted as YAML or JSON through the UI or API. Generic examples are available in:
-
-- `examples/mysql-to-doris.yaml`
-- `examples/mysql-to-iceberg.yaml`
-
-Submit a job:
-
-```sh
-curl -X POST   -H 'Content-Type: application/x-yaml'   --data-binary @examples/mysql-to-doris.yaml   http://localhost:8080/api/jobs
-```
-
-If `RIVUS_API_TOKEN` is set, pass either:
+When `RIVUS_API_TOKEN` is configured, pass either:
 
 ```text
 X-Rivus-Token: <token>
 Authorization: Bearer <token>
 ```
 
-Important server environment variables:
+Do not commit source credentials, API tokens, object-storage keys, or metadata database passwords into job files.
 
-```env
-RIVUS_META_MYSQL_DSN=rivus:change-me@tcp(meta-mysql:3306)/rivus_meta?parseTime=true
-RIVUS_UI_LOGIN_ENABLED=false
-RIVUS_UI_LOGIN_USERNAME=admin
-RIVUS_UI_LOGIN_PASSWORD=change-me
-RIVUS_UI_SESSION_SECRET=change-me
-RIVUS_API_TOKEN=
-RIVUS_AUTO_RESUME=false
-RIVUS_WORKER_ROLE=all
-RIVUS_WORKER_ID=
-RIVUS_WORKER_POLL_INTERVAL_SECONDS=2
-RIVUS_WORKER_LEASE_SECONDS=30
-RIVUS_SHUTDOWN_TIMEOUT_SECONDS=90
-RIVUS_LOG_DIR=/app/logs
-RIVUS_LOG_STDERR=true
-```
+## Iceberg maintenance
 
-Iceberg integrations can use:
+Rivus can maintain Iceberg tables through the same durable platform used by CDC.
 
-```env
-ICEBERG_REST_URI=http://iceberg-rest:8181
-ICEBERG_WAREHOUSE=warehouse
-ICEBERG_REST_AUTH_HEADER=
-ICEBERG_REST_BASIC_USERNAME=
-ICEBERG_REST_BASIC_PASSWORD=
-ICEBERG_S3_ENDPOINT=http://minio:9000
-ICEBERG_S3_PATH_STYLE=true
-AWS_ACCESS_KEY_ID=change-me
-AWS_SECRET_ACCESS_KEY=change-me
-AWS_DEFAULT_REGION=us-east-1
-```
+Supported maintenance operations include:
 
-## Snapshots and shutdown
+- data-file rewrite / compaction;
+- snapshot expiration;
+- orphan-file cleanup.
 
-On `SIGTERM` or `SIGINT`, the server stops starting new work, drains active jobs to committed checkpoints, and preserves their desired state as `RUNNING`. Set `RIVUS_AUTO_RESUME=true` with `RIVUS_META_MYSQL_DSN` to resume saved running jobs after replacement.
+The maintenance worker can use native `iceberg-go` operations and optionally route heavy compaction to an external Spark runner when `executor: hybrid` or `executor: spark` is configured.
 
-Initial MySQL snapshots for `iceberg_native` use a disk-backed rolling writer by default. Each source batch is spooled locally and acknowledged without advancing durable table progress; at table completion Rivus streams the spool into Iceberg Parquet files and then advances snapshot progress.
+CDC is not paused for routine maintenance. Maintenance uses its own durable queue and retry model.
 
-```yaml
-sink:
-  type: iceberg_native
-  config:
-    snapshot_rolling_enabled: true
-    snapshot_target_file_size_bytes: 134217728
-    snapshot_parquet_row_group_rows: 50000
-    snapshot_spool_directory: /tmp/rivus-snapshot-spool
-    snapshot_spool_max_bytes: 21474836480
-```
+See [docs/iceberg-maintenance.md](docs/iceberg-maintenance.md) and [docs/maintenance-concurrency.md](docs/maintenance-concurrency.md).
 
-### Isolated snapshot worker
+## Logs and observability
 
-Large initial snapshots can run in a separate container so their temporary
-heap, local spool, and CPU usage do not compete with CDC streaming. Both
-containers use the same image, metadata DSN, Iceberg catalog, and object-store
-credentials.
-
-```yaml
-services:
-  rivus-streaming:
-    image: ghcr.io/gerinsp/rivus:latest
-    command: ["/app/rivus", "-addr", ":8080", "-ui-dir", "./ui"]
-    environment:
-      RIVUS_META_MYSQL_DSN: ${RIVUS_META_MYSQL_DSN}
-      RIVUS_WORKER_ROLE: streaming
-      RIVUS_WORKER_ID: streaming-1
-      GOMEMLIMIT: 4GiB
-    ports:
-      - "8080:8080"
-
-  rivus-snapshot:
-    image: ghcr.io/gerinsp/rivus:latest
-    command: ["/app/rivus", "snapshot-worker", "--worker-id", "snapshot-1"]
-    environment:
-      RIVUS_META_MYSQL_DSN: ${RIVUS_META_MYSQL_DSN}
-      RIVUS_MAX_CONCURRENT_SNAPSHOT_JOBS: "1"
-      GOMEMLIMIT: 6GiB
-    volumes:
-      - ./snapshot-spool:/tmp/rivus-snapshot-spool
-```
-
-Submit the normal job YAML to the streaming API with `mode: initial`. The API
-stores it as durable snapshot work instead of running it locally. The snapshot
-worker leases the job, writes the initial snapshot, and stops before CDC. It
-then changes the durable assignment to `STREAMING`; the streaming process
-leases the same job and resumes from the binlog position captured before the
-snapshot began.
-
-The lease is renewed while work is active. If a worker exits, another replica
-of the same role may continue after `RIVUS_WORKER_LEASE_SECONDS`. Interrupted
-snapshots resume from saved table progress and still stop at the handoff
-boundary. `snapshot-only` jobs finish in the snapshot worker and are not handed
-to streaming.
-
-`RIVUS_WORKER_ROLE=all` is the default and preserves the original
-single-container behavior. Do not run an old `all` process beside the split
-workers for the same metadata database.
-
-For memory-sensitive workloads, start with one concurrent snapshot and a
-source `snapshot_batch_size` around 5,000. Raising
-`RIVUS_MAX_CONCURRENT_SNAPSHOT_JOBS` to `2` permits two large snapshot batches,
-Parquet writers, and spools to exist at the same time, so size the snapshot
-container independently from streaming.
-
-## Docker
-
-Published images are distributed through GitHub Container Registry:
-
-```sh
-docker pull ghcr.io/gerinsp/rivus:latest
-docker run --rm -p 8080:8080 ghcr.io/gerinsp/rivus:latest
-```
-
-The publish workflow pushes images on `main` and version tags. The default `CMD` remains:
+The recommended split-runtime layout uses one shared log root with one subdirectory per role:
 
 ```text
-/app/rivus -addr :8080 -ui-dir ./ui
+/app/logs/
+├── master/
+│   └── rivus-*.log
+├── streaming/
+│   └── rivus-streaming-*.log
+├── snapshot/
+│   └── rivus-snapshot-*.log
+└── maintenance/
+    └── rivus-maintenance-*.log
 ```
+
+The master can read all role directories for the dashboard, while job log views prefer the streaming log for CDC jobs. High-volume application logging is file-based and rotated by Rivus; `RIVUS_LOG_STDERR=false` is the recommended default so CDC output is not duplicated into Docker's log driver.
+
+## Production notes
+
+For production deployments:
+
+- pin a release or immutable `sha-*` image instead of `latest`;
+- keep metadata MySQL durable and backed up;
+- stop Rivus workers gracefully so active jobs can drain checkpoints;
+- keep Docker `stop_grace_period` longer than `RIVUS_SHUTDOWN_TIMEOUT_SECONDS`;
+- enable UI/API authentication before exposing the master outside a trusted network;
+- persist the snapshot spool when interrupted snapshots must resume across container replacement;
+- verify source binlog retention is long enough for planned outages and snapshot duration;
+- monitor worker leases, job progress, maintenance queues, storage growth, and checkpoint freshness.
+
+The complete checklist is in [docs/production-deployment.md](docs/production-deployment.md).
+
+## Releases and images
+
+Images are published to GitHub Container Registry.
+
+The publish workflow produces:
+
+- `latest` from the default branch;
+- branch/tag-derived image tags;
+- immutable `sha-<commit>` tags.
+
+For production, prefer a version tag or immutable SHA tag. `latest` follows `main` and should be treated as a moving development target.
+
+See [docs/release-policy.md](docs/release-policy.md).
+
+## Compatibility and benchmarking
+
+Rivus currently documents implemented integrations separately from formally certified version ranges. Do not infer a compatibility guarantee from a dependency compiling successfully.
+
+See [docs/compatibility.md](docs/compatibility.md) for the current support matrix.
+
+Public benchmark numbers are not published yet. The project intentionally avoids unverified throughput claims; [docs/benchmarking.md](docs/benchmarking.md) defines a reproducible methodology for future results.
 
 ## Development
 
+Run the test suite:
+
 ```sh
 go test ./...
-go test ./pkg/connectors/iceberg
-go run ./cmd/rivus -addr :8080 -ui-dir ./ui
 ```
 
-Please see `CONTRIBUTING.md` before opening a pull request.
+The CI workflow also validates the browser ES modules with Node before running the Go tests.
+
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Security
 
-Do not commit real database credentials, object-storage credentials, API tokens, logs, or production job configs. Use environment placeholders in publishable examples.
-
-To report a vulnerability, see `SECURITY.md`.
+Do not open a public issue containing credentials, tokens, private hostnames, or vulnerability details. Follow [SECURITY.md](SECURITY.md) for reporting guidance and the current supported-version policy.
 
 ## License
 
-Apache License 2.0. See `LICENSE`.
+Rivus is licensed under the [Apache License 2.0](LICENSE).
