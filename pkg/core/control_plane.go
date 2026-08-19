@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -190,7 +191,9 @@ func (m *JobManager) resubmitDurableJob(job *Job) (*Job, error) {
 		return nil, err
 	}
 	if !updated {
-		return nil, ErrJobNotFound
+		// The row existed when we read it, so a failed conditional update means
+		// its lifecycle changed concurrently. Do not clear a new worker lease.
+		return nil, ErrJobResubmitNotAllowed
 	}
 	m.mu.Lock()
 	m.executionRoles[job.Config.ID] = role
@@ -201,8 +204,9 @@ func (m *JobManager) resubmitDurableJob(job *Job) (*Job, error) {
 }
 
 // RunControlObserver applies durable lifecycle requests to jobs currently
-// leased by this worker. It is intentionally separate from RunWorker so the
-// existing worker reconciliation stays focused on claiming/renewing leases.
+// leased by this worker. One query finds all PAUSING jobs owned by this worker;
+// transient metadata errors are logged and retried instead of killing the data
+// worker process.
 func (m *JobManager) RunControlObserver(ctx context.Context) error {
 	if m.workerRole != WorkerRoleSnapshot && m.workerRole != WorkerRoleStreaming {
 		return errors.New("control observer requires snapshot or streaming worker role")
@@ -219,26 +223,13 @@ func (m *JobManager) RunControlObserver(ctx context.Context) error {
 	if poll <= 0 {
 		poll = 2 * time.Second
 	}
-	check := func() error {
-		m.mu.RLock()
-		jobs := make([]*Job, 0, len(m.workerLeases))
-		for id := range m.workerLeases {
-			if job := m.jobs[id]; job != nil {
-				jobs = append(jobs, job)
-			}
+	check := func() {
+		if err := m.applyDurablePauseRequests(ctx, store); err != nil && ctx.Err() == nil {
+			log.Printf("[job-manager] control observer failed role=%s owner=%s: %v", m.workerRole, m.workerID, err)
 		}
-		m.mu.RUnlock()
-		for _, job := range jobs {
-			if err := m.observeDurablePauseRequest(ctx, store, job); err != nil {
-				return err
-			}
-		}
-		return nil
 	}
 
-	if err := check(); err != nil {
-		return err
-	}
+	check()
 	ticker := time.NewTicker(poll)
 	defer ticker.Stop()
 	for {
@@ -246,27 +237,26 @@ func (m *JobManager) RunControlObserver(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			if err := check(); err != nil && ctx.Err() == nil {
-				return err
-			}
+			check()
 		}
 	}
 }
 
-func (m *JobManager) observeDurablePauseRequest(ctx context.Context, store meta.JobControlStore, job *Job) error {
-	if job == nil || job.Config == nil {
-		return nil
-	}
-	state, err := store.LoadJobControl(ctx, job.Config.ID)
+func (m *JobManager) applyDurablePauseRequests(ctx context.Context, store meta.JobControlStore) error {
+	ids, err := store.LoadJobPauseRequests(ctx, m.workerID)
 	if err != nil {
 		return err
 	}
-	if state == nil || !strings.EqualFold(state.LastStatus, string(JobStatusPausing)) {
-		return nil
-	}
-	if job.GetStatus() == JobStatusRunning {
+	for _, id := range ids {
+		m.mu.RLock()
+		job := m.jobs[id]
+		_, leased := m.workerLeases[id]
+		m.mu.RUnlock()
+		if job == nil || !leased || job.GetStatus() != JobStatusRunning {
+			continue
+		}
 		if !job.RequestPause() {
-			return fmt.Errorf("job %s could not enter graceful pause", job.Config.ID)
+			return fmt.Errorf("job %s could not enter graceful pause", id)
 		}
 	}
 	return nil
