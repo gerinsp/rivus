@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
+	drivermysql "github.com/go-sql-driver/mysql"
 
 	"github.com/gerinsp/rivus/pkg/config"
 )
@@ -115,8 +115,24 @@ type MySQLJobStore struct {
 	db *sql.DB
 }
 
+func normalizeJobStoreDSN(dsn string) (string, error) {
+	cfg, err := drivermysql.ParseDSN(dsn)
+	if err != nil {
+		return "", fmt.Errorf("parse mysql job store dsn: %w", err)
+	}
+	// SaveClaimedJob uses RowsAffected to decide whether the guarded lease row
+	// still matched. MySQL otherwise reports only rows whose values changed,
+	// so an idempotent update can look exactly like a lost lease.
+	cfg.ClientFoundRows = true
+	return cfg.FormatDSN(), nil
+}
+
 func NewMySQLJobStore(dsn string) (*MySQLJobStore, error) {
-	db, err := sql.Open("mysql", dsn)
+	normalizedDSN, err := normalizeJobStoreDSN(dsn)
+	if err != nil {
+		return nil, err
+	}
+	db, err := sql.Open("mysql", normalizedDSN)
 	if err != nil {
 		return nil, err
 	}
