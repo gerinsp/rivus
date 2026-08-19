@@ -310,7 +310,8 @@ func processClaimedMaintenanceTask(
 		}
 	}()
 
-	outcome := executeNativeMaintenanceTask(taskCtx, store, task.OwnerJobID, job.Job.Config, *state, task, job.Settings)
+	taskSettings := maintenanceSettingsForTask(job.Settings, task)
+	outcome := executeNativeMaintenanceTask(taskCtx, store, task.OwnerJobID, job.Job.Config, *state, task, taskSettings)
 	taskCancel()
 	leaseWG.Wait()
 	outcome.Result.RunID = runID
