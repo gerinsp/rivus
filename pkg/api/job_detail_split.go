@@ -203,7 +203,7 @@ func (s *Server) durableIcebergMaintenanceView(ctx context.Context, job *core.Jo
 		state = "error"
 	case inventoryPending:
 		state = "inventory_pending"
-	case summary.SnapshotBlocked > 0 && summary.SnapshotBlocked == summary.Tables:
+	case summary.Blocked > 0 && summary.Blocked == summary.Tables:
 		state = "waiting_for_snapshot"
 	case summary.Tables > 0 && tablesScanned == 0:
 		state = "inventory_pending"
