@@ -673,7 +673,7 @@ func (m *JobManager) attachStatusListener(job *Job) {
 			persistedStatus = JobStatusStopped
 			log.Printf("[job-manager] snapshot handoff ready job=%s next_role=streaming", job.Config.ID)
 		}
-		if err := m.saveManagedJobRecord(context.Background(), job, desired, persistedStatus); err != nil && !errors.Is(err, ErrJobWorkerLeaseLost) {
+		if err := m.saveManagedJobRecordIfCurrent(context.Background(), job, status, desired, persistedStatus); err != nil && !errors.Is(err, ErrJobWorkerLeaseLost) {
 			log.Printf("[job-manager] persist job state failed job=%s status=%s: %v", job.Config.ID, status, err)
 		}
 		if m.workerRole != WorkerRoleAll && snapshotStatusReleasesSlot(status) {
@@ -714,7 +714,7 @@ func (m *JobManager) persistSnapshotProgress(job *Job) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		status := job.GetStatus()
-		if err := m.saveManagedJobRecord(ctx, job, m.desiredStateForJobStatus(id, status), status); err != nil && !errors.Is(err, ErrJobWorkerLeaseLost) {
+		if err := m.saveManagedJobRecordIfCurrent(ctx, job, status, m.desiredStateForJobStatus(id, status), status); err != nil && !errors.Is(err, ErrJobWorkerLeaseLost) {
 			log.Printf("[job-manager] persist snapshot progress failed job=%s: %v", id, err)
 		}
 	}(job.Config.ID)
@@ -1257,6 +1257,28 @@ func (m *JobManager) saveManagedJobRecord(ctx context.Context, job *Job, desired
 	return m.saveJobRecord(ctx, job, desired, status)
 }
 
+// saveManagedJobRecordIfCurrent prevents a stale persistence callback from
+// writing an older status after the job has already advanced. This matters for
+// very fast snapshot jobs where RUNNING can race with DONE, and for progress
+// callbacks that were captured just before a terminal transition.
+func (m *JobManager) saveManagedJobRecordIfCurrent(ctx context.Context, job *Job, expectedStatus JobStatus, desired meta.DesiredState, status JobStatus) error {
+	if job == nil || job.Config == nil {
+		return nil
+	}
+
+	job.persistenceMu.Lock()
+	defer job.persistenceMu.Unlock()
+
+	if job.isPersistenceDeleted() {
+		return nil
+	}
+	if job.GetStatus() != expectedStatus {
+		return nil
+	}
+
+	return m.saveJobRecord(ctx, job, desired, status)
+}
+
 func (m *JobManager) deletePersistedJob(ctx context.Context, id string) error {
 	if m.jobStore == nil {
 		return nil
@@ -1568,7 +1590,7 @@ func (m *JobManager) startJob(job *Job, mode config.JobMode, removeOnStartFailur
 	if err == nil {
 		status := job.GetStatus()
 		desired := m.desiredStateForJobStatus(job.Config.ID, status)
-		if saveErr := m.saveManagedJobRecord(context.Background(), job, desired, status); saveErr != nil {
+		if saveErr := m.saveManagedJobRecordIfCurrent(context.Background(), job, status, desired, status); saveErr != nil {
 			job.requestStop()
 			err = saveErr
 		}
@@ -1639,7 +1661,7 @@ func (m *JobManager) startQueuedSnapshotJobs() {
 		}
 		status := job.GetStatus()
 		desired := m.desiredStateForJobStatus(job.Config.ID, status)
-		if err := m.saveManagedJobRecord(context.Background(), job, desired, status); err != nil {
+		if err := m.saveManagedJobRecordIfCurrent(context.Background(), job, status, desired, status); err != nil {
 			log.Printf("[job-manager] persist queued job start failed job=%s: %v", id, err)
 		}
 		m.mu.Lock()
