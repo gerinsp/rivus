@@ -27,6 +27,19 @@ func (s *memoryJobStore) LoadJobControl(_ context.Context, jobID string) (*meta.
 	}, nil
 }
 
+func (s *memoryJobStore) LoadJobPauseRequests(_ context.Context, owner string) ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	out := make([]string, 0)
+	for id, record := range s.jobs {
+		if record.LeaseOwner == owner && record.LeaseUntil.After(now) && record.DesiredState == meta.DesiredStateRunning && record.LastStatus == string(JobStatusPausing) {
+			out = append(out, id)
+		}
+	}
+	return out, nil
+}
+
 func (s *memoryJobStore) RequestJobStop(_ context.Context, jobID string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -61,6 +74,11 @@ func (s *memoryJobStore) RequestJobResume(_ context.Context, jobID string, role 
 	defer s.mu.Unlock()
 	record, ok := s.jobs[jobID]
 	if !ok {
+		return false, nil
+	}
+	switch record.LastStatus {
+	case string(JobStatusPaused), string(JobStatusFailed), string(JobStatusStopped):
+	default:
 		return false, nil
 	}
 	record.DesiredState = meta.DesiredStateRunning
@@ -193,6 +211,33 @@ func TestMasterResubmitPreservesStreamingHandoffRole(t *testing.T) {
 	}
 }
 
+func TestResubmitConditionalUpdateDoesNotFenceRunningJob(t *testing.T) {
+	store := newMemoryJobStore()
+	manager := NewJobManager(nil, WithJobStore(store), WithControlPlaneRole())
+	job, err := manager.Submit(newTestJobConfig("master-resubmit-race"))
+	if err != nil {
+		t.Fatalf("Submit returned error: %v", err)
+	}
+
+	store.mu.Lock()
+	record := store.jobs[job.Config.ID]
+	record.ExecutionRole = meta.JobExecutionRoleStreaming
+	record.LastStatus = string(JobStatusRunning)
+	record.LeaseOwner = "streaming-new-owner"
+	record.LeaseUntil = time.Now().Add(time.Minute)
+	store.jobs[job.Config.ID] = record
+	store.mu.Unlock()
+	setObservedJobStatus(job, JobStatusStopped) // stale master view
+
+	if _, err := manager.RequestResubmit(job.Config.ID); err != ErrJobResubmitNotAllowed {
+		t.Fatalf("RequestResubmit error=%v, want ErrJobResubmitNotAllowed", err)
+	}
+	record, _ = store.Get(job.Config.ID)
+	if record.LeaseOwner != "streaming-new-owner" || record.LastStatus != string(JobStatusRunning) {
+		t.Fatalf("running lease was fenced: status=%s owner=%q", record.LastStatus, record.LeaseOwner)
+	}
+}
+
 func TestWorkerAppliesDurablePauseGracefully(t *testing.T) {
 	store := newMemoryJobStore()
 	drainStarted := make(chan struct{}, 1)
@@ -232,8 +277,8 @@ func TestWorkerAppliesDurablePauseGracefully(t *testing.T) {
 	if updated, err := store.RequestJobPause(context.Background(), cfg.ID); err != nil || !updated {
 		t.Fatalf("RequestJobPause updated=%t err=%v", updated, err)
 	}
-	if err := manager.observeDurablePauseRequest(context.Background(), store, job); err != nil {
-		t.Fatalf("observeDurablePauseRequest returned error: %v", err)
+	if err := manager.applyDurablePauseRequests(context.Background(), store); err != nil {
+		t.Fatalf("applyDurablePauseRequests returned error: %v", err)
 	}
 	if got := job.GetStatus(); got != JobStatusPausing {
 		t.Fatalf("worker status=%s, want PAUSING", got)
