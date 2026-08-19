@@ -1,0 +1,36 @@
+name: Apply maintenance patch on PR
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.head_ref == 'agent/maintenance-concurrency-alerts'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/maintenance-concurrency-alerts
+          fetch-depth: 0
+      - name: Run patch script
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          lines = Path('.github/workflows/agent-maintenance-concurrency.yml').read_text().splitlines()
+          start = next(i for i, line in enumerate(lines) if line == '        run: |') + 1
+          script = []
+          for line in lines[start:]:
+              if line.startswith('          '):
+                  script.append(line[10:])
+              elif line.strip() == '':
+                  script.append('')
+              else:
+                  break
+          Path('/tmp/apply-maintenance.sh').write_text('\n'.join(script) + '\n')
+          PY
+          bash /tmp/apply-maintenance.sh
