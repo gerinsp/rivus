@@ -15,12 +15,12 @@ x-rivus-common: &rivus-common
     TZ: ${TZ:-UTC}
     RIVUS_IMAGE_TAG: ${RIVUS_IMAGE_TAG:-latest}
     RIVUS_SHUTDOWN_TIMEOUT_SECONDS: ${RIVUS_SHUTDOWN_TIMEOUT_SECONDS:-90}
-    RIVUS_LOG_DIR: ${RIVUS_LOG_DIR:-/app/logs}
+    RIVUS_LOG_ROOT: ${RIVUS_LOG_ROOT:-/app/logs}
     RIVUS_LOG_RETENTION_DAYS: ${RIVUS_LOG_RETENTION_DAYS:-7}
     RIVUS_LOG_MAX_SIZE_MB: ${RIVUS_LOG_MAX_SIZE_MB:-64}
     RIVUS_LOG_MAX_TOTAL_SIZE_MB: ${RIVUS_LOG_MAX_TOTAL_SIZE_MB:-2048}
     # Streaming/maintenance logs can be very noisy. Keep them in Rivus'
-    # rotating files by default; the master log UI reads those shared files.
+    # rotating files by default rather than duplicating them into Docker logs.
     RIVUS_LOG_STDERR: ${RIVUS_LOG_STDERR:-false}
   logging:
     driver: json-file
@@ -60,14 +60,13 @@ services:
     environment:
       <<: *rivus-environment
       RIVUS_API_TOKEN: ${RIVUS_API_TOKEN:-}
-      # Keep the broad "rivus" prefix on the API process. The log API uses
-      # this prefix to discover the per-role files written into the shared
-      # /app/logs directory below.
+      RIVUS_LOG_DIR: ${RIVUS_MASTER_LOG_DIR:-/app/logs/master}
       RIVUS_LOG_PREFIX: rivus
     ports:
       - "${RIVUS_HTTP_PORT:-8080}:8080"
     volumes:
       - ./ui:/app/ui:ro
+      # One shared volume, organized by role below /app/logs.
       - ./logs:/app/logs
 
   rivus-streaming:
@@ -79,6 +78,7 @@ services:
       # Set RIVUS_STREAMING_WORKER_ID only when you can guarantee uniqueness.
       RIVUS_WORKER_ID: ${RIVUS_STREAMING_WORKER_ID:-}
       RIVUS_ICEBERG_MAX_CONCURRENT_COMMITS: ${RIVUS_ICEBERG_MAX_CONCURRENT_COMMITS:-3}
+      RIVUS_LOG_DIR: ${RIVUS_STREAMING_LOG_DIR:-/app/logs/streaming}
       RIVUS_LOG_PREFIX: rivus-streaming
     volumes:
       - ./logs:/app/logs
@@ -90,6 +90,7 @@ services:
       <<: *rivus-environment
       RIVUS_WORKER_ID: ${RIVUS_SNAPSHOT_WORKER_ID:-}
       RIVUS_ICEBERG_MAX_CONCURRENT_COMMITS: ${RIVUS_ICEBERG_MAX_CONCURRENT_COMMITS:-3}
+      RIVUS_LOG_DIR: ${RIVUS_SNAPSHOT_LOG_DIR:-/app/logs/snapshot}
       RIVUS_LOG_PREFIX: rivus-snapshot
     volumes:
       - ./logs:/app/logs
@@ -101,6 +102,7 @@ services:
     environment:
       <<: *rivus-environment
       RIVUS_WORKER_ID: ${RIVUS_MAINTENANCE_WORKER_ID:-}
+      RIVUS_LOG_DIR: ${RIVUS_MAINTENANCE_LOG_DIR:-/app/logs/maintenance}
       RIVUS_LOG_PREFIX: rivus-maintenance
     volumes:
       - ./logs:/app/logs
