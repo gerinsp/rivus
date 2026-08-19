@@ -19,7 +19,9 @@ Rivus can run one container image as four independent runtime roles. Job YAML st
         CDC / resume          initial snapshot      compact / expire / orphan
 ```
 
-All roles use the same Rivus image and the same durable metadata database. Snapshot and streaming workers use job leases so only one worker owns a job at a time. Maintenance keeps its independent table-level queue and leases.
+All roles use the same Rivus image and the same durable metadata database. Snapshot and streaming workers use job leases so only one worker owns a job at a time. Automatic table maintenance keeps its independent durable queue and table leases.
+
+The master never claims snapshot or streaming jobs. The legacy explicit `POST /api/jobs/{id}/iceberg/orphans` administration endpoint remains synchronous for API compatibility; normal scheduled compaction, snapshot expiration, and orphan cleanup run only in `maintenance-worker --queue`.
 
 ## Commands
 
@@ -64,7 +66,7 @@ No worker field is added to job YAML.
 - `initial`, `snapshot-only`, and internal snapshot handoff modes are assigned to the snapshot worker.
 - Normal CDC/resume execution is assigned to the streaming worker.
 - After a successful `initial` snapshot, Rivus changes the durable execution role to `STREAMING`; the streaming worker then resumes from the snapshot checkpoint.
-- Table maintenance remains independent from job execution and is consumed by `maintenance-worker --queue`.
+- Automatic table maintenance remains independent from job execution and is consumed by `maintenance-worker --queue`.
 
 ## Lifecycle control
 
@@ -72,19 +74,21 @@ The master does not own source or sink goroutines. Pause, cancel, and resubmit t
 
 - **Pause** writes a `PAUSING` request while retaining the worker lease. The owning worker stops only the source and lets the sink drain and commit its checkpoint before becoming `PAUSED`.
 - **Cancel** sets the durable desired state to `STOPPED` and clears the lease. Guarded worker writes can no longer overwrite the stop request, and the worker stops its local pipeline when ownership is lost.
-- **Resubmit** preserves the durable execution role, clears any stale lease, and makes the job claimable from its existing checkpoint.
+- **Resubmit** preserves the durable execution role, clears a terminal job's stale lease, and makes the job claimable from its existing checkpoint. A conditional update prevents resubmit from fencing a job that has already started again.
 - **Delete** removes the durable registry record; late claimed-worker writes are already fenced by the existing guarded save path.
+
+Workers poll durable pause requests by lease owner instead of performing one metadata query per running job. A transient control-observer database error is logged and retried; it does not terminate the data worker.
 
 ## Environment placement
 
 A useful deployment split is:
 
-- **master**: API/UI auth, metadata DB, control-plane notification settings.
-- **streaming worker**: metadata DB, source connectivity, Iceberg/storage credentials, streaming/commit limits.
-- **snapshot worker**: metadata DB, source connectivity, Iceberg/storage credentials, snapshot concurrency, snapshot spool volume.
-- **maintenance worker**: metadata DB, Iceberg/storage credentials, Trino/runner settings when used, maintenance concurrency and timeout settings.
+- **master**: metadata DB, API/UI auth, and control-plane settings.
+- **streaming worker**: metadata DB, source connectivity, Iceberg/storage credentials, streaming/commit limits, and streaming job health/failure notification settings when enabled.
+- **snapshot worker**: metadata DB, source connectivity, Iceberg/storage credentials, snapshot concurrency, snapshot spool volume, and snapshot job failure notification settings when enabled.
+- **maintenance worker**: metadata DB, Iceberg/storage credentials, Trino/runner settings when used, maintenance concurrency/timeouts, and maintenance queue notification settings.
 
-Give every execution worker a unique `RIVUS_WORKER_ID`, especially when workers run on different servers.
+Give every execution worker a unique `RIVUS_WORKER_ID`, especially when workers run on different servers. The repository Compose example leaves worker service names scalable rather than fixing `container_name` for those roles.
 
 ## Migration from the all-in-one server
 
