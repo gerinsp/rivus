@@ -210,6 +210,8 @@ func processClaimedMaintenanceTask(
 	runID int64,
 	task meta.IcebergMaintenanceTask,
 ) (string, error) {
+	defer releaseMaintenanceTableLease(store, task.TableKey, workerID)
+
 	state, err := store.GetState(ctx, task.TableKey)
 	if err != nil {
 		return "failed", err
@@ -256,8 +258,14 @@ func processClaimedMaintenanceTask(
 			case <-leaseCtx.Done():
 				return
 			case <-ticker.C:
-				if err := store.RenewLease(leaseCtx, task.ID, workerID, time.Now().Add(opts.LeaseDuration)); err != nil {
-					log.Printf("[maintenance-worker %s] lease renewal task=%d error=%v", workerID, task.ID, err)
+				if err := store.RenewTaskAndTableLease(
+					leaseCtx,
+					task.ID,
+					task.TableKey,
+					workerID,
+					time.Now().Add(opts.LeaseDuration),
+				); err != nil {
+					log.Printf("[maintenance-worker %s] lease renewal task=%d table=%s error=%v", workerID, task.ID, task.TableKey, err)
 					return
 				}
 			}
@@ -300,5 +308,16 @@ func processClaimedMaintenanceTask(
 			return "failed", err
 		}
 		return "failed", nil
+	}
+}
+
+func releaseMaintenanceTableLease(store *meta.IcebergMaintenanceStore, tableKey, workerID string) {
+	if store == nil || tableKey == "" || workerID == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := store.ReleaseMaintenanceTableLease(ctx, tableKey, workerID); err != nil {
+		log.Printf("[maintenance-worker %s] release table lease table=%s error=%v", workerID, tableKey, err)
 	}
 }
