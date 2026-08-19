@@ -53,6 +53,20 @@ func setObservedJobStatus(job *Job, status JobStatus) {
 	job.mu.Unlock()
 }
 
+func setObservedQueuedProgress(job *Job, role meta.JobExecutionRole) {
+	if job == nil {
+		return
+	}
+	job.mu.Lock()
+	job.progress = &JobProgress{
+		Phase:   "queued",
+		Summary: "Waiting for " + strings.ToLower(string(role)) + " worker",
+		Detail:  "The job will resume from its durable checkpoint",
+	}
+	job.Updated = time.Now()
+	job.mu.Unlock()
+}
+
 func (m *JobManager) cancelDurableJob(job *Job) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -129,31 +143,8 @@ func (m *JobManager) resubmitDurableJob(job *Job) (*Job, error) {
 	m.executionRoles[job.Config.ID] = role
 	m.mu.Unlock()
 	setObservedJobStatus(job, JobStatusQueued)
-	job.updateProgress(connectorQueuedProgress(role))
+	setObservedQueuedProgress(job, role)
 	return job, nil
-}
-
-func connectorQueuedProgress(role meta.JobExecutionRole) connectorProgressInfo {
-	return connectorProgressInfo{
-		phase:   "queued",
-		summary: "Waiting for " + strings.ToLower(string(role)) + " worker",
-		detail:  "The job will resume from its durable checkpoint",
-	}
-}
-
-// Small adapter keeps control_plane.go independent from connector internals in
-// tests while still reusing Job.updateProgress through applyQueuedProgress.
-type connectorProgressInfo struct {
-	phase   string
-	summary string
-	detail  string
-}
-
-func (j *Job) applyQueuedProgress(info connectorProgressInfo) {
-	j.mu.Lock()
-	j.progress = &JobProgress{Phase: info.phase, Summary: info.summary, Detail: info.detail}
-	j.Updated = time.Now()
-	j.mu.Unlock()
 }
 
 func (m *JobManager) observeDurablePauseRequest(ctx context.Context, store meta.JobWorkerStore, job *Job) error {
