@@ -52,6 +52,9 @@ func (s *Server) Router() http.Handler {
 	mux.HandleFunc("GET /metrics", s.handlePrometheusMetrics)
 
 	mux.HandleFunc("/api/jobs", s.requireAPIAuth(s.handleJobs))
+	// Exact GET route uses durable worker state so the master UI does not show
+	// stale in-memory progress/maintenance after execution moved to workers.
+	mux.HandleFunc("GET /api/jobs/{id}", s.requireAPIAuth(s.handleJobDetail))
 	// Keep manual orphan cleanup on the master as a control-plane action only.
 	// The specific route wins over the generic /api/jobs/ fallback below.
 	mux.HandleFunc("POST /api/jobs/{id}/iceberg/orphans", s.requireAPIAuth(s.handleQueuedJobIcebergOrphans))
