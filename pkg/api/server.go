@@ -37,6 +37,15 @@ func NewServer(jm *core.JobManager, uiDir string, auth AuthConfig) *Server {
 	}
 }
 
+func noStoreUI(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Dashboard assets are deployed together with the binary. Do not let an
+		// old ES module survive a rollout and keep stale UI behavior in the browser.
+		w.Header().Set("Cache-Control", "no-store")
+		next.ServeHTTP(w, r)
+	})
+}
+
 func (s *Server) Router() http.Handler {
 	mux := http.NewServeMux()
 
@@ -76,13 +85,7 @@ func (s *Server) Router() http.Handler {
 	mux.Handle("GET /api/jobs/{id}/graph", s.requireAPIAuth(s.handleGetJobGraph))
 
 	fs := http.FileServer(http.Dir(s.uiDir))
-	staticHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Dashboard assets are deployed together with the binary. Do not let an
-		// old ES module survive a rollout and keep stale UI behavior in the browser.
-		w.Header().Set("Cache-Control", "no-store")
-		fs.ServeHTTP(w, r)
-	})
-	mux.Handle("/", s.requirePageAuth(staticHandler))
+	mux.Handle("/", s.requirePageAuth(noStoreUI(fs)))
 
 	return mux
 }
