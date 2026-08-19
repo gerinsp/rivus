@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"sort"
 	"strings"
@@ -297,7 +298,11 @@ func (s *Server) maintenanceStoreForView(ctx context.Context) (*meta.IcebergMain
 			s.maintenanceStoreErr = fmt.Errorf("maintenance metadata store is not configured")
 			return
 		}
-		initCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		base := context.Background()
+		if ctx != nil {
+			base = context.WithoutCancel(ctx)
+		}
+		initCtx, cancel := context.WithTimeout(base, 3*time.Second)
 		defer cancel()
 		store, err := meta.NewIcebergMaintenanceStore(dsn)
 		if err != nil {
