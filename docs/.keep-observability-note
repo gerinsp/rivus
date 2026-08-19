@@ -1,0 +1,1 @@
+file-only logging remains the default; split-runtime log files are shared for the master log UI.
