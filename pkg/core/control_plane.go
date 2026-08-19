@@ -49,6 +49,26 @@ func (m *JobManager) durableControlStore(ctx context.Context) (meta.JobControlSt
 	return store, nil
 }
 
+// beginDurableLifecycle mirrors the existing JobManager lifecycle fence for
+// operations that are executed through the durable control store. Holding the
+// read lock prevents Shutdown from crossing a control mutation mid-request.
+func (m *JobManager) beginDurableLifecycle(job *Job) (func(), error) {
+	m.lifecycleMu.RLock()
+	m.mu.RLock()
+	shuttingDown := m.shuttingDown
+	managed := job != nil && job.Config != nil && m.jobs[job.Config.ID] == job
+	m.mu.RUnlock()
+	if shuttingDown {
+		m.lifecycleMu.RUnlock()
+		return nil, ErrJobManagerShuttingDown
+	}
+	if !managed {
+		m.lifecycleMu.RUnlock()
+		return nil, ErrJobNotFound
+	}
+	return m.lifecycleMu.RUnlock, nil
+}
+
 // RequestCancel is the lifecycle entry point for API/control-plane callers.
 // Local monolith/worker jobs preserve the existing direct cancellation path;
 // remote jobs are fenced through the durable registry instead.
@@ -122,6 +142,12 @@ func setObservedQueuedProgress(job *Job, role meta.JobExecutionRole) {
 }
 
 func (m *JobManager) cancelDurableJob(job *Job) error {
+	release, err := m.beginDurableLifecycle(job)
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	store, err := m.durableControlStore(ctx)
@@ -140,6 +166,12 @@ func (m *JobManager) cancelDurableJob(job *Job) error {
 }
 
 func (m *JobManager) pauseDurableJob(job *Job) error {
+	release, err := m.beginDurableLifecycle(job)
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	store, err := m.durableControlStore(ctx)
@@ -165,6 +197,12 @@ func (m *JobManager) pauseDurableJob(job *Job) error {
 }
 
 func (m *JobManager) resubmitDurableJob(job *Job) (*Job, error) {
+	release, err := m.beginDurableLifecycle(job)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	store, err := m.durableControlStore(ctx)
