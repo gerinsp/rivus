@@ -21,7 +21,7 @@ Rivus can run one container image as four independent runtime roles. Job YAML st
 
 All roles use the same Rivus image and the same durable metadata database. Snapshot and streaming workers use job leases so only one worker owns a job at a time. Automatic table maintenance keeps its independent durable queue and table leases.
 
-The master never claims snapshot or streaming jobs. The legacy explicit `POST /api/jobs/{id}/iceberg/orphans` administration endpoint remains synchronous for API compatibility; normal scheduled compaction, snapshot expiration, and orphan cleanup run only in `maintenance-worker --queue`.
+The master never claims snapshot/streaming jobs and never performs object-store maintenance work. Manual `POST /api/jobs/{id}/iceberg/orphans` requests are converted into durable `remove_orphan_files` tasks and executed by `maintenance-worker --queue`.
 
 ## Commands
 
@@ -76,6 +76,7 @@ No worker field is added to job YAML.
 - Normal CDC/resume execution is assigned to the streaming worker.
 - After a successful `initial` snapshot, Rivus changes the durable execution role to `STREAMING`; the streaming worker then resumes from the snapshot checkpoint.
 - Automatic table maintenance remains independent from job execution and is consumed by `maintenance-worker --queue`.
+- Manual orphan cleanup uses the same durable maintenance queue. The endpoint defaults to `dry_run=true`; explicit `older_than_hours` must respect the native seven-day safety floor, and concurrency is controlled globally by `RIVUS_MAINTENANCE_ORPHAN_CONCURRENCY`.
 
 ## Lifecycle control
 
