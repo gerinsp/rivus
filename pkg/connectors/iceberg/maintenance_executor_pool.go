@@ -167,6 +167,25 @@ func maintenanceFinalizeContext(parent context.Context) (context.Context, contex
 	return context.WithTimeout(context.Background(), maintenanceShutdownFinalizeTimeout)
 }
 
+func requeueInterruptedMaintenanceTask(ctx context.Context, store *meta.IcebergMaintenanceStore, workerID string, runID int64, task meta.IcebergMaintenanceTask) {
+	if ctx == nil || ctx.Err() == nil || store == nil || task.ID <= 0 {
+		return
+	}
+	finalizeCtx, cancel := maintenanceFinalizeContext(ctx)
+	defer cancel()
+
+	message := fmt.Sprintf("maintenance worker interrupted: %v", ctx.Err())
+	retryAt := time.Now().Add(time.Minute)
+	// FinishTask is lease-guarded. If the normal path already finalized the
+	// task, this update simply fails and we leave its real result untouched.
+	if err := store.FinishTask(finalizeCtx, task.ID, workerID, meta.MaintenanceTaskRetry, message, &retryAt); err != nil {
+		return
+	}
+	result := maintenancePreflightFailureResult(runID, task, message)
+	result.RoutingReason = "Worker shutdown interrupted execution"
+	_ = store.InsertResult(finalizeCtx, result)
+}
+
 func processClaimedMaintenanceTasks(
 	ctx context.Context,
 	store *meta.IcebergMaintenanceStore,
@@ -228,6 +247,7 @@ func processClaimedMaintenanceTask(
 	task meta.IcebergMaintenanceTask,
 ) (string, error) {
 	defer releaseMaintenanceTableLease(store, task.TableKey, workerID)
+	defer requeueInterruptedMaintenanceTask(ctx, store, workerID, runID, task)
 
 	state, err := store.GetState(ctx, task.TableKey)
 	if err != nil {
