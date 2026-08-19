@@ -10,10 +10,17 @@ import (
 	"github.com/gerinsp/rivus/pkg/meta"
 )
 
+// WorkerRoleMaster is a pure control-plane role. It may load and mutate the
+// durable job registry, but it never claims or executes snapshot/streaming jobs.
 const WorkerRoleMaster WorkerRole = "master"
 
-func isExecutionWorkerRole(role WorkerRole) bool {
-	return role == WorkerRoleSnapshot || role == WorkerRoleStreaming
+// WithControlPlaneRole configures a JobManager for the master/API process.
+// Keep this separate from WithWorkerRole so legacy RIVUS_WORKER_ROLE parsing
+// remains backward compatible until deployments move to the explicit command.
+func WithControlPlaneRole() JobManagerOption {
+	return func(m *JobManager) {
+		m.workerRole = WorkerRoleMaster
+	}
 }
 
 func (m *JobManager) ownsWorkerLease(jobID string) bool {
@@ -39,6 +46,52 @@ func (m *JobManager) durableControlStore(ctx context.Context) (meta.JobControlSt
 		return nil, errors.New("remote job lifecycle control requires a JobControlStore")
 	}
 	return store, nil
+}
+
+// RequestCancel is the lifecycle entry point for API/control-plane callers.
+// Local monolith/worker jobs preserve the existing direct cancellation path;
+// remote jobs are fenced through the durable registry instead.
+func (m *JobManager) RequestCancel(id string) error {
+	m.mu.RLock()
+	job := m.jobs[id]
+	m.mu.RUnlock()
+	if job == nil {
+		return ErrJobNotFound
+	}
+	if !m.usesDurableControl(id) {
+		return m.Cancel(id)
+	}
+	return m.cancelDurableJob(job)
+}
+
+// RequestPause preserves graceful source-stop/sink-drain semantics even when
+// the API and the executing worker are different processes.
+func (m *JobManager) RequestPause(id string) error {
+	m.mu.RLock()
+	job := m.jobs[id]
+	m.mu.RUnlock()
+	if job == nil {
+		return ErrJobNotFound
+	}
+	if !m.usesDurableControl(id) {
+		return m.Pause(id)
+	}
+	return m.pauseDurableJob(job)
+}
+
+// RequestResubmit makes a remote job claimable again while preserving the
+// durable execution role chosen by snapshot handoff.
+func (m *JobManager) RequestResubmit(id string) (*Job, error) {
+	m.mu.RLock()
+	job := m.jobs[id]
+	m.mu.RUnlock()
+	if job == nil {
+		return nil, ErrJobNotFound
+	}
+	if !m.usesDurableControl(id) {
+		return m.Resubmit(id)
+	}
+	return m.resubmitDurableJob(job)
 }
 
 // setObservedJobStatus updates the control-plane's local projection without
@@ -147,12 +200,64 @@ func (m *JobManager) resubmitDurableJob(job *Job) (*Job, error) {
 	return job, nil
 }
 
-func (m *JobManager) observeDurablePauseRequest(ctx context.Context, store meta.JobWorkerStore, job *Job) error {
-	controlStore, ok := store.(meta.JobControlStore)
-	if !ok || job == nil || job.Config == nil {
+// RunControlObserver applies durable lifecycle requests to jobs currently
+// leased by this worker. It is intentionally separate from RunWorker so the
+// existing worker reconciliation stays focused on claiming/renewing leases.
+func (m *JobManager) RunControlObserver(ctx context.Context) error {
+	if m.workerRole != WorkerRoleSnapshot && m.workerRole != WorkerRoleStreaming {
+		return errors.New("control observer requires snapshot or streaming worker role")
+	}
+	store, ok := m.jobStore.(meta.JobControlStore)
+	if !ok {
+		return errors.New("control observer requires a JobControlStore")
+	}
+	if err := m.ensureJobStoreReady(ctx); err != nil {
+		return err
+	}
+
+	poll := m.workerPollInterval
+	if poll <= 0 {
+		poll = 2 * time.Second
+	}
+	check := func() error {
+		m.mu.RLock()
+		jobs := make([]*Job, 0, len(m.workerLeases))
+		for id := range m.workerLeases {
+			if job := m.jobs[id]; job != nil {
+				jobs = append(jobs, job)
+			}
+		}
+		m.mu.RUnlock()
+		for _, job := range jobs {
+			if err := m.observeDurablePauseRequest(ctx, store, job); err != nil {
+				return err
+			}
+		}
 		return nil
 	}
-	state, err := controlStore.LoadJobControl(ctx, job.Config.ID)
+
+	if err := check(); err != nil {
+		return err
+	}
+	ticker := time.NewTicker(poll)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			if err := check(); err != nil && ctx.Err() == nil {
+				return err
+			}
+		}
+	}
+}
+
+func (m *JobManager) observeDurablePauseRequest(ctx context.Context, store meta.JobControlStore, job *Job) error {
+	if job == nil || job.Config == nil {
+		return nil
+	}
+	state, err := store.LoadJobControl(ctx, job.Config.ID)
 	if err != nil {
 		return err
 	}
