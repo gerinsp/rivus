@@ -16,6 +16,8 @@ const (
 	maintenanceOperationOrphan  = "remove_orphan_files"
 )
 
+const maintenanceShutdownFinalizeTimeout = 10 * time.Second
+
 type maintenanceConcurrency struct {
 	Compact         int
 	ExpireSnapshots int
@@ -136,6 +138,7 @@ func runMaintenanceOperationWorker(
 			time.Now().UTC(),
 		); err != nil {
 			if ctx.Err() != nil {
+				log.Printf("[maintenance-worker %s] shutdown finalization operation=%s error=%v", workerID, operation, err)
 				return
 			}
 			log.Printf("[maintenance-worker %s] process operation=%s error=%v", workerID, operation, err)
@@ -155,6 +158,13 @@ func waitMaintenanceExecutor(ctx context.Context, delay time.Duration) bool {
 	case <-timer.C:
 		return true
 	}
+}
+
+func maintenanceFinalizeContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent != nil && parent.Err() == nil {
+		return context.WithCancel(parent)
+	}
+	return context.WithTimeout(context.Background(), maintenanceShutdownFinalizeTimeout)
 }
 
 func processClaimedMaintenanceTasks(
@@ -184,7 +194,9 @@ func processClaimedMaintenanceTasks(
 		status, err := processClaimedMaintenanceTask(ctx, store, jobStore, jobs, opts, workerID, runID, task)
 		if err != nil {
 			failures++
-			_ = store.FinishRun(ctx, runID, successes, skipped, failures, time.Now().UTC())
+			finalizeCtx, cancel := maintenanceFinalizeContext(ctx)
+			_ = store.FinishRun(finalizeCtx, runID, successes, skipped, failures, time.Now().UTC())
+			cancel()
 			return len(tasks), err
 		}
 		switch status {
@@ -197,7 +209,9 @@ func processClaimedMaintenanceTasks(
 		}
 	}
 
-	if err := store.FinishRun(ctx, runID, successes, skipped, failures, time.Now().UTC()); err != nil {
+	finalizeCtx, cancel := maintenanceFinalizeContext(ctx)
+	defer cancel()
+	if err := store.FinishRun(finalizeCtx, runID, successes, skipped, failures, time.Now().UTC()); err != nil {
 		return len(tasks), err
 	}
 	return len(tasks), nil
@@ -280,35 +294,49 @@ func processClaimedMaintenanceTask(
 	taskCancel()
 	leaseWG.Wait()
 	outcome.Result.RunID = runID
-	if err := store.InsertResult(ctx, outcome.Result); err != nil {
+
+	// When SIGTERM cancels the worker context, using that same context for the
+	// result/task updates would leave the durable row leased until lease expiry.
+	// Finalize through a fresh bounded context so a replacement container can
+	// pick the retry promptly.
+	finalizeCtx, finalizeCancel := maintenanceFinalizeContext(ctx)
+	defer finalizeCancel()
+	if err := store.InsertResult(finalizeCtx, outcome.Result); err != nil {
 		return "failed", fmt.Errorf("store maintenance result task=%d: %w", task.ID, err)
 	}
 
 	switch outcome.Result.Status {
 	case "succeeded":
-		_ = store.RecordStateSuccess(ctx, state.TableKey, task.Operation, time.Now().UTC(), task.Operation == maintenanceOperationCompact)
-		if err := store.FinishTask(ctx, task.ID, workerID, meta.MaintenanceTaskSucceeded, "", nil); err != nil {
+		_ = store.RecordStateSuccess(finalizeCtx, state.TableKey, task.Operation, time.Now().UTC(), task.Operation == maintenanceOperationCompact)
+		if err := store.FinishTask(finalizeCtx, task.ID, workerID, meta.MaintenanceTaskSucceeded, "", nil); err != nil {
 			return "failed", err
 		}
 		return "succeeded", nil
 	case "skipped":
-		_ = store.RecordStateSuccess(ctx, state.TableKey, task.Operation, time.Now().UTC(), false)
-		if err := store.FinishTask(ctx, task.ID, workerID, meta.MaintenanceTaskSkipped, "", nil); err != nil {
+		_ = store.RecordStateSuccess(finalizeCtx, state.TableKey, task.Operation, time.Now().UTC(), false)
+		if err := store.FinishTask(finalizeCtx, task.ID, workerID, meta.MaintenanceTaskSkipped, "", nil); err != nil {
 			return "failed", err
 		}
 		return "skipped", nil
 	default:
-		_ = store.RecordStateError(ctx, state.TableKey, outcome.Result.Error)
+		_ = store.RecordStateError(finalizeCtx, state.TableKey, outcome.Result.Error)
 		retryLimit := retryLimitFromRaw(job.Job.Config)
 		if retryLimit <= 0 {
 			retryLimit = defaultMaintenanceRetryLimit
 		}
-		if outcome.Retryable && task.AttemptCount < retryLimit {
+		interrupted := ctx.Err() != nil
+		if interrupted || (outcome.Retryable && task.AttemptCount < retryLimit) {
 			retryAt := time.Now().Add(maintenanceRetryBackoff(task.AttemptCount, retryBackoffFromRaw(job.Job.Config)))
-			if err := store.FinishTask(ctx, task.ID, workerID, meta.MaintenanceTaskRetry, outcome.Result.Error, &retryAt); err != nil {
+			if interrupted {
+				// A deployment interruption is operational, not a terminal
+				// maintenance failure. Always leave it retryable even if it happened
+				// on the configured final attempt.
+				retryAt = time.Now().Add(time.Minute)
+			}
+			if err := store.FinishTask(finalizeCtx, task.ID, workerID, meta.MaintenanceTaskRetry, outcome.Result.Error, &retryAt); err != nil {
 				return "failed", err
 			}
-		} else if err := store.FinishTask(ctx, task.ID, workerID, meta.MaintenanceTaskFailed, outcome.Result.Error, nil); err != nil {
+		} else if err := store.FinishTask(finalizeCtx, task.ID, workerID, meta.MaintenanceTaskFailed, outcome.Result.Error, nil); err != nil {
 			return "failed", err
 		}
 		return "failed", nil
