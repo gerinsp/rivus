@@ -1,4 +1,16 @@
 services:
-  rivus:
+  rivus-master:
+    build: .
+    image: rivus:dev
+
+  rivus-streaming:
+    build: .
+    image: rivus:dev
+
+  rivus-snapshot:
+    build: .
+    image: rivus:dev
+
+  rivus-maintenance:
     build: .
     image: rivus:dev
