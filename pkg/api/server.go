@@ -37,16 +37,6 @@ func NewServer(jm *core.JobManager, uiDir string, auth AuthConfig) *Server {
 	}
 }
 
-func noStoreUI(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// The dashboard is shipped inside the Rivus image and changes together
-		// with the backend. Revalidate on every navigation so a browser cannot
-		// keep an old ES module after a container/image rollout.
-		w.Header().Set("Cache-Control", "no-store")
-		next.ServeHTTP(w, r)
-	})
-}
-
 func (s *Server) Router() http.Handler {
 	mux := http.NewServeMux()
 
@@ -77,14 +67,22 @@ func (s *Server) Router() http.Handler {
 
 	mux.HandleFunc("/api/metrics", s.requireAPIAuth(s.handleMetrics))
 	mux.HandleFunc("/api/table-metrics", s.requireAPIAuth(s.handleTableMetrics))
-	mux.HandleFunc("GET /api/logs", s.requireAPIAuth(s.handleLogs))
-	mux.HandleFunc("GET /api/logs/tail", s.requireAPIAuth(s.handleLogTail))
-	mux.HandleFunc("GET /api/logs/download", s.requireAPIAuth(s.handleLogDownload))
+	// The master reads all role directories from one shared log root while each
+	// runtime keeps its own rotating files under master/streaming/snapshot/maintenance.
+	mux.HandleFunc("GET /api/logs", s.requireAPIAuth(s.handleSplitLogs))
+	mux.HandleFunc("GET /api/logs/tail", s.requireAPIAuth(s.handleSplitLogTail))
+	mux.HandleFunc("GET /api/logs/download", s.requireAPIAuth(s.handleSplitLogDownload))
 
 	mux.Handle("GET /api/jobs/{id}/graph", s.requireAPIAuth(s.handleGetJobGraph))
 
 	fs := http.FileServer(http.Dir(s.uiDir))
-	mux.Handle("/", s.requirePageAuth(noStoreUI(fs)))
+	staticHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Dashboard assets are deployed together with the binary. Do not let an
+		// old ES module survive a rollout and keep stale UI behavior in the browser.
+		w.Header().Set("Cache-Control", "no-store")
+		fs.ServeHTTP(w, r)
+	})
+	mux.Handle("/", s.requirePageAuth(staticHandler))
 
 	return mux
 }
