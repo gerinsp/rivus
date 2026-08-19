@@ -1,5 +1,31 @@
 name: rivus
 
+x-rivus-common: &rivus-common
+  image: ghcr.io/gerinsp/rivus:${RIVUS_IMAGE_TAG:-latest}
+  restart: unless-stopped
+  # Must be longer than RIVUS_SHUTDOWN_TIMEOUT_SECONDS so Docker does not
+  # SIGKILL snapshot/streaming workers before their checkpoint drain finishes.
+  stop_grace_period: ${RIVUS_STOP_GRACE_PERIOD:-2m}
+  depends_on:
+    meta-mysql:
+      condition: service_healthy
+  env_file:
+    - .env
+  environment: &rivus-environment
+    TZ: ${TZ:-UTC}
+    RIVUS_IMAGE_TAG: ${RIVUS_IMAGE_TAG:-latest}
+    RIVUS_SHUTDOWN_TIMEOUT_SECONDS: ${RIVUS_SHUTDOWN_TIMEOUT_SECONDS:-90}
+    RIVUS_LOG_DIR: ${RIVUS_LOG_DIR:-/app/logs}
+    RIVUS_LOG_RETENTION_DAYS: ${RIVUS_LOG_RETENTION_DAYS:-7}
+    RIVUS_LOG_MAX_SIZE_MB: ${RIVUS_LOG_MAX_SIZE_MB:-64}
+    RIVUS_LOG_MAX_TOTAL_SIZE_MB: ${RIVUS_LOG_MAX_TOTAL_SIZE_MB:-2048}
+    RIVUS_LOG_STDERR: ${RIVUS_LOG_STDERR:-true}
+  logging:
+    driver: json-file
+    options:
+      max-size: "64m"
+      max-file: "5"
+
 services:
   meta-mysql:
     image: mysql:8.0
@@ -26,37 +52,50 @@ services:
       - ./mysql-bootstrap-user.sh:/bootstrap/mysql-bootstrap-user.sh:ro
       - ./mysql-meta-entrypoint.sh:/bootstrap/mysql-meta-entrypoint.sh:ro
 
-  rivus:
-    image: ghcr.io/gerinsp/rivus:${RIVUS_IMAGE_TAG:-latest}
-    container_name: rivus
-    restart: unless-stopped
-    stop_grace_period: ${RIVUS_STOP_GRACE_PERIOD:-2m}
-    depends_on:
-      meta-mysql:
-        condition: service_healthy
-    env_file:
-      - .env
+  rivus-master:
+    <<: *rivus-common
+    command: ["/app/rivus", "master"]
     environment:
-      TZ: ${TZ:-UTC}
-      RIVUS_IMAGE_TAG: ${RIVUS_IMAGE_TAG:-latest}
-      RIVUS_LOG_DIR: ${RIVUS_LOG_DIR:-/app/logs}
-      RIVUS_LOG_RETENTION_DAYS: ${RIVUS_LOG_RETENTION_DAYS:-7}
-      RIVUS_LOG_MAX_SIZE_MB: ${RIVUS_LOG_MAX_SIZE_MB:-64}
-      RIVUS_LOG_MAX_TOTAL_SIZE_MB: ${RIVUS_LOG_MAX_TOTAL_SIZE_MB:-2048}
-      RIVUS_LOG_STDERR: ${RIVUS_LOG_STDERR:-true}
+      <<: *rivus-environment
       RIVUS_API_TOKEN: ${RIVUS_API_TOKEN:-}
-      RIVUS_AUTO_RESUME: ${RIVUS_AUTO_RESUME:-false}
-      RIVUS_ICEBERG_MAX_CONCURRENT_COMMITS: ${RIVUS_ICEBERG_MAX_CONCURRENT_COMMITS:-3}
     ports:
       - "${RIVUS_HTTP_PORT:-8080}:8080"
     volumes:
       - ./ui:/app/ui:ro
-      - ./logs:/app/logs
-    logging:
-      driver: json-file
-      options:
-        max-size: "64m"
-        max-file: "5"
+      - ./logs/master:/app/logs
+
+  rivus-streaming:
+    <<: *rivus-common
+    command: ["/app/rivus", "streaming-worker"]
+    environment:
+      <<: *rivus-environment
+      # Leave empty by default so Rivus uses its unique hostname-pid identity.
+      # Set RIVUS_STREAMING_WORKER_ID only when you can guarantee uniqueness.
+      RIVUS_WORKER_ID: ${RIVUS_STREAMING_WORKER_ID:-}
+      RIVUS_ICEBERG_MAX_CONCURRENT_COMMITS: ${RIVUS_ICEBERG_MAX_CONCURRENT_COMMITS:-3}
+    volumes:
+      - ./logs/streaming:/app/logs
+
+  rivus-snapshot:
+    <<: *rivus-common
+    command: ["/app/rivus", "snapshot-worker"]
+    environment:
+      <<: *rivus-environment
+      RIVUS_WORKER_ID: ${RIVUS_SNAPSHOT_WORKER_ID:-}
+      RIVUS_ICEBERG_MAX_CONCURRENT_COMMITS: ${RIVUS_ICEBERG_MAX_CONCURRENT_COMMITS:-3}
+    volumes:
+      - ./logs/snapshot:/app/logs
+      - snapshot-spool:/var/lib/rivus/snapshot-spool
+
+  rivus-maintenance:
+    <<: *rivus-common
+    command: ["/app/rivus", "maintenance-worker", "--queue"]
+    environment:
+      <<: *rivus-environment
+      RIVUS_WORKER_ID: ${RIVUS_MAINTENANCE_WORKER_ID:-}
+    volumes:
+      - ./logs/maintenance:/app/logs
 
 volumes:
   meta-mysql-data:
+  snapshot-spool:

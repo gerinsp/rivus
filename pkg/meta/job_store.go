@@ -267,7 +267,9 @@ func (s *MySQLJobStore) SaveJob(ctx context.Context, job PersistedJob) error {
 
 // SaveClaimedJob updates a job only while the caller still owns its worker
 // lease. Unlike SaveJob, it never inserts: a deleted row stays deleted even
-// if a snapshot completion callback arrives slightly later.
+// if a snapshot completion callback arrives slightly later. A control-plane
+// pause request is represented by last_status=PAUSING; routine worker progress
+// must not overwrite that request before the worker observes it.
 func (s *MySQLJobStore) SaveClaimedJob(ctx context.Context, job PersistedJob, owner string) (bool, error) {
 	if job.Config == nil {
 		return false, fmt.Errorf("persisted job config is nil for job_id=%s", job.ID)
@@ -318,10 +320,14 @@ func (s *MySQLJobStore) SaveClaimedJob(ctx context.Context, job PersistedJob, ow
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE job_registry
 		SET job_name=?, config_json=?, desired_state=?, execution_role=?,
-		    last_status=?, errors_json=?, progress_json=?, updated_at=NOW()
+		    last_status=CASE
+		      WHEN last_status='PAUSING' AND ? IN ('CREATED','QUEUED','PENDING','RUNNING') THEN last_status
+		      ELSE ?
+		    END,
+		    errors_json=?, progress_json=?, updated_at=NOW()
 		WHERE job_id=? AND lease_owner=? AND lease_until >= UTC_TIMESTAMP(6)`,
 		name, string(payload), string(desired), string(executionRole),
-		status, string(errorsJSON), progressJSON, id, owner)
+		status, status, string(errorsJSON), progressJSON, id, owner)
 	if err != nil {
 		return false, err
 	}
@@ -480,7 +486,8 @@ func (s *MySQLJobStore) RenewJobLease(ctx context.Context, jobID, owner string, 
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE job_registry
 		SET lease_until=?
-		WHERE job_id=? AND lease_owner=? AND desired_state=?`,
+		WHERE job_id=? AND lease_owner=?
+		  AND (desired_state=? OR last_status='PAUSING')`,
 		time.Now().UTC().Add(leaseDuration), jobID, owner, string(DesiredStateRunning))
 	if err != nil {
 		return false, err

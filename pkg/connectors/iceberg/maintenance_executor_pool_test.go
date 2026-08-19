@@ -1,6 +1,7 @@
 package iceberg
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -26,6 +27,20 @@ func TestMaintenanceConcurrencyOverridesAndCaps(t *testing.T) {
 	got := maintenanceConcurrencyFromEnv()
 	if got.Compact != 2 || got.ExpireSnapshots != 8 || got.OrphanCleanup != 32 {
 		t.Fatalf("unexpected concurrency overrides: %#v", got)
+	}
+}
+
+func TestMaintenanceFinalizeContextSurvivesCanceledWorker(t *testing.T) {
+	parent, cancelParent := context.WithCancel(context.Background())
+	cancelParent()
+
+	finalizeCtx, cancel := maintenanceFinalizeContext(parent)
+	defer cancel()
+	if err := finalizeCtx.Err(); err != nil {
+		t.Fatalf("finalization context inherited canceled worker context: %v", err)
+	}
+	if _, ok := finalizeCtx.Deadline(); !ok {
+		t.Fatal("shutdown finalization context should be bounded by a deadline")
 	}
 }
 
