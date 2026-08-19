@@ -131,15 +131,17 @@ func runJobWorkerCommand(command string, args []string, role core.WorkerRole) er
 	case runErr = <-errCh:
 	}
 
-	// Freeze claiming/renewal first, then extend currently-owned leases past the
-	// full drain deadline. This prevents another worker from reclaiming a job
-	// while this process is still draining its source/sink checkpoint.
-	stopWorker()
-	workerWG.Wait()
 	timeout := gracefulShutdownTimeoutFromEnv()
-	extendCtx, extendCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	leaseErr := extendOwnedWorkerLeasesForShutdown(extendCtx, manager, jobStore, timeout+30*time.Second)
-	extendCancel()
+	leaseDuration := timeout + 30*time.Second
+
+	// Freeze new reconciliation first. Extend the leases both before and after
+	// the worker goroutines exit: the first extension protects jobs already
+	// owned when SIGTERM arrives, while the second catches a claim that was
+	// completing concurrently with cancellation.
+	stopWorker()
+	leaseErr := extendOwnedWorkerLeasesForShutdownBounded(manager, jobStore, leaseDuration)
+	workerWG.Wait()
+	leaseErr = errors.Join(leaseErr, extendOwnedWorkerLeasesForShutdownBounded(manager, jobStore, leaseDuration))
 	if leaseErr != nil {
 		log.Printf("worker shutdown lease extension error: %v", leaseErr)
 	}
@@ -148,6 +150,12 @@ func runJobWorkerCommand(command string, args []string, role core.WorkerRole) er
 	defer cancel()
 	shutdownErr := manager.Shutdown(shutdownCtx)
 	return errors.Join(runErr, leaseErr, shutdownErr)
+}
+
+func extendOwnedWorkerLeasesForShutdownBounded(manager *core.JobManager, store meta.JobWorkerStore, leaseDuration time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return extendOwnedWorkerLeasesForShutdown(ctx, manager, store, leaseDuration)
 }
 
 func extendOwnedWorkerLeasesForShutdown(ctx context.Context, manager *core.JobManager, store meta.JobWorkerStore, leaseDuration time.Duration) error {
@@ -323,17 +331,21 @@ func runServerWithRole(args []string, forcedRole core.WorkerRole) error {
 		}
 		return nil
 	case <-signalCtx.Done():
-		stopWorker()
-		workerWG.Wait()
 		timeout := gracefulShutdownTimeoutFromEnv()
+		leaseDuration := timeout + 30*time.Second
 		log.Printf("Shutdown signal received; draining jobs for up to %s", timeout)
 
+		stopWorker()
+		var leaseErr error
 		if workerRole == core.WorkerRoleSnapshot || workerRole == core.WorkerRoleStreaming {
-			extendCtx, extendCancel := context.WithTimeout(context.Background(), 5*time.Second)
-			if err := extendOwnedWorkerLeasesForShutdown(extendCtx, jobManager, durableWorkerStore, timeout+30*time.Second); err != nil {
-				log.Printf("worker shutdown lease extension error: %v", err)
+			leaseErr = extendOwnedWorkerLeasesForShutdownBounded(jobManager, durableWorkerStore, leaseDuration)
+		}
+		workerWG.Wait()
+		if workerRole == core.WorkerRoleSnapshot || workerRole == core.WorkerRoleStreaming {
+			leaseErr = errors.Join(leaseErr, extendOwnedWorkerLeasesForShutdownBounded(jobManager, durableWorkerStore, leaseDuration))
+			if leaseErr != nil {
+				log.Printf("worker shutdown lease extension error: %v", leaseErr)
 			}
-			extendCancel()
 		}
 
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), timeout)
