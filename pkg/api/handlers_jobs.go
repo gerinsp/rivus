@@ -139,7 +139,7 @@ func (s *Server) handleJobByID(w http.ResponseWriter, r *http.Request) {
 	id := parts[0]
 
 	if len(parts) == 2 && parts[1] == "cancel" && r.Method == http.MethodPost {
-		if err := s.jobManager.Cancel(id); err != nil {
+		if err := s.jobManager.RequestCancel(id); err != nil {
 			if err == core.ErrJobNotFound {
 				writeJSON(w, http.StatusNotFound, map[string]string{"error": "job not found"})
 			} else if err == core.ErrJobManagerShuttingDown {
@@ -154,7 +154,7 @@ func (s *Server) handleJobByID(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(parts) == 2 && parts[1] == "pause" && r.Method == http.MethodPost {
-		if err := s.jobManager.Pause(id); err != nil {
+		if err := s.jobManager.RequestPause(id); err != nil {
 			switch err {
 			case core.ErrJobNotFound:
 				writeJSON(w, http.StatusNotFound, map[string]string{"error": "job not found"})
@@ -172,7 +172,7 @@ func (s *Server) handleJobByID(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(parts) == 2 && parts[1] == "resubmit" && r.Method == http.MethodPost {
-		job, err := s.jobManager.Resubmit(id)
+		job, err := s.jobManager.RequestResubmit(id)
 		if err != nil {
 			switch err {
 			case core.ErrJobNotFound:
