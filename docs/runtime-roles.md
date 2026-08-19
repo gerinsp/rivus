@@ -41,7 +41,7 @@ services:
     stop_grace_period: 2m
     environment:
       RIVUS_META_MYSQL_DSN: ${RIVUS_META_MYSQL_DSN}
-      RIVUS_WORKER_ID: rivus-streaming-1
+      RIVUS_WORKER_ID: ${RIVUS_STREAMING_WORKER_ID:-}
       RIVUS_SHUTDOWN_TIMEOUT_SECONDS: 90
 
   rivus-snapshot:
@@ -50,7 +50,7 @@ services:
     stop_grace_period: 2m
     environment:
       RIVUS_META_MYSQL_DSN: ${RIVUS_META_MYSQL_DSN}
-      RIVUS_WORKER_ID: rivus-snapshot-1
+      RIVUS_WORKER_ID: ${RIVUS_SNAPSHOT_WORKER_ID:-}
       RIVUS_SHUTDOWN_TIMEOUT_SECONDS: 90
     volumes:
       - ./snapshot-spool:/var/lib/rivus/snapshot-spool
@@ -61,10 +61,12 @@ services:
     stop_grace_period: 2m
     environment:
       RIVUS_META_MYSQL_DSN: ${RIVUS_META_MYSQL_DSN}
-      RIVUS_WORKER_ID: rivus-maintenance-1
+      RIVUS_WORKER_ID: ${RIVUS_MAINTENANCE_WORKER_ID:-}
 ```
 
 The example intentionally shows only role-specific settings. Keep the existing source database, Iceberg/object-storage, runner, Trino, Telegram, auth, and other environment variables on the roles that need them.
+
+When `RIVUS_WORKER_ID` is empty, Rivus generates a unique `hostname-pid` identity. This is the safe default for copied/scaled Compose deployments. Set an explicit worker ID only when you can guarantee that no two live worker processes share it.
 
 ## Job routing
 
@@ -97,7 +99,7 @@ All four roles are safe to stop with Docker's normal `SIGTERM` flow. This matter
 
 Set Docker `stop_grace_period` longer than `RIVUS_SHUTDOWN_TIMEOUT_SECONDS`. The repository Compose defaults are `90s` Rivus shutdown timeout and `2m` Docker grace, leaving a 30-second process-exit buffer before Docker may send `SIGKILL`.
 
-A rolling updater should still avoid intentionally starting two containers with the same `RIVUS_WORKER_ID`. If that accidentally happens, durable job/table lease checks remain the correctness boundary, but worker IDs should be unique per live worker process/server.
+A rolling updater should still avoid intentionally starting two containers with the same explicit `RIVUS_WORKER_ID`. If no explicit ID is configured, each process uses its generated `hostname-pid` identity.
 
 ## Environment placement
 
@@ -108,7 +110,7 @@ A useful deployment split is:
 - **snapshot worker**: metadata DB, source connectivity, Iceberg/storage credentials, snapshot concurrency, snapshot spool volume, and snapshot job failure notification settings when enabled.
 - **maintenance worker**: metadata DB, Iceberg/storage credentials, Trino/runner settings when used, maintenance concurrency/timeouts, and maintenance queue notification settings.
 
-Give every execution worker a unique `RIVUS_WORKER_ID`, especially when workers run on different servers. The repository Compose example leaves worker service names scalable rather than fixing `container_name` for those roles.
+Give every explicitly named execution worker a unique `RIVUS_WORKER_ID`, especially when workers run on different servers. The repository Compose example leaves worker service names scalable rather than fixing `container_name` for those roles.
 
 ## Migration from the all-in-one server
 
