@@ -115,8 +115,14 @@ func RunMaintenanceWorkerBounded(ctx context.Context, dsn string, opts Maintenan
 			}
 		}
 
+		if opts.Queue {
+			if err := store.RecoverExpiredMaintenanceLeases(workerCtx, now); err != nil {
+				return fmt.Errorf("recover expired maintenance leases: %w", err)
+			}
+		}
+
 		for {
-			claimed, err := scanPriorityInventoryBatch(workerCtx, store, jobStore, jobs, opts, now, 100, interactiveInventoryBatchSize)
+			claimed, err := scanPriorityInventoryBatchBounded(workerCtx, store, jobStore, jobs, opts, now, 100, interactiveInventoryBatchSize)
 			if err != nil {
 				if workerCtx.Err() != nil {
 					return nil
@@ -129,7 +135,7 @@ func RunMaintenanceWorkerBounded(ctx context.Context, dsn string, opts Maintenan
 			}
 		}
 		for {
-			claimed, err := scanPriorityInventoryBatch(workerCtx, store, jobStore, jobs, opts, now, 1, interactiveInventoryBatchSize)
+			claimed, err := scanPriorityInventoryBatchBounded(workerCtx, store, jobStore, jobs, opts, now, 1, interactiveInventoryBatchSize)
 			if err != nil {
 				if workerCtx.Err() != nil {
 					return nil
@@ -141,18 +147,13 @@ func RunMaintenanceWorkerBounded(ctx context.Context, dsn string, opts Maintenan
 				break
 			}
 		}
-		if _, err := scanOnePendingInventory(workerCtx, store, jobStore, jobs, opts, now, 0); err != nil {
+		if _, err := scanOnePendingInventoryBounded(workerCtx, store, jobStore, jobs, opts, now, 0); err != nil {
 			if workerCtx.Err() != nil {
 				return nil
 			}
 			log.Printf("[maintenance-worker %s] pending inventory scan error: %v", opts.WorkerID, err)
 		}
 
-		if opts.Queue {
-			if err := store.RecoverExpiredMaintenanceLeases(workerCtx, now); err != nil {
-				return fmt.Errorf("recover expired maintenance leases: %w", err)
-			}
-		}
 		if err := enqueueDueMaintenance(workerCtx, store, jobs, now, opts.DuePageSize); err != nil {
 			return err
 		}
