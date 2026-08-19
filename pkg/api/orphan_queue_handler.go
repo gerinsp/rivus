@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/gerinsp/rivus/pkg/meta"
 )
 
 const (
@@ -180,13 +182,7 @@ func normalizeQueuedOrphanOptions(req queuedIcebergOrphanCleanupRequest) (queued
 	return queuedOrphanOptions{DryRun: dryRun, OlderThanHours: req.OlderThanHours, Tables: tables}, nil
 }
 
-func selectQueuedOrphanTables(states []struct {
-	TableKey         string
-	Catalog          string
-	Namespace        string
-	Table            string
-	SnapshotComplete bool
-}, requested []string) (map[string]bool, []string) {
+func selectQueuedOrphanTables(states []meta.IcebergMaintenanceState, requested []string) (map[string]bool, []string) {
 	selected := make(map[string]bool)
 	if len(requested) == 0 {
 		for _, state := range states {
