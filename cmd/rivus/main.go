@@ -116,7 +116,7 @@ func runMaintenanceWorkerCommand(args []string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return iceberg.RunMaintenanceWorker(ctx, strings.TrimSpace(os.Getenv("RIVUS_META_MYSQL_DSN")), iceberg.MaintenanceWorkerOptions{
+	return iceberg.RunMaintenanceWorkerBounded(ctx, strings.TrimSpace(os.Getenv("RIVUS_META_MYSQL_DSN")), iceberg.MaintenanceWorkerOptions{
 		Queue:         *queue,
 		PollInterval:  pollInterval,
 		LeaseDuration: leaseDuration,
