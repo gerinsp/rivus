@@ -43,18 +43,18 @@ type JobProgress struct {
 	CDCCurrentPos           uint32 `json:"cdc_current_pos,omitempty"`
 	CDCCheckpointFile       string `json:"cdc_checkpoint_file,omitempty"`
 	CDCCheckpointPos        uint32 `json:"cdc_checkpoint_pos,omitempty"`
-	CDCLatestFile           string `json:"cdc_latest_file,omitempty"`
-	CDCLatestPos            uint32 `json:"cdc_latest_pos,omitempty"`
-	CDCLagFiles             int    `json:"cdc_lag_files,omitempty"`
-	CheckpointPending       bool   `json:"checkpoint_pending,omitempty"`
-	CheckpointReason        string `json:"checkpoint_reason,omitempty"`
-	CheckpointPosition      string `json:"checkpoint_position,omitempty"`
-	CheckpointPendingTables string `json:"checkpoint_pending_tables,omitempty"`
-	SinkPhase               string `json:"sink_phase,omitempty"`
-	SinkSummary             string `json:"sink_summary,omitempty"`
-	SinkDetail              string `json:"sink_detail,omitempty"`
-	SinkTable               string `json:"sink_table,omitempty"`
-	SinkRows                int64  `json:"sink_rows,omitempty"`
+	CDCLatestFile            string `json:"cdc_latest_file,omitempty"`
+	CDCLatestPos             uint32 `json:"cdc_latest_pos,omitempty"`
+	CDCLagFiles              int    `json:"cdc_lag_files,omitempty"`
+	CheckpointPending        bool   `json:"checkpoint_pending,omitempty"`
+	CheckpointReason         string `json:"checkpoint_reason,omitempty"`
+	CheckpointPosition       string `json:"checkpoint_position,omitempty"`
+	CheckpointPendingTables  string `json:"checkpoint_pending_tables,omitempty"`
+	SinkPhase                string `json:"sink_phase,omitempty"`
+	SinkSummary              string `json:"sink_summary,omitempty"`
+	SinkDetail               string `json:"sink_detail,omitempty"`
+	SinkTable                string `json:"sink_table,omitempty"`
+	SinkRows                 int64  `json:"sink_rows,omitempty"`
 }
 
 type Checkpoint struct {
@@ -737,13 +737,13 @@ func (j *Job) updateProgress(info connector.ProgressInfo) {
 		CDCCurrentPos:           info.CDCCurrentPos,
 		CDCCheckpointFile:       strings.TrimSpace(info.CDCCheckpointFile),
 		CDCCheckpointPos:        info.CDCCheckpointPos,
-		CDCLatestFile:           strings.TrimSpace(info.CDCLatestFile),
-		CDCLatestPos:            info.CDCLatestPos,
-		CDCLagFiles:             info.CDCLagFiles,
-		CheckpointPending:       info.CheckpointPending,
-		CheckpointReason:        strings.TrimSpace(info.CheckpointReason),
-		CheckpointPosition:      strings.TrimSpace(info.CheckpointPosition),
-		CheckpointPendingTables: strings.TrimSpace(info.CheckpointPendingTables),
+		CDCLatestFile:            strings.TrimSpace(info.CDCLatestFile),
+		CDCLatestPos:             info.CDCLatestPos,
+		CDCLagFiles:              info.CDCLagFiles,
+		CheckpointPending:        info.CheckpointPending,
+		CheckpointReason:         strings.TrimSpace(info.CheckpointReason),
+		CheckpointPosition:       strings.TrimSpace(info.CheckpointPosition),
+		CheckpointPendingTables:  strings.TrimSpace(info.CheckpointPendingTables),
 	}
 
 	j.mu.Lock()
@@ -1361,6 +1361,9 @@ func (j *Job) startWithMode(mode config.JobMode) (err error) {
 
 		// Preflight ensure table (generic)
 		if err := j.preflight(ctx, src, sink, effectiveMode); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
 			j.addError("system", err)
 			j.setStatus(JobStatusFailed)
 			cancel()
