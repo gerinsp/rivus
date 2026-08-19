@@ -30,28 +30,35 @@ services:
   rivus-master:
     image: ghcr.io/gerinsp/rivus:latest
     command: ["/app/rivus", "master"]
+    stop_grace_period: 2m
     environment:
       RIVUS_META_MYSQL_DSN: ${RIVUS_META_MYSQL_DSN}
+      RIVUS_SHUTDOWN_TIMEOUT_SECONDS: 90
 
   rivus-streaming:
     image: ghcr.io/gerinsp/rivus:latest
     command: ["/app/rivus", "streaming-worker"]
+    stop_grace_period: 2m
     environment:
       RIVUS_META_MYSQL_DSN: ${RIVUS_META_MYSQL_DSN}
       RIVUS_WORKER_ID: rivus-streaming-1
+      RIVUS_SHUTDOWN_TIMEOUT_SECONDS: 90
 
   rivus-snapshot:
     image: ghcr.io/gerinsp/rivus:latest
     command: ["/app/rivus", "snapshot-worker"]
+    stop_grace_period: 2m
     environment:
       RIVUS_META_MYSQL_DSN: ${RIVUS_META_MYSQL_DSN}
       RIVUS_WORKER_ID: rivus-snapshot-1
+      RIVUS_SHUTDOWN_TIMEOUT_SECONDS: 90
     volumes:
       - ./snapshot-spool:/var/lib/rivus/snapshot-spool
 
   rivus-maintenance:
     image: ghcr.io/gerinsp/rivus:latest
     command: ["/app/rivus", "maintenance-worker", "--queue"]
+    stop_grace_period: 2m
     environment:
       RIVUS_META_MYSQL_DSN: ${RIVUS_META_MYSQL_DSN}
       RIVUS_WORKER_ID: rivus-maintenance-1
@@ -78,6 +85,19 @@ The master does not own source or sink goroutines. Pause, cancel, and resubmit t
 - **Delete** removes the durable registry record; late claimed-worker writes are already fenced by the existing guarded save path.
 
 Workers poll durable pause requests by lease owner instead of performing one metadata query per running job. A transient control-observer database error is logged and retried; it does not terminate the data worker.
+
+## Graceful restart and auto-deploy
+
+All four roles are safe to stop with Docker's normal `SIGTERM` flow. This matters for image auto-deployers that stop the old container before starting the replacement.
+
+- **master** stops accepting work through the process shutdown path and exits without owning data pipelines.
+- **streaming worker** stops claiming jobs, extends its current durable job leases beyond the drain window, stops the source, lets the sink drain/commit the latest checkpoint, and exits. The replacement worker resumes from that durable checkpoint.
+- **snapshot worker** uses the same lease fencing and drain path. An interrupted snapshot remains resumable from its durable snapshot checkpoint instead of being started concurrently by the replacement worker.
+- **maintenance worker** cancels in-flight native maintenance on `SIGTERM`, then finalizes the durable result through a fresh short-lived context and moves interrupted work back to `retry`. It does not leave the task stuck in `leased` until the normal lease timeout.
+
+Set Docker `stop_grace_period` longer than `RIVUS_SHUTDOWN_TIMEOUT_SECONDS`. The repository Compose defaults are `90s` Rivus shutdown timeout and `2m` Docker grace, leaving a 30-second process-exit buffer before Docker may send `SIGKILL`.
+
+A rolling updater should still avoid intentionally starting two containers with the same `RIVUS_WORKER_ID`. If that accidentally happens, durable job/table lease checks remain the correctness boundary, but worker IDs should be unique per live worker process/server.
 
 ## Environment placement
 
