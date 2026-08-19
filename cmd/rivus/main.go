@@ -134,7 +134,7 @@ func runMaintenanceWorkerCommand(args []string) error {
 	leaseSeconds := fs.Int("lease-seconds", 0, "task lease duration in seconds (0 uses env/default)")
 	taskPageSize := fs.Int("task-page-size", 0, "maximum tasks claimed per parent run")
 	duePageSize := fs.Int("due-page-size", 0, "maximum due table states read per operation")
-	workerID := fs.String("worker-id", "", "stable worker identity (defaults to hostname-pid)")
+	workerID := fs.String("worker-id", strings.TrimSpace(os.Getenv("RIVUS_WORKER_ID")), "stable worker identity (defaults to hostname-pid)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
