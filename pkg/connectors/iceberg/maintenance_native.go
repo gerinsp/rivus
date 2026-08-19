@@ -632,8 +632,8 @@ func shouldRouteCompactionToSpark(work compactionWorkload, state meta.IcebergMai
 	equalityDeletes := maxInt(work.EqualityDeletes, state.ActiveEqualityDeleteFiles)
 	positionDeletes := maxInt(work.PositionDeletes, state.ActivePositionDeleteFiles)
 	switch {
-	case positionDeletes > 0:
-		return true, "position-delete files are present during the initial native rollout"
+	case settings.PositionDeleteThreshold > 0 && positionDeletes >= settings.PositionDeleteThreshold:
+		return true, fmt.Sprintf("position-delete files %d reached threshold %d", positionDeletes, settings.PositionDeleteThreshold)
 	case equalityDeletes > settings.MaxEqualityDeleteFiles:
 		return true, fmt.Sprintf("equality-delete files %d exceed native limit %d", equalityDeletes, settings.MaxEqualityDeleteFiles)
 	case work.SelectedBytes > settings.MaxSelectedInputBytes:
