@@ -693,10 +693,10 @@ func (m *JobManager) attachStatusListener(job *Job) {
 }
 
 // Snapshot and streaming workers run in separate containers. Persist a
-// throttled snapshot view so the API/UI container can show the actual table,
-// phase, and row count while the snapshot is running elsewhere.
+// throttled worker view so the API/UI control-plane container can show the
+// actual phase, table, CDC position, and sink progress from either worker.
 func (m *JobManager) persistSnapshotProgress(job *Job) {
-	if m.workerRole != WorkerRoleSnapshot || job == nil || job.Config == nil || job.isPersistenceDeleted() {
+	if (m.workerRole != WorkerRoleSnapshot && m.workerRole != WorkerRoleStreaming) || job == nil || job.Config == nil || job.isPersistenceDeleted() {
 		return
 	}
 
@@ -715,7 +715,7 @@ func (m *JobManager) persistSnapshotProgress(job *Job) {
 		defer cancel()
 		status := job.GetStatus()
 		if err := m.saveManagedJobRecordIfCurrent(ctx, job, status, m.desiredStateForJobStatus(id, status), status); err != nil && !errors.Is(err, ErrJobWorkerLeaseLost) {
-			log.Printf("[job-manager] persist snapshot progress failed job=%s: %v", id, err)
+			log.Printf("[job-manager] persist worker progress failed job=%s role=%s: %v", id, m.workerRole, err)
 		}
 	}(job.Config.ID)
 }
