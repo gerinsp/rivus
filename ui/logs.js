@@ -14,6 +14,11 @@ let currentLogLineLimit = Number(initialUrl.searchParams.get('lines') || 500);
 let latestLogLines = [];
 let latestLogTailLoaded = false;
 let latestLogTailError = '';
+// Logs are physically split by runtime under one shared /app/logs volume.
+// Default the page and Job -> Logs flow to the CDC/streaming runtime while
+// still listing master/snapshot/maintenance files for manual selection.
+let preferredLogPrefix = currentLogFile ? '' : 'streaming/rivus-streaming-';
+let logTailRequestSequence = 0;
 let routeChanged = () => {};
 let switchTab = () => {};
 let initialized = false;
@@ -78,20 +83,30 @@ function logFileRowTemplate(file) {
   `;
 }
 
+function preferredLatestFile(logFiles) {
+  if (preferredLogPrefix) {
+    const preferred = logFiles.find((file) => String(file?.name || '').startsWith(preferredLogPrefix));
+    if (preferred) return String(preferred.name || '');
+  }
+  return String(logFiles[0]?.name || '');
+}
+
 export async function loadLogs(options = {}) {
   try {
     setInitialLogLineLimit();
     if (options.preferLatest === true) setFollowLatestLog(true);
-    const res = await apiFetch('/api/logs');
+    const res = await apiFetch('/api/logs', { cache: 'no-store' });
     if (!res.ok) throw new Error(await operationErrorMessage(res, 'Load log files'));
 
     const files = await res.json();
     const logFiles = Array.isArray(files) ? files : [];
     const select = document.getElementById('logFileSelect');
-    select.innerHTML = logFiles.map((file) => {
-      const name = String(file?.name || '');
-      return `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`;
-    }).join('');
+    if (select) {
+      select.innerHTML = logFiles.map((file) => {
+        const name = String(file?.name || '');
+        return `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`;
+      }).join('');
+    }
 
     if (logFiles.length === 0) {
       currentLogFile = '';
@@ -99,8 +114,10 @@ export async function loadLogs(options = {}) {
       latestLogTailLoaded = true;
       latestLogTailError = '';
       renderLogOutput();
-      document.getElementById('logsFileBody').innerHTML = '';
-      document.getElementById('logsFileEmpty').classList.remove('hidden');
+      const body = document.getElementById('logsFileBody');
+      const empty = document.getElementById('logsFileEmpty');
+      if (body) body.innerHTML = '';
+      empty?.classList.remove('hidden');
       setLogMeta({});
       setLogsNotice('No Rivus log files are available yet.');
       routeChanged();
@@ -109,11 +126,14 @@ export async function loadLogs(options = {}) {
 
     const names = new Set(logFiles.map((file) => String(file?.name || '')));
     if (followLatestLog || !currentLogFile || !names.has(currentLogFile)) {
-      currentLogFile = String(logFiles[0]?.name || '');
+      currentLogFile = preferredLatestFile(logFiles);
     }
-    select.value = currentLogFile;
-    document.getElementById('logsFileBody').innerHTML = logFiles.map(logFileRowTemplate).join('');
-    document.getElementById('logsFileEmpty').classList.toggle('hidden', logFiles.length !== 0);
+    if (select) select.value = currentLogFile;
+
+    const body = document.getElementById('logsFileBody');
+    const empty = document.getElementById('logsFileEmpty');
+    if (body) body.innerHTML = logFiles.map(logFileRowTemplate).join('');
+    empty?.classList.toggle('hidden', logFiles.length !== 0);
 
     setLogsNotice('');
     routeChanged();
@@ -126,19 +146,41 @@ export async function loadLogs(options = {}) {
       renderLogOutput();
     }
   } catch (err) {
-    const message = err?.message || 'Failed to load log files. Check RIVUS_LOG_DIR and API status.';
+    const message = err?.message || 'Failed to load log files. Check RIVUS_LOG_ROOT and API status.';
     setLogsNotice(message, 'error');
   }
 }
 
+function setText(id, value) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = value;
+}
+
 function setLogMeta(payload) {
-  const files = Array.isArray(payload.files) ? payload.files : [];
-  const fileLabel = payload.file || (files.length ? `${files.length} matching files` : '-');
-  document.getElementById('logCurrentFile').textContent = fileLabel;
-  document.getElementById('logCurrentSize').textContent = payload.total_size || payload.total_size === 0 ? fmtBytes(payload.total_size) : '-';
-  document.getElementById('logCurrentUpdated').textContent = payload.mod_time ? formatLogTime(payload.mod_time) : '-';
-  document.getElementById('logConsoleTitle').textContent = fileLabel;
-  document.getElementById('logTruncatedBadge').classList.toggle('hidden', !payload.truncated);
+  const files = Array.isArray(payload?.files) ? payload.files : [];
+  const fileLabel = payload?.file || (files.length ? `${files.length} matching files` : '-');
+  setText('logCurrentFile', fileLabel);
+  setText('logCurrentSize', payload?.total_size || payload?.total_size === 0 ? fmtBytes(payload.total_size) : '-');
+  setText('logCurrentUpdated', payload?.mod_time ? formatLogTime(payload.mod_time) : '-');
+  setText('logConsoleTitle', fileLabel);
+  document.getElementById('logTruncatedBadge')?.classList.toggle('hidden', !payload?.truncated);
+}
+
+function applyLogTailPayload(payload) {
+  latestLogLines = Array.isArray(payload?.lines) ? payload.lines.map((line) => String(line)) : [];
+  latestLogTailLoaded = true;
+  latestLogTailError = '';
+  setLogMeta(payload || {});
+  renderLogOutput();
+}
+
+function applyLogTailError(message) {
+  latestLogLines = [];
+  latestLogTailLoaded = true;
+  latestLogTailError = message || 'Failed to load log tail for the selected file.';
+  setLogMeta({ file: currentLogFile });
+  renderLogOutput();
+  setLogsNotice(latestLogTailError, 'error');
 }
 
 export async function loadLogTail(options = {}) {
@@ -150,31 +192,40 @@ export async function loadLogTail(options = {}) {
     return;
   }
 
-  try {
-    latestLogTailLoaded = false;
-    latestLogTailError = '';
-    const url = new URL('/api/logs/tail', window.location.origin);
-    const filter = String(document.getElementById('logFilter')?.value || '').trim();
-    if (!(followLatestLog && filter)) url.searchParams.set('file', currentLogFile);
-    url.searchParams.set('lines', String(selectedLogLineLimit()));
-    if (filter) url.searchParams.set('filter', filter);
-    const res = await apiFetch(url.pathname + url.search);
-    if (!res.ok) throw new Error(await operationErrorMessage(res, 'Load log tail'));
+  const requestSequence = ++logTailRequestSequence;
+  const requestedFile = currentLogFile;
+  latestLogTailLoaded = false;
+  latestLogTailError = '';
 
-    const payload = await res.json();
-    latestLogLines = Array.isArray(payload.lines) ? payload.lines : [];
-    latestLogTailLoaded = true;
-    setLogMeta(payload);
-    renderLogOutput();
-    if (!options.silent) setLogsNotice('');
-  } catch (err) {
-    latestLogLines = [];
-    latestLogTailLoaded = true;
-    latestLogTailError = err?.message || 'Failed to load log tail for the selected file.';
-    setLogMeta({ file: currentLogFile });
-    renderLogOutput();
-    if (!options.silent) setLogsNotice(latestLogTailError, 'error');
+  const url = new URL('/api/logs/tail', window.location.origin);
+  const filter = String(document.getElementById('logFilter')?.value || '').trim();
+  // For the default streaming view, keep the request pinned to the selected
+  // streaming file even when filtering by job id. This prevents a job view
+  // from mixing master/snapshot/maintenance lines into the CDC console.
+  if (!(followLatestLog && filter && !preferredLogPrefix)) {
+    url.searchParams.set('file', requestedFile);
   }
+  url.searchParams.set('lines', String(selectedLogLineLimit()));
+  if (filter) url.searchParams.set('filter', filter);
+
+  let res;
+  let payload;
+  try {
+    res = await apiFetch(url.pathname + url.search, { cache: 'no-store' });
+    if (!res.ok) throw new Error(await operationErrorMessage(res, 'Load log tail'));
+    payload = await res.json();
+  } catch (err) {
+    if (requestSequence !== logTailRequestSequence) return;
+    applyLogTailError(err?.message || 'Failed to load log tail for the selected file.');
+    return;
+  }
+
+  // Ignore an older response that completed after a newer refresh/file change.
+  if (requestSequence !== logTailRequestSequence) return;
+  if (!followLatestLog && requestedFile !== currentLogFile) return;
+
+  applyLogTailPayload(payload);
+  if (!options.silent) setLogsNotice('');
 }
 
 export function renderLogOutput() {
@@ -200,14 +251,16 @@ export function renderLogOutput() {
   }
 
   output.textContent = lines.length > 0 ? lines.join('\n') : emptyMessage;
-  document.getElementById('logVisibleLines').textContent = String(lines.length);
-  document.getElementById('logTotalLines').textContent = String(latestLogLines.length);
+  setText('logVisibleLines', String(lines.length));
+  setText('logTotalLines', String(latestLogLines.length));
   if (document.getElementById('logAutoRefresh')?.checked) output.scrollTop = output.scrollHeight;
 }
 
 export function selectLogFile(name) {
+  preferredLogPrefix = '';
   setFollowLatestLog(false);
   currentLogFile = String(name || '');
+  logTailRequestSequence++;
   routeChanged();
   loadLogs();
 }
@@ -219,10 +272,12 @@ export function setFollowLatestLog(enabled) {
 }
 
 export function changeLogFollowLatest(enabled) {
+  preferredLogPrefix = enabled ? 'streaming/rivus-streaming-' : '';
   setFollowLatestLog(enabled);
   if (followLatestLog) {
     currentLogFile = '';
     latestLogLines = [];
+    logTailRequestSequence++;
     loadLogs({ preferLatest: true });
     return;
   }
@@ -245,11 +300,13 @@ export function downloadSelectedLog() {
 export function showLogsForJob(jobId) {
   const filter = document.getElementById('logFilter');
   if (filter) filter.value = jobId || '';
+  preferredLogPrefix = 'streaming/rivus-streaming-';
   setFollowLatestLog(true);
   currentLogFile = '';
   latestLogLines = [];
   latestLogTailLoaded = false;
   latestLogTailError = '';
+  logTailRequestSequence++;
   switchTab('logs');
   renderLogOutput();
 }
