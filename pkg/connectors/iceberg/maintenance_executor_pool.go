@@ -173,6 +173,9 @@ func processClaimedMaintenanceTasks(
 
 	runID, err := store.CreateRunForTasks(ctx, workerID, tasks, now)
 	if err != nil {
+		for _, task := range tasks {
+			releaseMaintenanceTableLease(store, task.TableKey, workerID)
+		}
 		return 0, fmt.Errorf("create maintenance run: %w", err)
 	}
 
@@ -242,7 +245,7 @@ func processClaimedMaintenanceTask(
 		return "failed", nil
 	}
 
-	leaseCtx, leaseCancel := context.WithCancel(ctx)
+	taskCtx, taskCancel := context.WithCancel(ctx)
 	var leaseWG sync.WaitGroup
 	leaseWG.Add(1)
 	go func() {
@@ -255,25 +258,26 @@ func processClaimedMaintenanceTask(
 		defer ticker.Stop()
 		for {
 			select {
-			case <-leaseCtx.Done():
+			case <-taskCtx.Done():
 				return
 			case <-ticker.C:
 				if err := store.RenewTaskAndTableLease(
-					leaseCtx,
+					taskCtx,
 					task.ID,
 					task.TableKey,
 					workerID,
 					time.Now().Add(opts.LeaseDuration),
 				); err != nil {
 					log.Printf("[maintenance-worker %s] lease renewal task=%d table=%s error=%v", workerID, task.ID, task.TableKey, err)
+					taskCancel()
 					return
 				}
 			}
 		}
 	}()
 
-	outcome := executeNativeMaintenanceTask(ctx, store, task.OwnerJobID, job.Job.Config, *state, task, job.Settings)
-	leaseCancel()
+	outcome := executeNativeMaintenanceTask(taskCtx, store, task.OwnerJobID, job.Job.Config, *state, task, job.Settings)
+	taskCancel()
 	leaseWG.Wait()
 	outcome.Result.RunID = runID
 	if err := store.InsertResult(ctx, outcome.Result); err != nil {
