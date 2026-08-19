@@ -52,6 +52,9 @@ func (s *Server) Router() http.Handler {
 	mux.HandleFunc("GET /metrics", s.handlePrometheusMetrics)
 
 	mux.HandleFunc("/api/jobs", s.requireAPIAuth(s.handleJobs))
+	// Keep manual orphan cleanup on the master as a control-plane action only.
+	// The specific route wins over the generic /api/jobs/ fallback below.
+	mux.HandleFunc("POST /api/jobs/{id}/iceberg/orphans", s.requireAPIAuth(s.handleQueuedJobIcebergOrphans))
 	mux.HandleFunc("/api/jobs/", s.requireAPIAuth(s.handleJobByID))
 
 	mux.HandleFunc("GET /api/iceberg/maintenance/summary", s.requireAPIAuth(s.handleMaintenanceSummary))
