@@ -69,7 +69,9 @@ services:
     command: ["/app/rivus", "streaming-worker"]
     environment:
       <<: *rivus-environment
-      RIVUS_WORKER_ID: ${RIVUS_STREAMING_WORKER_ID:-rivus-streaming-1}
+      # Leave empty by default so Rivus uses its unique hostname-pid identity.
+      # Set RIVUS_STREAMING_WORKER_ID only when you can guarantee uniqueness.
+      RIVUS_WORKER_ID: ${RIVUS_STREAMING_WORKER_ID:-}
       RIVUS_ICEBERG_MAX_CONCURRENT_COMMITS: ${RIVUS_ICEBERG_MAX_CONCURRENT_COMMITS:-3}
     volumes:
       - ./logs/streaming:/app/logs
@@ -79,7 +81,7 @@ services:
     command: ["/app/rivus", "snapshot-worker"]
     environment:
       <<: *rivus-environment
-      RIVUS_WORKER_ID: ${RIVUS_SNAPSHOT_WORKER_ID:-rivus-snapshot-1}
+      RIVUS_WORKER_ID: ${RIVUS_SNAPSHOT_WORKER_ID:-}
       RIVUS_ICEBERG_MAX_CONCURRENT_COMMITS: ${RIVUS_ICEBERG_MAX_CONCURRENT_COMMITS:-3}
     volumes:
       - ./logs/snapshot:/app/logs
@@ -90,7 +92,7 @@ services:
     command: ["/app/rivus", "maintenance-worker", "--queue"]
     environment:
       <<: *rivus-environment
-      RIVUS_WORKER_ID: ${RIVUS_MAINTENANCE_WORKER_ID:-rivus-maintenance-1}
+      RIVUS_WORKER_ID: ${RIVUS_MAINTENANCE_WORKER_ID:-}
     volumes:
       - ./logs/maintenance:/app/logs
 
