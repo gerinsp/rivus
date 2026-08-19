@@ -58,11 +58,15 @@ services:
     environment:
       <<: *rivus-environment
       RIVUS_API_TOKEN: ${RIVUS_API_TOKEN:-}
+      # Keep the broad "rivus" prefix on the API process. The log API uses
+      # this prefix to discover the per-role files written into the shared
+      # /app/logs directory below.
+      RIVUS_LOG_PREFIX: rivus
     ports:
       - "${RIVUS_HTTP_PORT:-8080}:8080"
     volumes:
       - ./ui:/app/ui:ro
-      - ./logs/master:/app/logs
+      - ./logs:/app/logs
 
   rivus-streaming:
     <<: *rivus-common
@@ -73,8 +77,9 @@ services:
       # Set RIVUS_STREAMING_WORKER_ID only when you can guarantee uniqueness.
       RIVUS_WORKER_ID: ${RIVUS_STREAMING_WORKER_ID:-}
       RIVUS_ICEBERG_MAX_CONCURRENT_COMMITS: ${RIVUS_ICEBERG_MAX_CONCURRENT_COMMITS:-3}
+      RIVUS_LOG_PREFIX: rivus-streaming
     volumes:
-      - ./logs/streaming:/app/logs
+      - ./logs:/app/logs
 
   rivus-snapshot:
     <<: *rivus-common
@@ -83,8 +88,9 @@ services:
       <<: *rivus-environment
       RIVUS_WORKER_ID: ${RIVUS_SNAPSHOT_WORKER_ID:-}
       RIVUS_ICEBERG_MAX_CONCURRENT_COMMITS: ${RIVUS_ICEBERG_MAX_CONCURRENT_COMMITS:-3}
+      RIVUS_LOG_PREFIX: rivus-snapshot
     volumes:
-      - ./logs/snapshot:/app/logs
+      - ./logs:/app/logs
       - snapshot-spool:/var/lib/rivus/snapshot-spool
 
   rivus-maintenance:
@@ -93,8 +99,9 @@ services:
     environment:
       <<: *rivus-environment
       RIVUS_WORKER_ID: ${RIVUS_MAINTENANCE_WORKER_ID:-}
+      RIVUS_LOG_PREFIX: rivus-maintenance
     volumes:
-      - ./logs/maintenance:/app/logs
+      - ./logs:/app/logs
 
 volumes:
   meta-mysql-data:
