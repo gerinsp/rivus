@@ -211,7 +211,8 @@ func TestCompactionRoutingBoundaries(t *testing.T) {
 		{name: "too many files", work: compactionWorkload{SelectedFiles: 251, SelectedBytes: 400 * 1024 * 1024, GroupCount: 1}, want: true},
 		{name: "100 equality deletes", work: compactionWorkload{SelectedFiles: 50, SelectedBytes: 14 * 1024 * 1024, EqualityDeletes: 100, GroupCount: 1}, want: false},
 		{name: "too many equality deletes", work: compactionWorkload{SelectedFiles: 50, SelectedBytes: 14 * 1024 * 1024, EqualityDeletes: 101, GroupCount: 1}, want: true},
-		{name: "position deletes", work: compactionWorkload{SelectedFiles: 20, SelectedBytes: 300 * 1024 * 1024, PositionDeletes: 1, GroupCount: 1}, want: true},
+		{name: "one position delete stays native", work: compactionWorkload{SelectedFiles: 20, SelectedBytes: 300 * 1024 * 1024, PositionDeletes: 1, GroupCount: 1}, want: false},
+		{name: "25 position deletes route to Spark", work: compactionWorkload{SelectedFiles: 44, SelectedBytes: 300 * 1024 * 1024, PositionDeletes: 25, GroupCount: 1}, want: true},
 		{name: "multiple groups within native limits", work: compactionWorkload{SelectedFiles: 80, SelectedBytes: 300 * 1024 * 1024, GroupCount: 2}, want: false},
 	}
 	for _, tc := range cases {
