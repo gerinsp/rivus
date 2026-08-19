@@ -14,7 +14,10 @@ let currentLogLineLimit = Number(initialUrl.searchParams.get('lines') || 500);
 let latestLogLines = [];
 let latestLogTailLoaded = false;
 let latestLogTailError = '';
-let preferredLogPrefix = '';
+// Logs are physically split by runtime under one shared /app/logs volume.
+// Default the page and Job -> Logs flow to the CDC/streaming runtime while
+// still listing master/snapshot/maintenance files for manual selection.
+let preferredLogPrefix = currentLogFile ? '' : 'streaming/rivus-streaming-';
 let logTailRequestSequence = 0;
 let routeChanged = () => {};
 let switchTab = () => {};
@@ -143,7 +146,7 @@ export async function loadLogs(options = {}) {
       renderLogOutput();
     }
   } catch (err) {
-    const message = err?.message || 'Failed to load log files. Check RIVUS_LOG_DIR and API status.';
+    const message = err?.message || 'Failed to load log files. Check RIVUS_LOG_ROOT and API status.';
     setLogsNotice(message, 'error');
   }
 }
@@ -196,7 +199,12 @@ export async function loadLogTail(options = {}) {
 
   const url = new URL('/api/logs/tail', window.location.origin);
   const filter = String(document.getElementById('logFilter')?.value || '').trim();
-  if (!(followLatestLog && filter)) url.searchParams.set('file', requestedFile);
+  // For the default streaming view, keep the request pinned to the selected
+  // streaming file even when filtering by job id. This prevents a job view
+  // from mixing master/snapshot/maintenance lines into the CDC console.
+  if (!(followLatestLog && filter && !preferredLogPrefix)) {
+    url.searchParams.set('file', requestedFile);
+  }
   url.searchParams.set('lines', String(selectedLogLineLimit()));
   if (filter) url.searchParams.set('filter', filter);
 
@@ -264,7 +272,7 @@ export function setFollowLatestLog(enabled) {
 }
 
 export function changeLogFollowLatest(enabled) {
-  preferredLogPrefix = '';
+  preferredLogPrefix = enabled ? 'streaming/rivus-streaming-' : '';
   setFollowLatestLog(enabled);
   if (followLatestLog) {
     currentLogFile = '';
@@ -292,10 +300,7 @@ export function downloadSelectedLog() {
 export function showLogsForJob(jobId) {
   const filter = document.getElementById('logFilter');
   if (filter) filter.value = jobId || '';
-  // All active CDC jobs execute in the streaming runtime after the split.
-  // Prefer its rotating file while still falling back to the broad rivus log
-  // for old/single-process deployments.
-  preferredLogPrefix = 'rivus-streaming-';
+  preferredLogPrefix = 'streaming/rivus-streaming-';
   setFollowLatestLog(true);
   currentLogFile = '';
   latestLogLines = [];
