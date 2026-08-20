@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	drivermysql "github.com/go-sql-driver/mysql"
@@ -29,6 +30,7 @@ const (
 
 type PersistedJob struct {
 	ID            string
+	SubmissionID  string
 	Name          string
 	MetaKey       string
 	Config        *config.JobConfig
@@ -93,8 +95,8 @@ type JobStore interface {
 // even when more than one replica of a worker role is running.
 type JobWorkerStore interface {
 	ClaimJobs(ctx context.Context, role JobExecutionRole, owner string, limit int, leaseDuration time.Duration) ([]PersistedJob, error)
-	RenewJobLease(ctx context.Context, jobID, owner string, leaseDuration time.Duration) (bool, error)
-	ReleaseJobLease(ctx context.Context, jobID, owner string) error
+	RenewJobLease(ctx context.Context, jobID, submissionID, owner string, leaseDuration time.Duration) (bool, error)
+	ReleaseJobLease(ctx context.Context, jobID, submissionID, owner string) error
 }
 
 // ClaimedJobStore protects split-worker writes. A snapshot or streaming
@@ -148,6 +150,7 @@ func (s *MySQLJobStore) Init(ctx context.Context) error {
 	const ddl = `
 	CREATE TABLE IF NOT EXISTS job_registry (
 	  job_id        VARCHAR(255) NOT NULL PRIMARY KEY,
+	  submission_id VARCHAR(64) NOT NULL DEFAULT '',
 	  job_name      VARCHAR(255) NOT NULL,
 	  config_json   LONGTEXT NOT NULL,
 	  meta_key      VARCHAR(255) NULL,
@@ -171,6 +174,15 @@ func (s *MySQLJobStore) Init(ctx context.Context) error {
 		return err
 	}
 	if _, err := s.db.ExecContext(ctx, `ALTER TABLE job_registry ADD COLUMN meta_key VARCHAR(255) NULL AFTER config_json`); err != nil && !isDuplicateColumnError(err) {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE job_registry ADD COLUMN submission_id VARCHAR(64) NOT NULL DEFAULT '' AFTER job_id`); err != nil && !isDuplicateColumnError(err) {
+		return err
+	}
+	// Existing rows predate submission fencing. Give each one a stable token so
+	// workers restored during a rolling deployment can immediately use guarded
+	// writes without requiring a separate migration step.
+	if _, err := s.db.ExecContext(ctx, `UPDATE job_registry SET submission_id=LOWER(REPLACE(UUID(), '-', '')) WHERE submission_id=''`); err != nil {
 		return err
 	}
 	for _, migration := range []string{
@@ -209,6 +221,9 @@ func (s *MySQLJobStore) Init(ctx context.Context) error {
 func (s *MySQLJobStore) SaveJob(ctx context.Context, job PersistedJob) error {
 	if job.Config == nil {
 		return fmt.Errorf("persisted job config is nil for job_id=%s", job.ID)
+	}
+	if strings.TrimSpace(job.SubmissionID) == "" {
+		return fmt.Errorf("persisted job submission id is empty for job_id=%s", job.ID)
 	}
 
 	cfg := *job.Config
@@ -255,9 +270,10 @@ func (s *MySQLJobStore) SaveJob(ctx context.Context, job PersistedJob) error {
 	}
 
 	const stmt = `
-	INSERT INTO job_registry (job_id, job_name, config_json, meta_key, desired_state, execution_role, last_status, errors_json, progress_json, created_at, updated_at)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
+	INSERT INTO job_registry (job_id, submission_id, job_name, config_json, meta_key, desired_state, execution_role, last_status, errors_json, progress_json, created_at, updated_at)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
 	ON DUPLICATE KEY UPDATE
+	  submission_id = VALUES(submission_id),
 	  job_name = VALUES(job_name),
 	  config_json = VALUES(config_json),
 	  meta_key = VALUES(meta_key),
@@ -267,7 +283,7 @@ func (s *MySQLJobStore) SaveJob(ctx context.Context, job PersistedJob) error {
 	  errors_json = VALUES(errors_json),
 	  progress_json = VALUES(progress_json),
 	  updated_at = NOW();`
-	_, err = s.db.ExecContext(ctx, stmt, id, name, string(payload), nullableString(job.MetaKey), string(desired), string(executionRole), status, string(errorsJSON), progressJSON)
+	_, err = s.db.ExecContext(ctx, stmt, id, job.SubmissionID, name, string(payload), nullableString(job.MetaKey), string(desired), string(executionRole), status, string(errorsJSON), progressJSON)
 	return err
 }
 
@@ -280,16 +296,14 @@ func (s *MySQLJobStore) SaveClaimedJob(ctx context.Context, job PersistedJob, ow
 	if job.Config == nil {
 		return false, fmt.Errorf("persisted job config is nil for job_id=%s", job.ID)
 	}
+	if strings.TrimSpace(job.SubmissionID) == "" {
+		return false, fmt.Errorf("persisted job submission id is empty for job_id=%s", job.ID)
+	}
 	if owner == "" {
 		return false, fmt.Errorf("claimed job owner is empty")
 	}
 
 	cfg := *job.Config
-	config.ApplyDefaults(&cfg)
-	payload, err := json.Marshal(&cfg)
-	if err != nil {
-		return false, err
-	}
 	errorsJSON, err := json.Marshal(job.Errors)
 	if err != nil {
 		return false, err
@@ -325,15 +339,15 @@ func (s *MySQLJobStore) SaveClaimedJob(ctx context.Context, job PersistedJob, ow
 
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE job_registry
-		SET job_name=?, config_json=?, meta_key=?, desired_state=?, execution_role=?,
+		SET job_name=?, meta_key=?, desired_state=?, execution_role=?,
 		    last_status=CASE
 		      WHEN last_status='PAUSING' AND ? IN ('CREATED','QUEUED','PENDING','RUNNING') THEN last_status
 		      ELSE ?
 		    END,
 		    errors_json=?, progress_json=?, updated_at=NOW()
-		WHERE job_id=? AND lease_owner=? AND lease_until >= UTC_TIMESTAMP(6)`,
-		name, string(payload), nullableString(job.MetaKey), string(desired), string(executionRole),
-		status, status, string(errorsJSON), progressJSON, id, owner)
+		WHERE job_id=? AND submission_id=? AND lease_owner=? AND lease_until >= UTC_TIMESTAMP(6)`,
+		name, nullableString(job.MetaKey), string(desired), string(executionRole),
+		status, status, string(errorsJSON), progressJSON, id, job.SubmissionID, owner)
 	if err != nil {
 		return false, err
 	}
@@ -343,7 +357,7 @@ func (s *MySQLJobStore) SaveClaimedJob(ctx context.Context, job PersistedJob, ow
 
 func (s *MySQLJobStore) LoadJobs(ctx context.Context) ([]PersistedJob, error) {
 	const q = `
-	SELECT job_id, job_name, config_json, meta_key, desired_state, execution_role, lease_owner, lease_until, last_status, errors_json, progress_json, created_at, updated_at
+	SELECT job_id, submission_id, job_name, config_json, meta_key, desired_state, execution_role, lease_owner, lease_until, last_status, errors_json, progress_json, created_at, updated_at
 	FROM job_registry
 	ORDER BY created_at ASC`
 	return s.loadJobs(ctx, q)
@@ -359,14 +373,14 @@ func (s *MySQLJobStore) loadJobs(ctx context.Context, query string, args ...any)
 	out := make([]PersistedJob, 0)
 	for rows.Next() {
 		var (
-			jobID, name, configJSON, desiredState, executionRole, lastStatus string
-			metaKey                                                          sql.NullString
-			leaseOwner                                                       sql.NullString
-			leaseUntil                                                       sql.NullTime
-			errorsJSON, progressJSON                                         sql.NullString
-			createdAt, updatedAt                                             time.Time
+			jobID, submissionID, name, configJSON, desiredState, executionRole, lastStatus string
+			metaKey                                                                        sql.NullString
+			leaseOwner                                                                     sql.NullString
+			leaseUntil                                                                     sql.NullTime
+			errorsJSON, progressJSON                                                       sql.NullString
+			createdAt, updatedAt                                                           time.Time
 		)
-		if err := rows.Scan(&jobID, &name, &configJSON, &metaKey, &desiredState, &executionRole, &leaseOwner, &leaseUntil, &lastStatus, &errorsJSON, &progressJSON, &createdAt, &updatedAt); err != nil {
+		if err := rows.Scan(&jobID, &submissionID, &name, &configJSON, &metaKey, &desiredState, &executionRole, &leaseOwner, &leaseUntil, &lastStatus, &errorsJSON, &progressJSON, &createdAt, &updatedAt); err != nil {
 			return nil, err
 		}
 
@@ -391,6 +405,7 @@ func (s *MySQLJobStore) loadJobs(ctx context.Context, query string, args ...any)
 
 		out = append(out, PersistedJob{
 			ID:            jobID,
+			SubmissionID:  submissionID,
 			Name:          name,
 			MetaKey:       metaKey.String,
 			Config:        &cfg,
@@ -423,6 +438,11 @@ func (s *MySQLJobStore) ClaimJobs(ctx context.Context, role JobExecutionRole, ow
 	}
 	if leaseDuration <= 0 {
 		leaseDuration = 30 * time.Second
+	}
+	// An older control-plane binary may insert a row using the column default
+	// during a rolling deployment. Fence it before any new worker can claim it.
+	if _, err := s.db.ExecContext(ctx, `UPDATE job_registry SET submission_id=LOWER(REPLACE(UUID(), '-', '')) WHERE submission_id=''`); err != nil {
+		return nil, err
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -480,23 +500,23 @@ func (s *MySQLJobStore) ClaimJobs(ctx context.Context, role JobExecutionRole, ow
 	}
 
 	const claimedQuery = `
-	SELECT job_id, job_name, config_json, meta_key, desired_state, execution_role, lease_owner, lease_until, last_status, errors_json, progress_json, created_at, updated_at
+	SELECT job_id, submission_id, job_name, config_json, meta_key, desired_state, execution_role, lease_owner, lease_until, last_status, errors_json, progress_json, created_at, updated_at
 	FROM job_registry
 	WHERE lease_owner=? AND execution_role=? AND desired_state=? AND lease_until >= UTC_TIMESTAMP(6)
 	ORDER BY updated_at ASC`
 	return s.loadJobs(ctx, claimedQuery, owner, string(role), string(DesiredStateRunning))
 }
 
-func (s *MySQLJobStore) RenewJobLease(ctx context.Context, jobID, owner string, leaseDuration time.Duration) (bool, error) {
+func (s *MySQLJobStore) RenewJobLease(ctx context.Context, jobID, submissionID, owner string, leaseDuration time.Duration) (bool, error) {
 	if leaseDuration <= 0 {
 		leaseDuration = 30 * time.Second
 	}
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE job_registry
 		SET lease_until=?
-		WHERE job_id=? AND lease_owner=?
+		WHERE job_id=? AND submission_id=? AND lease_owner=?
 		  AND (desired_state=? OR last_status='PAUSING')`,
-		time.Now().UTC().Add(leaseDuration), jobID, owner, string(DesiredStateRunning))
+		time.Now().UTC().Add(leaseDuration), jobID, submissionID, owner, string(DesiredStateRunning))
 	if err != nil {
 		return false, err
 	}
@@ -504,11 +524,11 @@ func (s *MySQLJobStore) RenewJobLease(ctx context.Context, jobID, owner string, 
 	return rows > 0, err
 }
 
-func (s *MySQLJobStore) ReleaseJobLease(ctx context.Context, jobID, owner string) error {
+func (s *MySQLJobStore) ReleaseJobLease(ctx context.Context, jobID, submissionID, owner string) error {
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE job_registry
 		SET lease_owner=NULL, lease_until=NULL
-		WHERE job_id=? AND lease_owner=?`, jobID, owner)
+		WHERE job_id=? AND submission_id=? AND lease_owner=?`, jobID, submissionID, owner)
 	return err
 }
 

@@ -91,7 +91,7 @@ type JobManager struct {
 	workerPollInterval  time.Duration
 	workerLeaseDuration time.Duration
 	executionRoles      map[string]meta.JobExecutionRole
-	workerLeases        map[string]struct{}
+	workerLeases        map[string]string
 	progressPersistMu   sync.Mutex
 	lastProgressPersist map[string]time.Time
 
@@ -204,7 +204,7 @@ func NewJobManager(reg *connector.Registry, opts ...JobManagerOption) *JobManage
 		workerPollInterval:        defaultWorkerPollInterval,
 		workerLeaseDuration:       defaultWorkerLeaseDuration,
 		executionRoles:            make(map[string]meta.JobExecutionRole),
-		workerLeases:              make(map[string]struct{}),
+		workerLeases:              make(map[string]string),
 		lastProgressPersist:       make(map[string]time.Time),
 	}
 	for _, opt := range opts {
@@ -677,7 +677,7 @@ func (m *JobManager) attachStatusListener(job *Job) {
 			log.Printf("[job-manager] persist job state failed job=%s status=%s: %v", job.Config.ID, status, err)
 		}
 		if m.workerRole != WorkerRoleAll && snapshotStatusReleasesSlot(status) {
-			m.releaseWorkerLease(job.Config.ID)
+			m.releaseWorkerLease(job.Config.ID, job.SubmissionID())
 		}
 		if snapshotStatusReleasesSlot(status) {
 			m.startQueuedSnapshotJobsAsync()
@@ -1122,6 +1122,9 @@ func (m *JobManager) restoreJobSnapshot(job *Job, record meta.PersistedJob, resu
 	}
 
 	job.mu.Lock()
+	if strings.TrimSpace(record.SubmissionID) != "" {
+		job.submissionID = strings.TrimSpace(record.SubmissionID)
+	}
 	if strings.TrimSpace(record.MetaKey) != "" {
 		// The submitting control plane is authoritative for the checkpoint
 		// identity. Always accept the durable value so a master that previously
@@ -1207,6 +1210,7 @@ func (m *JobManager) saveJobRecord(ctx context.Context, job *Job, desired meta.D
 
 	record := meta.PersistedJob{
 		ID:            cfg.ID,
+		SubmissionID:  job.SubmissionID(),
 		Name:          name,
 		MetaKey:       metaKey,
 		Config:        m.normalizeConfig(cfg),
@@ -1218,30 +1222,42 @@ func (m *JobManager) saveJobRecord(ctx context.Context, job *Job, desired meta.D
 		CreatedAt:     created,
 		UpdatedAt:     updated,
 	}
-	if owner := m.claimedWorkerLeaseOwner(cfg.ID); owner != "" {
-		if claimedStore, ok := m.jobStore.(meta.ClaimedJobStore); ok {
-			saved, err := claimedStore.SaveClaimedJob(saveCtx, record, owner)
-			if err != nil {
-				return err
+	if m.workerRole == WorkerRoleSnapshot || m.workerRole == WorkerRoleStreaming {
+		owner := m.claimedWorkerLeaseOwner(job)
+		if owner == "" {
+			// A combined API/worker process persists a newly submitted job before
+			// any worker has claimed it. Only that pre-claim queued state may use
+			// the unguarded insert/upsert path; execution callbacks must be fenced.
+			if !job.runActive() && (status == JobStatusCreated || status == JobStatusQueued) {
+				return m.jobStore.SaveJob(saveCtx, record)
 			}
-			if !saved {
-				return ErrJobWorkerLeaseLost
-			}
-			return nil
+			return ErrJobWorkerLeaseLost
 		}
+		claimedStore, ok := m.jobStore.(meta.ClaimedJobStore)
+		if !ok {
+			return errors.New("durable worker persistence requires a ClaimedJobStore")
+		}
+		saved, err := claimedStore.SaveClaimedJob(saveCtx, record, owner)
+		if err != nil {
+			return err
+		}
+		if !saved {
+			return ErrJobWorkerLeaseLost
+		}
+		return nil
 	}
 	return m.jobStore.SaveJob(saveCtx, record)
 }
 
-func (m *JobManager) claimedWorkerLeaseOwner(jobID string) string {
-	if m.workerRole == WorkerRoleAll || strings.TrimSpace(jobID) == "" {
+func (m *JobManager) claimedWorkerLeaseOwner(job *Job) string {
+	if m.workerRole == WorkerRoleAll || job == nil || job.Config == nil || strings.TrimSpace(job.Config.ID) == "" {
 		return ""
 	}
 	m.mu.RLock()
-	_, claimed := m.workerLeases[jobID]
+	submissionID, claimed := m.workerLeases[job.Config.ID]
 	owner := m.workerID
 	m.mu.RUnlock()
-	if !claimed {
+	if !claimed || submissionID != job.SubmissionID() {
 		return ""
 	}
 	return owner
@@ -1461,7 +1477,7 @@ func (m *JobManager) reconcileWorkerJobs(ctx context.Context, store meta.JobWork
 	}
 	m.mu.RUnlock()
 	for _, job := range owned {
-		renewed, err := store.RenewJobLease(ctx, job.Config.ID, m.workerID, m.workerLeaseDuration)
+		renewed, err := store.RenewJobLease(ctx, job.Config.ID, job.SubmissionID(), m.workerID, m.workerLeaseDuration)
 		if err != nil {
 			return err
 		}
@@ -1475,7 +1491,7 @@ func (m *JobManager) reconcileWorkerJobs(ctx context.Context, store meta.JobWork
 				job.setProgressListener(nil)
 				job.requestStop()
 			}
-			m.releaseWorkerLease(job.Config.ID)
+			m.releaseWorkerLease(job.Config.ID, job.SubmissionID())
 		}
 	}
 
@@ -1497,6 +1513,39 @@ func (m *JobManager) startClaimedWorkerJob(record meta.PersistedJob) error {
 		return errors.New("claimed job has empty config or id")
 	}
 
+	// A deleted job can be resubmitted with the same job ID before the old
+	// pipeline has completely stopped. Worker IDs are stable for the process,
+	// so the new row may be leased by the same owner. Fence and drain the old
+	// in-memory submission before attaching the newly claimed generation.
+	m.mu.RLock()
+	staleJob := m.jobs[cfg.ID]
+	m.mu.RUnlock()
+	if staleJob != nil && !sameJobSubmission(staleJob, record.SubmissionID) {
+		log.Printf(
+			"[job-manager] replacing stale worker submission job=%s old_submission=%s new_submission=%s",
+			cfg.ID,
+			staleJob.SubmissionID(),
+			record.SubmissionID,
+		)
+		staleJob.markPersistenceDeleted()
+		staleJob.setStatusListener(nil)
+		staleJob.setProgressListener(nil)
+		if staleJob.runActive() {
+			staleJob.requestStop()
+			if !staleJob.waitRunDone(30 * time.Second) {
+				m.releaseWorkerLease(cfg.ID, record.SubmissionID)
+				return fmt.Errorf("stale job submission %s is still stopping: %w", cfg.ID, ErrJobStillStopping)
+			}
+		}
+		m.mu.Lock()
+		if m.jobs[cfg.ID] == staleJob {
+			delete(m.jobs, cfg.ID)
+			delete(m.executionRoles, cfg.ID)
+			delete(m.workerLeases, cfg.ID)
+		}
+		m.mu.Unlock()
+	}
+
 	m.mu.Lock()
 	job := m.jobs[cfg.ID]
 	if job == nil {
@@ -1504,7 +1553,7 @@ func (m *JobManager) startClaimedWorkerJob(record meta.PersistedJob) error {
 		m.jobs[cfg.ID] = job
 	}
 	m.executionRoles[cfg.ID] = m.durableWorkerRole()
-	m.workerLeases[cfg.ID] = struct{}{}
+	m.workerLeases[cfg.ID] = record.SubmissionID
 	m.mu.Unlock()
 	// A job may be reclaimed by this process after a previous lease was lost.
 	// Restore manager callbacks before starting or observing the new lease.
@@ -1557,15 +1606,27 @@ func (m *JobManager) startClaimedWorkerJob(record meta.PersistedJob) error {
 	return m.startJob(job, mode, false)
 }
 
+func sameJobSubmission(job *Job, submissionID string) bool {
+	if job == nil {
+		return false
+	}
+	submissionID = strings.TrimSpace(submissionID)
+	// Empty IDs exist only in legacy/in-memory stores. MySQLJobStore.Init
+	// backfills every durable row before workers can claim it.
+	return submissionID == "" || job.SubmissionID() == submissionID
+}
+
 func snapshotFirstAttempt(lastStatus string, checkpointExists bool) bool {
 	return strings.EqualFold(lastStatus, string(JobStatusCreated)) ||
 		strings.EqualFold(lastStatus, string(JobStatusQueued)) ||
 		!checkpointExists
 }
 
-func (m *JobManager) releaseWorkerLease(jobID string) {
+func (m *JobManager) releaseWorkerLease(jobID, submissionID string) {
 	m.mu.Lock()
-	delete(m.workerLeases, jobID)
+	if currentSubmissionID, ok := m.workerLeases[jobID]; ok && currentSubmissionID == submissionID {
+		delete(m.workerLeases, jobID)
+	}
 	m.mu.Unlock()
 	store, ok := m.jobStore.(meta.JobWorkerStore)
 	if !ok || strings.TrimSpace(jobID) == "" {
@@ -1573,7 +1634,7 @@ func (m *JobManager) releaseWorkerLease(jobID string) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := store.ReleaseJobLease(ctx, jobID, m.workerID); err != nil {
+	if err := store.ReleaseJobLease(ctx, jobID, submissionID, m.workerID); err != nil {
 		log.Printf("[job-manager] release worker lease failed job=%s owner=%s: %v", jobID, m.workerID, err)
 	}
 }

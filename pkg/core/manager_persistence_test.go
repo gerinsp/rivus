@@ -13,6 +13,7 @@ import (
 	"github.com/gerinsp/rivus/pkg/connector"
 	"github.com/gerinsp/rivus/pkg/meta"
 	"github.com/gerinsp/rivus/pkg/model"
+	"github.com/google/uuid"
 )
 
 func TestRestorePersistedJobsLoadsStoppedAndResumesRunning(t *testing.T) {
@@ -960,7 +961,7 @@ func TestDeleteWinsOverInFlightJobPersistence(t *testing.T) {
 
 func TestSubmitWithDeletedJobIDWaitsForDeletionToFinish(t *testing.T) {
 	store := newBlockingSaveJobStore()
-	manager := NewJobManager(nil, WithJobStore(store), WithWorkerRole(WorkerRoleStreaming))
+	manager := NewJobManager(nil, WithJobStore(store), WithControlPlaneRole())
 	job := NewJob(newTestJobConfig("job-delete-submit-race"), nil)
 
 	manager.mu.Lock()
@@ -1037,7 +1038,7 @@ func TestClaimedWorkerCannotRecreateDeletedJob(t *testing.T) {
 	}
 
 	manager.mu.Lock()
-	manager.workerLeases[job.Config.ID] = struct{}{}
+	manager.workerLeases[job.Config.ID] = job.SubmissionID()
 	manager.executionRoles[job.Config.ID] = meta.JobExecutionRoleSnapshot
 	manager.mu.Unlock()
 
@@ -1050,6 +1051,174 @@ func TestClaimedWorkerCannotRecreateDeletedJob(t *testing.T) {
 	if _, ok := store.Get(job.Config.ID); ok {
 		t.Fatal("late snapshot worker write recreated the deleted job")
 	}
+}
+
+func TestStaleClaimedSubmissionCannotOverwriteRecreatedJob(t *testing.T) {
+	store := newMemoryJobStore()
+	const (
+		jobID = "recreated-job"
+		owner = "snapshot-recreated"
+	)
+	oldCfg := newTestJobConfig(jobID)
+	oldCfg.Sink.Config = map[string]any{"flush_seconds": 1200}
+	oldSubmissionID := uuid.NewString()
+	if err := store.SaveJob(context.Background(), meta.PersistedJob{
+		ID:            jobID,
+		SubmissionID:  oldSubmissionID,
+		Name:          oldCfg.Name,
+		Config:        oldCfg,
+		DesiredState:  meta.DesiredStateRunning,
+		ExecutionRole: meta.JobExecutionRoleSnapshot,
+		LastStatus:    string(JobStatusRunning),
+	}); err != nil {
+		t.Fatalf("seed old job: %v", err)
+	}
+	if _, err := store.ClaimJobs(context.Background(), meta.JobExecutionRoleSnapshot, owner, 1, time.Minute); err != nil {
+		t.Fatalf("claim old job: %v", err)
+	}
+
+	if err := store.DeleteJob(context.Background(), jobID); err != nil {
+		t.Fatalf("delete old job: %v", err)
+	}
+	newCfg := newTestJobConfig(jobID)
+	newCfg.Sink.Config = map[string]any{"flush_seconds": 300}
+	newSubmissionID := uuid.NewString()
+	if err := store.SaveJob(context.Background(), meta.PersistedJob{
+		ID:            jobID,
+		SubmissionID:  newSubmissionID,
+		Name:          newCfg.Name,
+		Config:        newCfg,
+		DesiredState:  meta.DesiredStateRunning,
+		ExecutionRole: meta.JobExecutionRoleSnapshot,
+		LastStatus:    string(JobStatusQueued),
+	}); err != nil {
+		t.Fatalf("seed recreated job: %v", err)
+	}
+	if _, err := store.ClaimJobs(context.Background(), meta.JobExecutionRoleSnapshot, owner, 1, time.Minute); err != nil {
+		t.Fatalf("claim recreated job: %v", err)
+	}
+	if renewed, err := store.RenewJobLease(context.Background(), jobID, oldSubmissionID, owner, time.Minute); err != nil {
+		t.Fatalf("renew stale lease: %v", err)
+	} else if renewed {
+		t.Fatal("stale submission unexpectedly renewed the recreated job lease")
+	}
+	if err := store.ReleaseJobLease(context.Background(), jobID, oldSubmissionID, owner); err != nil {
+		t.Fatalf("release stale lease: %v", err)
+	}
+	manager := NewJobManager(nil,
+		WithJobStore(store),
+		WithWorkerRole(WorkerRoleSnapshot),
+		WithWorkerID(owner),
+	)
+	manager.workerLeases[jobID] = newSubmissionID
+	manager.releaseWorkerLease(jobID, oldSubmissionID)
+	if got := manager.workerLeases[jobID]; got != newSubmissionID {
+		t.Fatalf("manager lease generation = %q, want %q after stale release", got, newSubmissionID)
+	}
+
+	saved, err := store.SaveClaimedJob(context.Background(), meta.PersistedJob{
+		ID:            jobID,
+		SubmissionID:  oldSubmissionID,
+		Name:          oldCfg.Name,
+		Config:        oldCfg,
+		DesiredState:  meta.DesiredStateRunning,
+		ExecutionRole: meta.JobExecutionRoleSnapshot,
+		LastStatus:    string(JobStatusRunning),
+	}, owner)
+	if err != nil {
+		t.Fatalf("save stale submission: %v", err)
+	}
+	if saved {
+		t.Fatal("stale submission unexpectedly overwrote the recreated job")
+	}
+	saved, err = store.SaveClaimedJob(context.Background(), meta.PersistedJob{
+		ID:            jobID,
+		SubmissionID:  newSubmissionID,
+		Name:          newCfg.Name,
+		Config:        oldCfg, // workers must not rewrite submitted configuration
+		DesiredState:  meta.DesiredStateRunning,
+		ExecutionRole: meta.JobExecutionRoleSnapshot,
+		LastStatus:    string(JobStatusRunning),
+	}, owner)
+	if err != nil {
+		t.Fatalf("save current submission runtime state: %v", err)
+	}
+	if !saved {
+		t.Fatal("current submission runtime state was not saved")
+	}
+	record, ok := store.Get(jobID)
+	if !ok {
+		t.Fatal("recreated job disappeared")
+	}
+	if record.SubmissionID != newSubmissionID {
+		t.Fatalf("submission id = %q, want %q", record.SubmissionID, newSubmissionID)
+	}
+	if record.LeaseOwner != owner {
+		t.Fatalf("lease owner = %q, want %q after stale release", record.LeaseOwner, owner)
+	}
+	if got := record.Config.Sink.Config["flush_seconds"]; got != 300 {
+		t.Fatalf("stored flush_seconds = %v, want 300", got)
+	}
+}
+
+func TestClaimedRecreatedJobReplacesStaleWorkerConfig(t *testing.T) {
+	store := newMemoryJobStore()
+	reg, _ := newTestRegistry()
+	manager := NewJobManager(
+		reg,
+		WithJobStore(store),
+		WithWorkerRole(WorkerRoleSnapshot),
+		WithWorkerID("snapshot-replace"),
+	)
+	const jobID = "replace-stale-worker-job"
+	oldCfg := newTestJobConfig(jobID)
+	oldCfg.Sink.Config = map[string]any{"flush_seconds": 1200}
+	oldJob := NewJob(oldCfg, reg)
+	oldJob.submissionID = uuid.NewString()
+	manager.mu.Lock()
+	manager.jobs[jobID] = oldJob
+	manager.executionRoles[jobID] = meta.JobExecutionRoleSnapshot
+	manager.mu.Unlock()
+
+	newCfg := newTestJobConfig(jobID)
+	newCfg.Sink.Config = map[string]any{"flush_seconds": 300}
+	newSubmissionID := uuid.NewString()
+	if err := store.SaveJob(context.Background(), meta.PersistedJob{
+		ID:            jobID,
+		SubmissionID:  newSubmissionID,
+		Name:          newCfg.Name,
+		Config:        newCfg,
+		DesiredState:  meta.DesiredStateRunning,
+		ExecutionRole: meta.JobExecutionRoleSnapshot,
+		LastStatus:    string(JobStatusCreated),
+	}); err != nil {
+		t.Fatalf("seed recreated job: %v", err)
+	}
+	claimed, err := store.ClaimJobs(context.Background(), meta.JobExecutionRoleSnapshot, "snapshot-replace", 1, time.Minute)
+	if err != nil {
+		t.Fatalf("claim recreated job: %v", err)
+	}
+	if len(claimed) != 1 {
+		t.Fatalf("claimed jobs = %d, want 1", len(claimed))
+	}
+	if err := manager.startClaimedWorkerJob(claimed[0]); err != nil {
+		t.Fatalf("start recreated job: %v", err)
+	}
+
+	replacement, err := manager.Get(jobID)
+	if err != nil {
+		t.Fatalf("get replacement job: %v", err)
+	}
+	if replacement == oldJob {
+		t.Fatal("stale in-memory job was reused")
+	}
+	if replacement.SubmissionID() != newSubmissionID {
+		t.Fatalf("replacement submission id = %q, want %q", replacement.SubmissionID(), newSubmissionID)
+	}
+	if got := replacement.Config.Sink.Config["flush_seconds"]; got != 300 {
+		t.Fatalf("replacement flush_seconds = %v, want 300", got)
+	}
+	_ = manager.Cancel(jobID)
 }
 
 func TestRestorePersistedFailedJobRetainsErrorHistory(t *testing.T) {
@@ -1570,6 +1739,9 @@ func (s *memoryJobStore) SaveJob(_ context.Context, job meta.PersistedJob) error
 
 	record := job
 	record.Config = cloneTestJobConfig(job.Config)
+	if record.SubmissionID == "" {
+		record.SubmissionID = uuid.NewString()
+	}
 	if existing, ok := s.jobs[job.ID]; ok {
 		record.LeaseOwner = existing.LeaseOwner
 		record.LeaseUntil = existing.LeaseUntil
@@ -1593,11 +1765,14 @@ func (s *memoryJobStore) SaveClaimedJob(_ context.Context, job meta.PersistedJob
 	defer s.mu.Unlock()
 
 	existing, ok := s.jobs[job.ID]
-	if !ok || existing.LeaseOwner != owner || !existing.LeaseUntil.After(time.Now()) {
+	if !ok || existing.SubmissionID != job.SubmissionID || existing.LeaseOwner != owner || !existing.LeaseUntil.After(time.Now()) {
 		return false, nil
 	}
 	record := job
-	record.Config = cloneTestJobConfig(job.Config)
+	// Worker persistence updates runtime state but never rewrites the submitted
+	// configuration; the control-plane submission remains authoritative.
+	record.Config = cloneTestJobConfig(existing.Config)
+	record.SubmissionID = existing.SubmissionID
 	record.LeaseOwner = existing.LeaseOwner
 	record.LeaseUntil = existing.LeaseUntil
 	if record.CreatedAt.IsZero() {
@@ -1642,11 +1817,11 @@ func (s *memoryJobStore) ClaimJobs(_ context.Context, role meta.JobExecutionRole
 	return out, nil
 }
 
-func (s *memoryJobStore) RenewJobLease(_ context.Context, jobID, owner string, leaseDuration time.Duration) (bool, error) {
+func (s *memoryJobStore) RenewJobLease(_ context.Context, jobID, submissionID, owner string, leaseDuration time.Duration) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	record, ok := s.jobs[jobID]
-	if !ok || record.LeaseOwner != owner || record.DesiredState != meta.DesiredStateRunning {
+	if !ok || record.SubmissionID != submissionID || record.LeaseOwner != owner || record.DesiredState != meta.DesiredStateRunning {
 		return false, nil
 	}
 	record.LeaseUntil = time.Now().Add(leaseDuration)
@@ -1654,11 +1829,11 @@ func (s *memoryJobStore) RenewJobLease(_ context.Context, jobID, owner string, l
 	return true, nil
 }
 
-func (s *memoryJobStore) ReleaseJobLease(_ context.Context, jobID, owner string) error {
+func (s *memoryJobStore) ReleaseJobLease(_ context.Context, jobID, submissionID, owner string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	record, ok := s.jobs[jobID]
-	if !ok || record.LeaseOwner != owner {
+	if !ok || record.SubmissionID != submissionID || record.LeaseOwner != owner {
 		return nil
 	}
 	record.LeaseOwner = ""

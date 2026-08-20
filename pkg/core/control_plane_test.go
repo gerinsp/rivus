@@ -249,6 +249,7 @@ func TestStaleWorkerPersistenceCannotOverwriteTerminalStatus(t *testing.T) {
 
 	if err := store.SaveJob(context.Background(), meta.PersistedJob{
 		ID:            job.Config.ID,
+		SubmissionID:  job.SubmissionID(),
 		Name:          job.Config.Name,
 		Config:        job.Config,
 		DesiredState:  meta.DesiredStateRunning,
@@ -264,7 +265,7 @@ func TestStaleWorkerPersistenceCannotOverwriteTerminalStatus(t *testing.T) {
 	manager.mu.Lock()
 	manager.jobs[job.Config.ID] = job
 	manager.executionRoles[job.Config.ID] = meta.JobExecutionRoleSnapshot
-	manager.workerLeases[job.Config.ID] = struct{}{}
+	manager.workerLeases[job.Config.ID] = job.SubmissionID()
 	manager.mu.Unlock()
 
 	setObservedJobStatus(job, JobStatusDone)

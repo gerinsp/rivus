@@ -162,8 +162,8 @@ func extendOwnedWorkerLeasesForShutdown(ctx context.Context, manager *core.JobMa
 	if manager == nil || store == nil {
 		return nil
 	}
-	owner, jobIDs := manager.WorkerLeaseSnapshot()
-	if strings.TrimSpace(owner) == "" || len(jobIDs) == 0 {
+	owner, leases := manager.WorkerLeaseSnapshot()
+	if strings.TrimSpace(owner) == "" || len(leases) == 0 {
 		return nil
 	}
 	if leaseDuration <= 0 {
@@ -171,10 +171,10 @@ func extendOwnedWorkerLeasesForShutdown(ctx context.Context, manager *core.JobMa
 	}
 
 	var errs []error
-	for _, jobID := range jobIDs {
-		renewed, err := store.RenewJobLease(ctx, jobID, owner, leaseDuration)
+	for _, lease := range leases {
+		renewed, err := store.RenewJobLease(ctx, lease.JobID, lease.SubmissionID, owner, leaseDuration)
 		if err != nil {
-			errs = append(errs, fmt.Errorf("extend worker lease job=%s: %w", jobID, err))
+			errs = append(errs, fmt.Errorf("extend worker lease job=%s: %w", lease.JobID, err))
 			continue
 		}
 		if !renewed {
