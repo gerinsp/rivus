@@ -144,3 +144,8 @@ require (
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 )
+
+// Temporary fork: Iceberg Go v0.6.0 plus upstream positional-delete batch-index fix
+// from apache/iceberg-go#1183. Remove this replace when upgrading to a release
+// that contains f4b75e954d122eb299b83242a0df6da4e94c332f.
+replace github.com/apache/iceberg-go => github.com/gerinsp/iceberg-go v0.0.0-20260820024711-585aee3db4fe
