@@ -110,6 +110,12 @@ func runJobWorkerCommand(command string, args []string, role core.WorkerRole) er
 	}
 
 	workerCtx, stopWorker := context.WithCancel(context.Background())
+	stopHeartbeat, err := startRuntimeHeartbeat(workerCtx, dsn, string(role), *workerID)
+	if err != nil {
+		stopWorker()
+		return err
+	}
+	defer stopHeartbeat()
 	var workerWG sync.WaitGroup
 	errCh := make(chan error, 2)
 	workerWG.Add(2)
@@ -205,10 +211,19 @@ func runMaintenanceWorkerCommand(args []string) error {
 	if *leaseSeconds > 0 {
 		leaseDuration = time.Duration(*leaseSeconds) * time.Second
 	}
+	dsn := strings.TrimSpace(os.Getenv("RIVUS_META_MYSQL_DSN"))
+	if dsn == "" {
+		return fmt.Errorf("maintenance-worker requires RIVUS_META_MYSQL_DSN")
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return iceberg.RunMaintenanceWorkerBounded(ctx, strings.TrimSpace(os.Getenv("RIVUS_META_MYSQL_DSN")), iceberg.MaintenanceWorkerOptions{
+	stopHeartbeat, err := startRuntimeHeartbeat(ctx, dsn, "maintenance", *workerID)
+	if err != nil {
+		return err
+	}
+	defer stopHeartbeat()
+	return iceberg.RunMaintenanceWorkerBounded(ctx, dsn, iceberg.MaintenanceWorkerOptions{
 		Queue:         *queue,
 		PollInterval:  pollInterval,
 		LeaseDuration: leaseDuration,
@@ -278,6 +293,15 @@ func runServerWithRole(args []string, forcedRole core.WorkerRole) error {
 
 	workerCtx, stopWorker := context.WithCancel(context.Background())
 	defer stopWorker()
+	stopHeartbeat := func() {}
+	if dsn != "" {
+		heartbeatStop, heartbeatErr := startRuntimeHeartbeat(workerCtx, dsn, string(workerRole), strings.TrimSpace(os.Getenv("RIVUS_WORKER_ID")))
+		if heartbeatErr != nil {
+			return heartbeatErr
+		}
+		stopHeartbeat = heartbeatStop
+	}
+	defer stopHeartbeat()
 	var workerWG sync.WaitGroup
 	var workerErr <-chan error
 	if workerRole == core.WorkerRoleSnapshot || workerRole == core.WorkerRoleStreaming {

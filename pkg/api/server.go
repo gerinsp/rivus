@@ -14,6 +14,9 @@ type Server struct {
 	metrics              *MetricsSampler
 	auth                 AuthConfig
 	authSessions         *authSessionStore
+	runtimeStoreOnce     sync.Once
+	runtimeStore         runtimeInstanceReader
+	runtimeStoreErr      error
 	maintenanceStoreOnce sync.Once
 	maintenanceStore     *meta.IcebergMaintenanceStore
 	maintenanceStoreErr  error
@@ -56,6 +59,7 @@ func (s *Server) Router() http.Handler {
 	mux.HandleFunc("GET /rivus-favicon.svg", s.handleFavicon)
 	mux.HandleFunc("GET /rivus-logo.png", s.handleLogo)
 	mux.HandleFunc("GET /api/version", s.handleVersion)
+	mux.HandleFunc("GET /api/runtime/versions", s.requireAPIAuth(s.handleRuntimeVersions))
 	mux.HandleFunc("POST /auth/login", s.handleLogin)
 	mux.HandleFunc("POST /auth/logout", s.handleLogout)
 	mux.HandleFunc("GET /metrics", s.handlePrometheusMetrics)

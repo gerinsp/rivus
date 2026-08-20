@@ -261,6 +261,14 @@ required. Rivus sends one alert for each purged-checkpoint incident, re-arms
 after the checkpoint becomes available again, and retries on the next health
 probe if delivery fails.
 
+### Runtime container versions
+
+The authenticated master endpoint `GET /api/runtime/versions` reports the
+running image tag, commit, build date, uptime, and heartbeat state for the
+master, streaming, snapshot, and maintenance containers. Each process writes a
+metadata heartbeat every 30 seconds; the endpoint marks it offline after 90
+seconds without a heartbeat.
+
 ## Iceberg and object storage
 
 For Iceberg jobs:
