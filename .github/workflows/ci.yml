@@ -39,5 +39,10 @@ jobs:
           grep -q '<script type="module" src="app.js?v=8"></script>' ui/index.html
           ! grep -q 'maintenance-ui.js' ui/index.html
 
+      - name: Resolve temporary fork checksum
+        run: |
+          go mod tidy
+          git diff -- go.sum
+
       - name: Test
         run: go test ./...
