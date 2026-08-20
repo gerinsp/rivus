@@ -109,6 +109,15 @@ sink:
       spark_timeout_seconds: 7200
 ```
 
+`runner_resource_profile` is the minimum profile for automatic Spark
+compaction. The worker raises a submission to `medium` when the selected
+rewrite exceeds 512 MiB, 250 files, or 100 delete files, and to `large` when
+it exceeds 2 GiB, 1,000 files, or 400 delete files. It selects `xlarge` above
+8 GiB, 2,000 files, or 800 delete files. If Spark reports an executor heap
+error, the next durable retry moves up another profile through `xlarge`. This
+right-sizing is per maintenance submission and does not modify or resubmit the
+CDC job.
+
 If `executor` is omitted while maintenance is enabled, Rivus defaults it to `hybrid` for backward compatibility.
 
 The 256 MiB value is an additional compaction trigger. It is not required once

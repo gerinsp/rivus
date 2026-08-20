@@ -38,6 +38,15 @@ const (
 	defaultNativeTimeout                = 10 * time.Minute
 	defaultNativeOrphanAge              = 7 * 24 * time.Hour
 	defaultNativeOrphanInactiveInterval = 90 * 24 * time.Hour
+	sparkMediumInputBytes               = int64(512 * 1024 * 1024)
+	sparkLargeInputBytes                = int64(2 * 1024 * 1024 * 1024)
+	sparkXLargeInputBytes               = int64(8 * 1024 * 1024 * 1024)
+	sparkMediumInputFiles               = 250
+	sparkLargeInputFiles                = 1000
+	sparkXLargeInputFiles               = 2000
+	sparkMediumDeleteFiles              = 100
+	sparkLargeDeleteFiles               = 400
+	sparkXLargeDeleteFiles              = 800
 	orphanHashBuckets                   = 256
 )
 
@@ -477,7 +486,7 @@ func executeHybridCompaction(
 			} else {
 				result.RoutingReason = reason
 			}
-			return executeSparkCompactionFallback(ctx, jobID, jobCfg, state, task, result, settings, hasDeleteWork(work, state))
+			return executeSparkCompactionFallback(ctx, jobID, jobCfg, iceCfg, state, task, result, settings, work, hasDeleteWork(work, state))
 		}
 		result.Status = "skipped"
 		result.RoutingReason = "compaction planner found no eligible data-file group"
@@ -493,7 +502,7 @@ func executeHybridCompaction(
 		nativeCancel()
 		result.Engine = "spark"
 		result.RoutingReason = "executor=spark selected Spark compaction"
-		return executeSparkCompactionFallback(ctx, jobID, jobCfg, state, task, result, settings, hasDeleteWork(work, state))
+		return executeSparkCompactionFallback(ctx, jobID, jobCfg, iceCfg, state, task, result, settings, work, hasDeleteWork(work, state))
 	}
 	if routeSpark {
 		if settings.Executor == maintenanceExecutorNative {
@@ -504,7 +513,7 @@ func executeHybridCompaction(
 		nativeCancel()
 		result.Engine = "spark"
 		result.RoutingReason = reason
-		return executeSparkCompactionFallback(ctx, jobID, jobCfg, state, task, result, settings, hasDeleteWork(work, state))
+		return executeSparkCompactionFallback(ctx, jobID, jobCfg, iceCfg, state, task, result, settings, work, hasDeleteWork(work, state))
 	}
 
 	if err := tbl.Refresh(nativeCtx); err != nil {
@@ -654,32 +663,41 @@ func executeSparkCompactionFallback(
 	ctx context.Context,
 	jobID string,
 	jobCfg *config.JobConfig,
+	iceCfg config.IcebergConfig,
 	state meta.IcebergMaintenanceState,
 	task meta.IcebergMaintenanceTask,
 	result meta.IcebergMaintenanceResult,
 	settings nativeMaintenanceSettings,
+	work compactionWorkload,
 	deleteTriggered bool,
 ) nativeTaskOutcome {
 	minInputFiles := settings.MinSmallFiles
 	if deleteTriggered {
 		minInputFiles = 1
 	}
-	options := map[string]any{
-		"target-file-size-bytes": fmt.Sprintf("%d", settings.TargetFileSizeBytes),
-		"min-input-files":        fmt.Sprintf("%d", minInputFiles),
-	}
+	compactOptions := normalizeAutomaticCompactOptions(iceCfg.TableMaintenance.CompactOptions)
+	options := stringAnyMap(compactOptions["options"])
+	options["target-file-size-bytes"] = fmt.Sprintf("%d", settings.TargetFileSizeBytes)
+	options["min-input-files"] = fmt.Sprintf("%d", minInputFiles)
 	if deleteTriggered {
 		options["delete-file-threshold"] = "1"
 	}
+	compactOptions["options"] = options
+	resourceProfile, sizingReason := dynamicSparkResourceProfile(iceCfg.TableMaintenance.RunnerResourceProfile, work, task)
+	if result.Details == nil {
+		result.Details = map[string]any{}
+	}
+	result.Details["spark_resource_profile"] = resourceProfile
+	result.Details["spark_resource_sizing"] = sizingReason
 	request := TableMaintenanceRequest{
-		Tables:         []string{tableKey(state.Namespace, state.Table)},
-		ExternalRunKey: fmt.Sprintf("rivus-maintenance:%d", task.ID),
+		Tables: []string{tableKey(state.Namespace, state.Table)},
+		// Keep retries idempotent within one durable attempt while allowing a
+		// later, right-sized attempt to create a new runner job.
+		ExternalRunKey:  fmt.Sprintf("rivus-maintenance:%d:%d", task.ID, task.AttemptCount),
+		ResourceProfile: resourceProfile,
 		Operations: []TableMaintenanceOperation{{
-			Type: "rewrite_data_files",
-			Options: map[string]any{
-				"strategy": "binpack",
-				"options":  options,
-			},
+			Type:    "rewrite_data_files",
+			Options: compactOptions,
 		}},
 	}
 	submission, err := SubmitTableMaintenanceForJobConfig(ctx, jobID, jobCfg, request, false)
@@ -716,11 +734,92 @@ func executeSparkCompactionFallback(
 				result.Status = "succeeded"
 				return nativeTaskOutcome{Result: result}
 			case "FAILED", "ERROR", "KILLED", "CANCELLED", "CANCELED":
-				result.Error = firstNonEmpty(strings.TrimSpace(status.Message), "Spark compaction failed")
+				message := firstNonEmpty(strings.TrimSpace(status.Message), "Spark compaction failed")
+				result.Error = fmt.Sprintf("Spark compaction failed with resource profile %s: %s", resourceProfile, message)
 				return nativeTaskOutcome{Result: result, Retryable: true}
 			}
 		}
 	}
+}
+
+func dynamicSparkResourceProfile(configured string, work compactionWorkload, task meta.IcebergMaintenanceTask) (string, string) {
+	profile := normalizeSparkResourceProfile(configured)
+	reason := "configured minimum"
+	deleteFiles := work.EqualityDeletes + work.PositionDeletes
+
+	needed := "tiny"
+	workloadReason := ""
+	switch {
+	case work.SelectedBytes > sparkXLargeInputBytes || work.SelectedFiles > sparkXLargeInputFiles || deleteFiles > sparkXLargeDeleteFiles:
+		needed = "xlarge"
+		workloadReason = "xlarge selected rewrite workload"
+	case work.SelectedBytes > sparkLargeInputBytes || work.SelectedFiles > sparkLargeInputFiles || deleteFiles > sparkLargeDeleteFiles:
+		needed = "large"
+		workloadReason = "large selected rewrite workload"
+	case work.SelectedBytes > sparkMediumInputBytes || work.SelectedFiles > sparkMediumInputFiles || deleteFiles > sparkMediumDeleteFiles:
+		needed = "medium"
+		workloadReason = "medium selected rewrite workload"
+	}
+	if sparkResourceProfileRank(needed) > sparkResourceProfileRank(profile) {
+		profile = needed
+		reason = workloadReason
+	}
+
+	if isSparkHeapError(task.LastError) && profile != "xlarge" {
+		steps := task.AttemptCount - 1
+		if steps < 1 {
+			steps = 1
+		}
+		for i := 0; i < steps && profile != "xlarge"; i++ {
+			profile = nextSparkResourceProfile(profile)
+		}
+		reason = "previous Spark attempt exhausted executor heap"
+	}
+	return profile, reason
+}
+
+func normalizeSparkResourceProfile(profile string) string {
+	switch strings.ToLower(strings.TrimSpace(profile)) {
+	case "tiny", "small", "medium", "large", "xlarge":
+		return strings.ToLower(strings.TrimSpace(profile))
+	default:
+		return "small"
+	}
+}
+
+func sparkResourceProfileRank(profile string) int {
+	switch normalizeSparkResourceProfile(profile) {
+	case "tiny":
+		return 0
+	case "medium":
+		return 2
+	case "large":
+		return 3
+	case "xlarge":
+		return 4
+	default:
+		return 1
+	}
+}
+
+func nextSparkResourceProfile(profile string) string {
+	switch normalizeSparkResourceProfile(profile) {
+	case "tiny":
+		return "small"
+	case "small":
+		return "medium"
+	case "medium":
+		return "large"
+	default:
+		return "xlarge"
+	}
+}
+
+func isSparkHeapError(message string) bool {
+	message = strings.ToLower(message)
+	return strings.Contains(message, "outofmemoryerror") ||
+		strings.Contains(message, "java heap space") ||
+		strings.Contains(message, "gc overhead limit exceeded")
 }
 
 func executeNativeSnapshotExpiration(ctx context.Context, tbl *icetable.Table, result meta.IcebergMaintenanceResult, settings nativeMaintenanceSettings) nativeTaskOutcome {

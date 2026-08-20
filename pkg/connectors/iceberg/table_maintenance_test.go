@@ -338,9 +338,10 @@ func TestRunnerAppMaintenanceSubmissionStatusAndCancel(t *testing.T) {
 
 	jobCfg := runnerMaintenanceTestJobConfig(server.URL)
 	result, err := SubmitTableMaintenanceForJobConfig(context.Background(), "job-1", jobCfg, TableMaintenanceRequest{
-		Tables:         []string{"analytics.orders"},
-		Operations:     []TableMaintenanceOperation{{Type: "rewrite_data_files"}},
-		ExternalRunKey: "stable-maintenance-task-42",
+		Tables:          []string{"analytics.orders"},
+		Operations:      []TableMaintenanceOperation{{Type: "rewrite_data_files"}},
+		ExternalRunKey:  "stable-maintenance-task-42",
+		ResourceProfile: "xlarge",
 	}, true)
 	if err != nil {
 		t.Fatalf("submit through runner-app: %v", err)
@@ -348,7 +349,7 @@ func TestRunnerAppMaintenanceSubmissionStatusAndCancel(t *testing.T) {
 	if result.SubmissionID != "runner-job-1" || result.Action != "RunnerJobSubmission" {
 		t.Fatalf("submission = %#v", result)
 	}
-	if !strings.Contains(submitted.Content, "rewrite_data_files") || submitted.ResourceProfile != "small" {
+	if !strings.Contains(submitted.Content, "rewrite_data_files") || submitted.ResourceProfile != "xlarge" {
 		t.Fatalf("runner request = %#v", submitted)
 	}
 	if submitted.ExternalRunKey != "stable-maintenance-task-42" {

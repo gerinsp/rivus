@@ -58,6 +58,10 @@ type TableMaintenanceRequest struct {
 	Tables         []string                    `json:"tables,omitempty"`
 	Operations     []TableMaintenanceOperation `json:"operations"`
 	ExternalRunKey string                      `json:"-"`
+	// ResourceProfile overrides the configured runner profile for this one
+	// submission. Automatic maintenance uses it to right-size Spark without
+	// changing the persisted CDC job configuration.
+	ResourceProfile string `json:"-"`
 }
 
 type TableMaintenanceOperation struct {
@@ -174,6 +178,14 @@ func SubmitTableMaintenanceForJobConfig(
 	if err != nil {
 		return nil, err
 	}
+	if profile := strings.ToLower(strings.TrimSpace(req.ResourceProfile)); profile != "" && maintenanceUsesRunner(iceCfg.TableMaintenance) {
+		switch profile {
+		case "tiny", "small", "medium", "large", "xlarge":
+			iceCfg.TableMaintenance.RunnerResourceProfile = profile
+		default:
+			return nil, fmt.Errorf("invalid maintenance resource profile %q", profile)
+		}
+	}
 	return submitPreparedTableMaintenance(ctx, jobID, jobCfg.Name, iceCfg, targets, operations, statements, req.ExternalRunKey)
 }
 
@@ -266,6 +278,7 @@ func submitRunnerTableMaintenance(
 		JobContext: map[string]any{
 			"runner_kind":      "iceberg_maintenance",
 			"maintenance_mode": mode,
+			"resource_profile": iceCfg.TableMaintenance.RunnerResourceProfile,
 			"lineage_enabled":  false,
 			"iceberg_maintenance": map[string]any{
 				"catalog":             maintenanceCatalogName(iceCfg),
@@ -491,7 +504,7 @@ func validateMaintenanceBackend(cfg config.IcebergTableMaintenanceConfig) error 
 			profile = "small"
 		}
 		switch profile {
-		case "tiny", "small", "medium", "large":
+		case "tiny", "small", "medium", "large", "xlarge":
 			return nil
 		default:
 			return fmt.Errorf("invalid iceberg table_maintenance.runner_resource_profile %q", profile)
