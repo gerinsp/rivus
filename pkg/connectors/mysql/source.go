@@ -2317,6 +2317,10 @@ func (s *Source) reportCDCLag(ctx context.Context) error {
 	if latest == nil {
 		return nil
 	}
+	earliestFile, latestAvailableFile, availableCount, err := s.availableBinlogs(ctx)
+	if err != nil {
+		return fmt.Errorf("get available binlogs: %w", err)
+	}
 
 	lagFiles, ok := binlogFileLag(checkpoint.BinlogFile, latest.Name)
 	if !ok {
@@ -2324,14 +2328,37 @@ func (s *Source) reportCDCLag(ctx context.Context) error {
 	}
 
 	s.reportProgress(connector.ProgressInfo{
-		Phase:             "cdc_health",
-		CDCCheckpointFile: checkpoint.BinlogFile,
-		CDCCheckpointPos:  checkpoint.BinlogPos,
-		CDCLatestFile:     latest.Name,
-		CDCLatestPos:      latest.Pos,
-		CDCLagFiles:       lagFiles,
+		Phase:               "cdc_health",
+		CDCCheckpointFile:   checkpoint.BinlogFile,
+		CDCCheckpointPos:    checkpoint.BinlogPos,
+		CDCLatestFile:       latest.Name,
+		CDCLatestPos:        latest.Pos,
+		CDCLagFiles:         lagFiles,
+		CDCEarliestFile:     earliestFile,
+		CDCAvailableBinlogs: availableCount,
+		CDCBinlogStatus:     binlogCheckpointStatus(checkpoint.BinlogFile, earliestFile, latestAvailableFile, availableCount),
 	})
 	return nil
+}
+
+func binlogCheckpointStatus(checkpointFile, earliestFile, latestFile string, availableCount int) string {
+	if availableCount <= 0 || strings.TrimSpace(earliestFile) == "" || strings.TrimSpace(latestFile) == "" {
+		return "no_binlogs"
+	}
+
+	checkpointPrefix, checkpointNumber, checkpointOK := splitBinlogFileNumber(checkpointFile)
+	earliestPrefix, earliestNumber, earliestOK := splitBinlogFileNumber(earliestFile)
+	latestPrefix, latestNumber, latestOK := splitBinlogFileNumber(latestFile)
+	if !checkpointOK || !earliestOK || !latestOK || checkpointPrefix != earliestPrefix || checkpointPrefix != latestPrefix {
+		return "missing"
+	}
+	if checkpointNumber < earliestNumber {
+		return "purged"
+	}
+	if checkpointNumber <= latestNumber {
+		return "available"
+	}
+	return "missing"
 }
 
 func binlogFileLag(checkpointFile, latestFile string) (int, bool) {

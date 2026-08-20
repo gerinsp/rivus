@@ -13,8 +13,9 @@ import (
 type jobHealthAlertType string
 
 const (
-	jobHealthAlertCDCLag       jobHealthAlertType = "cdc_lag"
-	jobHealthAlertBackpressure jobHealthAlertType = "backpressure"
+	jobHealthAlertCDCLag           jobHealthAlertType = "cdc_lag"
+	jobHealthAlertCheckpointPurged jobHealthAlertType = "checkpoint_purged"
+	jobHealthAlertBackpressure     jobHealthAlertType = "backpressure"
 )
 
 type jobHealthNotification struct {
@@ -27,6 +28,8 @@ type jobHealthNotification struct {
 	CheckpointPos  uint32
 	LatestFile     string
 	LatestPos      uint32
+	EarliestFile   string
+	AvailableCount int
 	LagFiles       int
 	DashboardURL   string
 	Telegram       config.TelegramNotificationConfig
@@ -44,6 +47,10 @@ func (n *telegramJobFailureNotifier) NotifyJobHealth(ctx context.Context, payloa
 	switch payload.AlertType {
 	case jobHealthAlertCDCLag:
 		if !tg.NotifyCDCLag {
+			return nil
+		}
+	case jobHealthAlertCheckpointPurged:
+		if !tg.NotifyCheckpointPurged {
 			return nil
 		}
 	case jobHealthAlertBackpressure:
@@ -82,6 +89,8 @@ func formatJobHealthTelegramText(payload jobHealthNotification) string {
 	switch payload.AlertType {
 	case jobHealthAlertCDCLag:
 		title = "⚠️ Rivus CDC Lag"
+	case jobHealthAlertCheckpointPurged:
+		title = "🚨 Rivus Binlog Checkpoint Purged"
 	case jobHealthAlertBackpressure:
 		title = "⚠️ Rivus Buffer Backpressure"
 	}
@@ -100,6 +109,16 @@ func formatJobHealthTelegramText(payload jobHealthNotification) string {
 			notificationField("Lag", fmt.Sprintf("%d binlog file(s) behind latest", payload.LagFiles)),
 			notificationField("Checkpoint", formatBinlogPosition(payload.CheckpointFile, payload.CheckpointPos)),
 			notificationField("Latest", formatBinlogPosition(payload.LatestFile, payload.LatestPos)),
+		)
+	}
+	if payload.AlertType == jobHealthAlertCheckpointPurged {
+		lines = append(lines,
+			notificationField("Checkpoint", formatBinlogPosition(payload.CheckpointFile, payload.CheckpointPos)),
+			notificationField("Earliest available", payload.EarliestFile),
+			notificationField("Latest", formatBinlogPosition(payload.LatestFile, payload.LatestPos)),
+			notificationField("Available binlogs", fmt.Sprintf("%d", payload.AvailableCount)),
+			"",
+			"The live CDC connection may continue, but restarting now cannot resume from this checkpoint. Increase MySQL binlog retention.",
 		)
 	}
 	if strings.TrimSpace(payload.Detail) != "" {
@@ -137,6 +156,8 @@ func buildJobHealthNotification(job *Job, progress *JobProgress, alertType jobHe
 		CheckpointPos:  progress.CDCCheckpointPos,
 		LatestFile:     progress.CDCLatestFile,
 		LatestPos:      progress.CDCLatestPos,
+		EarliestFile:   progress.CDCEarliestFile,
+		AvailableCount: progress.CDCAvailableBinlogs,
 		LagFiles:       progress.CDCLagFiles,
 		DashboardURL:   buildJobDashboardURL(tg.UIBaseURL, job.Config),
 		Telegram:       tg,
@@ -157,7 +178,7 @@ func jobHealthTelegramConfig(cfg *config.JobConfig) (config.TelegramNotification
 	tg.BotToken = strings.TrimSpace(tg.BotToken)
 	tg.ChatID = strings.TrimSpace(tg.ChatID)
 	tg.UIBaseURL = strings.TrimRight(strings.TrimSpace(tg.UIBaseURL), "/")
-	if !tg.Enabled || tg.BotToken == "" || tg.ChatID == "" || (!tg.NotifyCDCLag && !tg.NotifyBackpressure) {
+	if !tg.Enabled || tg.BotToken == "" || tg.ChatID == "" || (!tg.NotifyCDCLag && !tg.NotifyCheckpointPurged && !tg.NotifyBackpressure) {
 		return config.TelegramNotificationConfig{}, false
 	}
 	return tg, true

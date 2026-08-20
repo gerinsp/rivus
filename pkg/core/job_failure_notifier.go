@@ -401,18 +401,20 @@ func telegramFailureConfigFromEnv() config.TelegramNotificationConfig {
 		notifyFailed = enabled
 	}
 	notifyCDCLag, _ := lookupEnvBool("RIVUS_TELEGRAM_NOTIFY_CDC_LAG")
+	notifyCheckpointPurged, _ := lookupEnvBool("RIVUS_TELEGRAM_NOTIFY_CHECKPOINT_PURGED")
 	notifyBackpressure, _ := lookupEnvBool("RIVUS_TELEGRAM_NOTIFY_BACKPRESSURE")
 
 	return config.TelegramNotificationConfig{
-		Enabled:              enabled,
-		BotToken:             strings.TrimSpace(os.Getenv("TELEGRAM_BOT_TOKEN")),
-		ChatID:               strings.TrimSpace(os.Getenv("TELEGRAM_CHAT_ID")),
-		UIBaseURL:            strings.TrimRight(strings.TrimSpace(os.Getenv("RIVUS_UI_BASE_URL")), "/"),
-		NotifyJobFailed:      notifyFailed,
-		NotifyCDCLag:         notifyCDCLag,
-		NotifyBackpressure:   notifyBackpressure,
-		CDCLagFilesThreshold: lookupEnvPositiveInt("RIVUS_CDC_LAG_FILES_THRESHOLD"),
-		AlertCooldownSeconds: lookupEnvPositiveInt("RIVUS_ALERT_COOLDOWN_SECONDS"),
+		Enabled:                enabled,
+		BotToken:               strings.TrimSpace(os.Getenv("TELEGRAM_BOT_TOKEN")),
+		ChatID:                 strings.TrimSpace(os.Getenv("TELEGRAM_CHAT_ID")),
+		UIBaseURL:              strings.TrimRight(strings.TrimSpace(os.Getenv("RIVUS_UI_BASE_URL")), "/"),
+		NotifyJobFailed:        notifyFailed,
+		NotifyCDCLag:           notifyCDCLag,
+		NotifyCheckpointPurged: notifyCheckpointPurged,
+		NotifyBackpressure:     notifyBackpressure,
+		CDCLagFilesThreshold:   lookupEnvPositiveInt("RIVUS_CDC_LAG_FILES_THRESHOLD"),
+		AlertCooldownSeconds:   lookupEnvPositiveInt("RIVUS_ALERT_COOLDOWN_SECONDS"),
 	}
 }
 
@@ -431,6 +433,8 @@ func mergeTelegramNotificationConfig(base, override config.TelegramNotificationC
 	out.Enabled = out.Enabled || override.Enabled
 	out.NotifyJobFailed = out.NotifyJobFailed || override.NotifyJobFailed
 	out.NotifyCDCLag = out.NotifyCDCLag || override.NotifyCDCLag
+	// Checkpoint-purge notifications are environment-only. Do not allow an
+	// individual job definition to enable or disable this platform safety alert.
 	out.NotifyBackpressure = out.NotifyBackpressure || override.NotifyBackpressure
 	if override.CDCLagFilesThreshold > 0 {
 		out.CDCLagFilesThreshold = override.CDCLagFilesThreshold

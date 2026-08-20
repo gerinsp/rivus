@@ -94,6 +94,61 @@ func TestJobManagerNotifiesOnBackpressure(t *testing.T) {
 	}
 }
 
+func TestJobManagerNotifiesOncePerPurgedCheckpointIncident(t *testing.T) {
+	t.Setenv("RIVUS_TELEGRAM_ENABLED", "true")
+	t.Setenv("TELEGRAM_BOT_TOKEN", "bot-token")
+	t.Setenv("TELEGRAM_CHAT_ID", "chat-id")
+	t.Setenv("RIVUS_TELEGRAM_NOTIFY_CHECKPOINT_PURGED", "true")
+
+	notifier := &recordingJobHealthNotifier{ch: make(chan jobHealthNotification, 3)}
+	manager := NewJobManager(nil, withJobHealthNotifier(notifier))
+	job := newRunningHealthNotificationJob("purged-job", config.TelegramNotificationConfig{})
+	purged := &JobProgress{
+		Phase:               "streaming",
+		CDCCheckpointFile:   "mysql-bin.000149",
+		CDCCheckpointPos:    1052464371,
+		CDCEarliestFile:     "mysql-bin.000150",
+		CDCLatestFile:       "mysql-bin.000150",
+		CDCLatestPos:        101379729,
+		CDCAvailableBinlogs: 1,
+		CDCBinlogStatus:     "purged",
+	}
+
+	manager.maybeNotifyJobHealth(job, purged)
+	manager.maybeNotifyJobHealth(job, purged)
+
+	select {
+	case payload := <-notifier.ch:
+		if payload.AlertType != jobHealthAlertCheckpointPurged {
+			t.Fatalf("alert type = %q, want %q", payload.AlertType, jobHealthAlertCheckpointPurged)
+		}
+		if payload.EarliestFile != "mysql-bin.000150" || payload.AvailableCount != 1 {
+			t.Fatalf("unexpected purge details: %+v", payload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for purged-checkpoint notification")
+	}
+
+	select {
+	case payload := <-notifier.ch:
+		t.Fatalf("unchanged purge incident sent duplicate notification: %+v", payload)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	manager.maybeNotifyJobHealth(job, &JobProgress{
+		CDCBinlogStatus:   "available",
+		CDCCheckpointFile: "mysql-bin.000150",
+		CDCEarliestFile:   "mysql-bin.000150",
+	})
+	manager.maybeNotifyJobHealth(job, purged)
+
+	select {
+	case <-notifier.ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("purged-checkpoint notification did not re-arm after recovery")
+	}
+}
+
 func TestJobManagerDoesNotNotifyBelowCDCLagThreshold(t *testing.T) {
 	notifier := &recordingJobHealthNotifier{ch: make(chan jobHealthNotification, 1)}
 	manager := NewJobManager(nil, withJobHealthNotifier(notifier))
@@ -135,6 +190,32 @@ func TestFormatJobHealthTelegramTextIncludesLagPositions(t *testing.T) {
 		"3 binlog file(s) behind latest",
 		"mysql-bin.000181:100",
 		"mysql-bin.000184:900",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("formatted notification %q does not contain %q", text, want)
+		}
+	}
+}
+
+func TestFormatJobHealthTelegramTextIncludesPurgedCheckpointDetails(t *testing.T) {
+	text := formatJobHealthTelegramText(jobHealthNotification{
+		AlertType:      jobHealthAlertCheckpointPurged,
+		JobID:          "job-1",
+		JobName:        "Reservations",
+		SinkType:       "iceberg",
+		CheckpointFile: "mysql-bin.000149",
+		CheckpointPos:  1052464371,
+		EarliestFile:   "mysql-bin.000150",
+		LatestFile:     "mysql-bin.000150",
+		LatestPos:      101379729,
+		AvailableCount: 1,
+	})
+	for _, want := range []string{
+		"Rivus Binlog Checkpoint Purged",
+		"mysql-bin.000149:1052464371",
+		"mysql-bin.000150",
+		"Available binlogs: 1",
+		"restarting now cannot resume",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("formatted notification %q does not contain %q", text, want)

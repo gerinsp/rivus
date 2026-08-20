@@ -464,6 +464,32 @@ func TestBinlogFileLag(t *testing.T) {
 	}
 }
 
+func TestBinlogCheckpointStatus(t *testing.T) {
+	tests := []struct {
+		name       string
+		checkpoint string
+		earliest   string
+		latest     string
+		count      int
+		want       string
+	}{
+		{name: "available latest", checkpoint: "mysql-bin.000150", earliest: "mysql-bin.000150", latest: "mysql-bin.000150", count: 1, want: "available"},
+		{name: "available history", checkpoint: "mysql-bin.000149", earliest: "mysql-bin.000148", latest: "mysql-bin.000150", count: 3, want: "available"},
+		{name: "purged", checkpoint: "mysql-bin.000149", earliest: "mysql-bin.000150", latest: "mysql-bin.000150", count: 1, want: "purged"},
+		{name: "ahead is missing", checkpoint: "mysql-bin.000151", earliest: "mysql-bin.000150", latest: "mysql-bin.000150", count: 1, want: "missing"},
+		{name: "different prefix", checkpoint: "relay-bin.000149", earliest: "mysql-bin.000150", latest: "mysql-bin.000150", count: 1, want: "missing"},
+		{name: "no binlogs", checkpoint: "mysql-bin.000149", count: 0, want: "no_binlogs"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := binlogCheckpointStatus(tt.checkpoint, tt.earliest, tt.latest, tt.count); got != tt.want {
+				t.Fatalf("binlogCheckpointStatus() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestCDCHandlerReportsBackpressure(t *testing.T) {
 	var got connector.ProgressInfo
 	handler := &cdcHandler{

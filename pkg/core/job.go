@@ -47,6 +47,9 @@ type JobProgress struct {
 	CDCLatestFile           string `json:"cdc_latest_file,omitempty"`
 	CDCLatestPos            uint32 `json:"cdc_latest_pos,omitempty"`
 	CDCLagFiles             int    `json:"cdc_lag_files,omitempty"`
+	CDCEarliestFile         string `json:"cdc_earliest_file,omitempty"`
+	CDCAvailableBinlogs     int    `json:"cdc_available_binlogs,omitempty"`
+	CDCBinlogStatus         string `json:"cdc_binlog_status,omitempty"`
 	CheckpointPending       bool   `json:"checkpoint_pending,omitempty"`
 	CheckpointReason        string `json:"checkpoint_reason,omitempty"`
 	CheckpointPosition      string `json:"checkpoint_position,omitempty"`
@@ -772,6 +775,9 @@ func (j *Job) updateProgress(info connector.ProgressInfo) {
 		CDCLatestFile:           strings.TrimSpace(info.CDCLatestFile),
 		CDCLatestPos:            info.CDCLatestPos,
 		CDCLagFiles:             info.CDCLagFiles,
+		CDCEarliestFile:         strings.TrimSpace(info.CDCEarliestFile),
+		CDCAvailableBinlogs:     info.CDCAvailableBinlogs,
+		CDCBinlogStatus:         strings.TrimSpace(info.CDCBinlogStatus),
 		CheckpointPending:       info.CheckpointPending,
 		CheckpointReason:        strings.TrimSpace(info.CheckpointReason),
 		CheckpointPosition:      strings.TrimSpace(info.CheckpointPosition),
@@ -818,6 +824,9 @@ func mergeCDCHealthProgress(previous, incoming JobProgress) *JobProgress {
 	merged.CDCLatestFile = incoming.CDCLatestFile
 	merged.CDCLatestPos = incoming.CDCLatestPos
 	merged.CDCLagFiles = incoming.CDCLagFiles
+	merged.CDCEarliestFile = incoming.CDCEarliestFile
+	merged.CDCAvailableBinlogs = incoming.CDCAvailableBinlogs
+	merged.CDCBinlogStatus = incoming.CDCBinlogStatus
 	return &merged
 }
 
@@ -871,6 +880,11 @@ func mergeSourceRuntimeProgress(previous, incoming JobProgress) *JobProgress {
 		merged.CDCLatestFile = previous.CDCLatestFile
 		merged.CDCLatestPos = previous.CDCLatestPos
 		merged.CDCLagFiles = previous.CDCLagFiles
+	}
+	if strings.TrimSpace(incoming.CDCBinlogStatus) == "" {
+		merged.CDCEarliestFile = previous.CDCEarliestFile
+		merged.CDCAvailableBinlogs = previous.CDCAvailableBinlogs
+		merged.CDCBinlogStatus = previous.CDCBinlogStatus
 	}
 	return &merged
 }

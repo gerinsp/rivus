@@ -73,6 +73,7 @@ type JobManager struct {
 
 	healthAlertMu       sync.Mutex
 	healthAlertLastSent map[string]time.Time
+	healthAlertActive   map[string]string
 
 	failureDeliveryMu        sync.Mutex
 	deferredFailureJobs      map[string]struct{}
@@ -189,6 +190,7 @@ func NewJobManager(reg *connector.Registry, opts ...JobManagerOption) *JobManage
 		failureNotifier:           telegramNotifier,
 		healthNotifier:            telegramNotifier,
 		healthAlertLastSent:       make(map[string]time.Time),
+		healthAlertActive:         make(map[string]string),
 		deferredFailureJobs:       make(map[string]struct{}),
 		activeFailureDeliveries:   make(map[string]struct{}),
 		completedFailureDelivery:  make(map[string]struct{}),
@@ -1053,7 +1055,20 @@ func (m *JobManager) maybeNotifyJobHealth(job *Job, progress *JobProgress) {
 		return
 	}
 
-	if tg.NotifyCDCLag &&
+	purgedCheckpoint := strings.EqualFold(strings.TrimSpace(progress.CDCBinlogStatus), "purged")
+	if tg.NotifyCheckpointPurged {
+		incident := ""
+		if purgedCheckpoint {
+			incident = strings.TrimSpace(progress.CDCCheckpointFile) + "->" + strings.TrimSpace(progress.CDCEarliestFile)
+		}
+		if m.updateJobHealthIncident(job.Config.ID, jobHealthAlertCheckpointPurged, incident) {
+			if payload, ok := buildJobHealthNotification(job, progress, jobHealthAlertCheckpointPurged); ok {
+				m.dispatchJobHealthNotification(payload)
+			}
+		}
+	}
+
+	if !purgedCheckpoint && tg.NotifyCDCLag &&
 		strings.TrimSpace(progress.CDCLatestFile) != "" &&
 		progress.CDCLagFiles >= tg.CDCLagFilesThreshold {
 		if payload, ok := buildJobHealthNotification(job, progress, jobHealthAlertCDCLag); ok {
@@ -1066,6 +1081,39 @@ func (m *JobManager) maybeNotifyJobHealth(job *Job, progress *JobProgress) {
 			m.dispatchJobHealthNotification(payload)
 		}
 	}
+}
+
+func (m *JobManager) updateJobHealthIncident(jobID string, alertType jobHealthAlertType, incident string) bool {
+	key := strings.TrimSpace(jobID) + ":" + string(alertType)
+	incident = strings.TrimSpace(incident)
+	m.healthAlertMu.Lock()
+	defer m.healthAlertMu.Unlock()
+
+	if incident == "" {
+		delete(m.healthAlertActive, key)
+		delete(m.healthAlertLastSent, key)
+		return false
+	}
+	if m.healthAlertActive[key] == incident {
+		return false
+	}
+	m.healthAlertActive[key] = incident
+	delete(m.healthAlertLastSent, key)
+	return true
+}
+
+func (m *JobManager) clearJobHealthIncident(payload jobHealthNotification) {
+	if payload.AlertType != jobHealthAlertCheckpointPurged {
+		return
+	}
+	key := payload.JobID + ":" + string(payload.AlertType)
+	incident := strings.TrimSpace(payload.CheckpointFile) + "->" + strings.TrimSpace(payload.EarliestFile)
+	m.healthAlertMu.Lock()
+	if m.healthAlertActive[key] == incident {
+		delete(m.healthAlertActive, key)
+		delete(m.healthAlertLastSent, key)
+	}
+	m.healthAlertMu.Unlock()
 }
 
 func (m *JobManager) dispatchJobHealthNotification(payload jobHealthNotification) {
@@ -1088,6 +1136,7 @@ func (m *JobManager) dispatchJobHealthNotification(payload jobHealthNotification
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := m.healthNotifier.NotifyJobHealth(ctx, payload); err != nil {
+			m.clearJobHealthIncident(payload)
 			log.Printf("[job-manager] health notification delivery failed job=%s alert=%s channel=telegram: %v",
 				payload.JobID, payload.AlertType, err)
 			return

@@ -554,6 +554,29 @@ func newNotificationTestJobConfig(id, sourceType, sinkType string) *config.JobCo
 	return cfg
 }
 
+func TestTelegramEnvironmentEnablesCheckpointPurgedAlert(t *testing.T) {
+	t.Setenv("RIVUS_TELEGRAM_ENABLED", "true")
+	t.Setenv("TELEGRAM_ENABLED", "")
+	t.Setenv("TELEGRAM_BOT_TOKEN", "bot-token")
+	t.Setenv("TELEGRAM_CHAT_ID", "chat-id")
+	t.Setenv("RIVUS_TELEGRAM_NOTIFY_CHECKPOINT_PURGED", "true")
+
+	tg := telegramFailureConfigFromEnv()
+	if !tg.NotifyCheckpointPurged {
+		t.Fatal("checkpoint-purged alert should be enabled by its environment variable")
+	}
+}
+
+func TestTelegramEnvironmentLeavesCheckpointPurgedAlertDisabledByDefault(t *testing.T) {
+	t.Setenv("RIVUS_TELEGRAM_ENABLED", "true")
+	t.Setenv("RIVUS_TELEGRAM_NOTIFY_CHECKPOINT_PURGED", "")
+
+	tg := telegramFailureConfigFromEnv()
+	if tg.NotifyCheckpointPurged {
+		t.Fatal("checkpoint-purged alert should require its environment variable")
+	}
+}
+
 type recordingJobFailureNotifier struct {
 	ch chan jobFailureNotification
 }

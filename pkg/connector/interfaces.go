@@ -50,6 +50,9 @@ type ProgressInfo struct {
 	CDCLatestFile           string
 	CDCLatestPos            uint32
 	CDCLagFiles             int
+	CDCEarliestFile         string
+	CDCAvailableBinlogs     int
+	CDCBinlogStatus         string
 	CheckpointPending       bool
 	CheckpointReason        string
 	CheckpointPosition      string

@@ -246,6 +246,21 @@ Operationally, binlog retention must be long enough to cover:
 
 Rivus cannot resume from a binlog file that the source has already purged.
 
+To alert on that unsafe restart window, enable Telegram checkpoint-purge
+notifications globally:
+
+```env
+RIVUS_TELEGRAM_ENABLED=true
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_CHAT_ID=...
+RIVUS_TELEGRAM_NOTIFY_CHECKPOINT_PURGED=true
+```
+
+This alert is controlled only by the environment variable; no per-job YAML is
+required. Rivus sends one alert for each purged-checkpoint incident, re-arms
+after the checkpoint becomes available again, and retries on the next health
+probe if delivery fails.
+
 ## Iceberg and object storage
 
 For Iceberg jobs:
