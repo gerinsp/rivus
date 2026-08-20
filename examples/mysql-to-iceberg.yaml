@@ -28,6 +28,8 @@ sink:
     max_batch_bytes: 128MB
     flush_seconds: 2
     checkpoint_flush_seconds: 10
+    # Coalesce safe idle checkpoint positions to avoid one metadata write per transaction.
+    checkpoint_save_interval_seconds: 5
     # Initial snapshot batches are spooled to local disk, then committed as
     # rolling Parquet files near 128 MiB. Small tables still produce one small file.
     snapshot_rolling_enabled: true

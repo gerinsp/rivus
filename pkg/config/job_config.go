@@ -203,6 +203,7 @@ type IcebergConfig struct {
 	MaxConcurrentCommits          int                                           `yaml:"max_concurrent_iceberg_commits" json:"max_concurrent_iceberg_commits"`
 	FlushSeconds                  int                                           `yaml:"flush_seconds" json:"flush_seconds"`
 	CheckpointFlushSeconds        int                                           `yaml:"checkpoint_flush_seconds" json:"checkpoint_flush_seconds"`
+	CheckpointSaveIntervalSeconds int                                           `yaml:"checkpoint_save_interval_seconds" json:"checkpoint_save_interval_seconds"`
 	DeleteConcurrency             int                                           `yaml:"delete_concurrency" json:"delete_concurrency"`
 	IdleTableEvictSeconds         int                                           `yaml:"idle_table_evict_seconds" json:"idle_table_evict_seconds"`
 	TrinoDelete                   IcebergTrinoDeleteConfig                      `yaml:"trino_delete" json:"trino_delete"`

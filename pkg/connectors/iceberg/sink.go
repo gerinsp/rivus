@@ -58,6 +58,7 @@ type Sink struct {
 	sourceSchemas              map[string]*model.TableSchema
 	states                     map[string]*tableState
 	pendingOffset              *model.SourceOffset
+	lastCheckpointCommitAt     time.Time
 	lastCheckpointBlockedLogAt time.Time
 }
 
@@ -495,7 +496,7 @@ func (s *Sink) reportCheckpointCommitted(off *model.SourceOffset) {
 	})
 }
 
-func (s *Sink) commitPendingOffset(ctx context.Context) error {
+func (s *Sink) commitPendingOffset(ctx context.Context, force bool) error {
 	if s.offsetSto == nil {
 		return nil
 	}
@@ -526,6 +527,11 @@ func (s *Sink) commitPendingOffset(ctx context.Context) error {
 		s.reportCheckpointPending(&off, tables)
 		return nil
 	}
+	now := time.Now()
+	if !s.checkpointSaveDueLocked(now, force) {
+		s.mu.Unlock()
+		return nil
+	}
 	off := *s.pendingOffset
 	s.mu.Unlock()
 
@@ -539,6 +545,7 @@ func (s *Sink) commitPendingOffset(ctx context.Context) error {
 	}
 
 	s.mu.Lock()
+	s.lastCheckpointCommitAt = time.Now()
 	if s.pendingOffset != nil && s.pendingOffset.BinlogFile == off.BinlogFile && s.pendingOffset.BinlogPos == off.BinlogPos {
 		s.pendingOffset = nil
 	}
@@ -547,6 +554,14 @@ func (s *Sink) commitPendingOffset(ctx context.Context) error {
 	log.Printf("[iceberg][job %s] committed offset key=%s pos=%s:%d", s.jobID, checkpointKey, off.BinlogFile, off.BinlogPos)
 	s.reportCheckpointCommitted(&off)
 	return nil
+}
+
+func (s *Sink) checkpointSaveDueLocked(now time.Time, force bool) bool {
+	if force || s.lastCheckpointCommitAt.IsZero() {
+		return true
+	}
+	interval := time.Duration(s.cfg.CheckpointSaveIntervalSeconds) * time.Second
+	return interval <= 0 || now.Sub(s.lastCheckpointCommitAt) >= interval
 }
 
 func newCatalog(ctx context.Context, cfg config.IcebergConfig) (icecatalog.Catalog, error) {
@@ -1416,7 +1431,7 @@ func (s *Sink) handleEvent(ctx context.Context, ev model.Event) error {
 	}
 	if ev.Type == model.EventTypeCheckpoint {
 		s.rememberOffset(ev.SourceOffset)
-		return s.commitPendingOffset(ctx)
+		return s.commitPendingOffset(ctx, false)
 	}
 	if ev.Type == model.EventTypeSnapshotBatch {
 		return s.handleSnapshotBatch(ctx, ev)
@@ -1564,7 +1579,7 @@ func (s *Sink) handleSnapshotBatch(ctx context.Context, ev model.Event) (err err
 	)
 	observability.RecordSinkFlush(s.jobID, state.sourceKey, tableKey(state.targetNamespace, state.targetTable), "snapshot", result.operation, 0, result.rowCount, result.deleteCount, duration)
 	clearRows(ev.Rows)
-	return s.commitPendingOffset(ctx)
+	return s.commitPendingOffset(ctx, true)
 }
 
 func (s *Sink) pendingBytesLimitReached(state *tableState) bool {
@@ -1613,7 +1628,7 @@ func (s *Sink) flushDue(ctx context.Context, now time.Time) error {
 			return err
 		}
 	}
-	return s.commitPendingOffset(ctx)
+	return s.commitPendingOffset(ctx, false)
 }
 
 func (s *Sink) flushStatesDueLocked(now time.Time) ([]*tableState, bool, *model.SourceOffset) {
@@ -1689,7 +1704,7 @@ func (s *Sink) flushAll(ctx context.Context) error {
 			return err
 		}
 	}
-	return s.commitPendingOffset(ctx)
+	return s.commitPendingOffset(ctx, true)
 }
 
 func (s *Sink) ApplyEvents(ctx context.Context, events []model.Event, schemas map[string]*model.TableSchema) error {
@@ -1821,7 +1836,7 @@ func (s *Sink) flushState(ctx context.Context, state *tableState) error {
 	)
 	observability.RecordSinkFlush(s.jobID, state.sourceKey, tableKey(state.targetNamespace, state.targetTable), "stream", result.operation, len(events), result.rowCount, result.deleteCount, duration)
 
-	return s.commitPendingOffset(ctx)
+	return s.commitPendingOffset(ctx, true)
 }
 
 func clearEvents(events []model.Event) {

@@ -947,6 +947,9 @@ func TestNormalizeIcebergConfigDefaultsSnapshotWriteMode(t *testing.T) {
 	if got, want := cfg.CheckpointFlushSeconds, 10; got != want {
 		t.Fatalf("CheckpointFlushSeconds = %d, want %d", got, want)
 	}
+	if got, want := cfg.CheckpointSaveIntervalSeconds, 5; got != want {
+		t.Fatalf("CheckpointSaveIntervalSeconds = %d, want %d", got, want)
+	}
 	if !snapshotRollingEnabled(cfg) {
 		t.Fatal("SnapshotRollingEnabled should default to true")
 	}
@@ -1900,7 +1903,7 @@ func TestCommitPendingOffsetUsesCheckpointKey(t *testing.T) {
 		states:        make(map[string]*tableState),
 	}
 
-	if err := sink.commitPendingOffset(context.Background()); err != nil {
+	if err := sink.commitPendingOffset(context.Background(), false); err != nil {
 		t.Fatalf("commitPendingOffset returned error: %v", err)
 	}
 	if store.savedJobID != "rivus/v1/checkpoint-key" {
@@ -1911,9 +1914,66 @@ func TestCommitPendingOffsetUsesCheckpointKey(t *testing.T) {
 	}
 }
 
+func TestCommitPendingOffsetCoalescesAndSavesNewestPosition(t *testing.T) {
+	store := &testOffsetStore{}
+	sink := &Sink{
+		jobID: "job-1",
+		cfg: config.IcebergConfig{
+			CheckpointSaveIntervalSeconds: 5,
+		},
+		offsetSto:              store,
+		pendingOffset:          &model.SourceOffset{BinlogFile: "mysql-bin.000010", BinlogPos: 42},
+		lastCheckpointCommitAt: time.Now(),
+		states:                 make(map[string]*tableState),
+	}
+
+	if err := sink.commitPendingOffset(context.Background(), false); err != nil {
+		t.Fatalf("first commitPendingOffset returned error: %v", err)
+	}
+	if store.saveCount != 0 {
+		t.Fatalf("checkpoint saves = %d, want coalesced write", store.saveCount)
+	}
+
+	sink.rememberOffset(&model.SourceOffset{BinlogFile: "mysql-bin.000010", BinlogPos: 99})
+	sink.mu.Lock()
+	sink.lastCheckpointCommitAt = time.Now().Add(-6 * time.Second)
+	sink.mu.Unlock()
+	if err := sink.commitPendingOffset(context.Background(), false); err != nil {
+		t.Fatalf("second commitPendingOffset returned error: %v", err)
+	}
+	if store.saveCount != 1 {
+		t.Fatalf("checkpoint saves = %d, want 1", store.saveCount)
+	}
+	if store.offset == nil || store.offset.BinlogPos != 99 {
+		t.Fatalf("saved offset = %#v, want newest position 99", store.offset)
+	}
+}
+
+func TestCommitPendingOffsetForceBypassesSaveInterval(t *testing.T) {
+	store := &testOffsetStore{}
+	sink := &Sink{
+		jobID: "job-1",
+		cfg: config.IcebergConfig{
+			CheckpointSaveIntervalSeconds: 5,
+		},
+		offsetSto:              store,
+		pendingOffset:          &model.SourceOffset{BinlogFile: "mysql-bin.000010", BinlogPos: 42},
+		lastCheckpointCommitAt: time.Now(),
+		states:                 make(map[string]*tableState),
+	}
+
+	if err := sink.commitPendingOffset(context.Background(), true); err != nil {
+		t.Fatalf("commitPendingOffset returned error: %v", err)
+	}
+	if store.saveCount != 1 {
+		t.Fatalf("checkpoint saves = %d, want forced write", store.saveCount)
+	}
+}
+
 type testOffsetStore struct {
 	savedJobID string
 	offset     *meta.Offset
+	saveCount  int
 }
 
 func (s *testOffsetStore) GetOffset(context.Context, string) (*meta.Offset, error) {
@@ -1923,6 +1983,7 @@ func (s *testOffsetStore) GetOffset(context.Context, string) (*meta.Offset, erro
 func (s *testOffsetStore) SaveOffset(_ context.Context, jobID string, offset meta.Offset) error {
 	s.savedJobID = jobID
 	s.offset = &offset
+	s.saveCount++
 	return nil
 }
 
