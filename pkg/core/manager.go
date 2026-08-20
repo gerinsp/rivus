@@ -1717,9 +1717,7 @@ func (m *JobManager) resumeCanBypassSnapshotGate(job *Job) bool {
 		return false
 	}
 
-	srcType, srcCfg := job.pickSource()
-	sinkType, sinkCfg := job.pickSink()
-	metaKey := buildMetaKey(job.Config.ID, string(storedMode), srcType, srcCfg, sinkType, sinkCfg)
+	metaKey := job.ensureMetaKey()
 
 	store, err := meta.NewMySQLOffsetStore(dsn)
 	if err != nil {
@@ -1763,9 +1761,7 @@ func (m *JobManager) snapshotCheckpointExists(job *Job) (bool, error) {
 		return false, errors.New("meta MySQL DSN is unavailable")
 	}
 
-	srcType, srcCfg := job.pickSource()
-	sinkType, sinkCfg := job.pickSink()
-	metaKey := buildMetaKey(job.Config.ID, string(normalizeMode(job.Config.Mode)), srcType, srcCfg, sinkType, sinkCfg)
+	metaKey := job.ensureMetaKey()
 
 	store, err := meta.NewMySQLOffsetStore(dsn)
 	if err != nil {
