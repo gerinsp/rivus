@@ -2,7 +2,10 @@ package iceberg
 
 import (
 	"context"
+	"encoding/base64"
+	"math/rand"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +16,63 @@ import (
 	"github.com/gerinsp/rivus/pkg/config"
 	"github.com/gerinsp/rivus/pkg/model"
 )
+
+func TestPlanSnapshotWriteSizingUsesBytesForWideRows(t *testing.T) {
+	spool := &snapshotSpool{
+		rowCount: 20662,
+		bytes:    6498236156,
+	}
+	sizing := planSnapshotWriteSizing(spool, 128*1024*1024, 50000)
+
+	if sizing.averageRowBytes <= 300*1024 {
+		t.Fatalf("average row bytes = %d, want a wide-row estimate above 300 KiB", sizing.averageRowBytes)
+	}
+	if sizing.rowGroupTargetBytes != 64*1024*1024 {
+		t.Fatalf("row group target bytes = %d, want 64 MiB", sizing.rowGroupTargetBytes)
+	}
+	if sizing.rowGroupRows <= 0 || sizing.rowGroupRows >= 500 {
+		t.Fatalf("row group rows = %d, want a dynamic value between 1 and 499", sizing.rowGroupRows)
+	}
+	if sizing.readBatchRows != sizing.rowGroupRows {
+		t.Fatalf("read batch rows = %d, want row group rows %d for a wide snapshot", sizing.readBatchRows, sizing.rowGroupRows)
+	}
+}
+
+func TestPlanSnapshotWriteSizingKeepsCeilingForSmallSnapshot(t *testing.T) {
+	spool := &snapshotSpool{rowCount: 100, bytes: 64 * 1024}
+	sizing := planSnapshotWriteSizing(spool, 128*1024*1024, 50000)
+
+	if got, want := sizing.rowGroupRows, int64(50000); got != want {
+		t.Fatalf("row group rows = %d, want ceiling %d", got, want)
+	}
+	if got, want := sizing.readBatchRows, snapshotSpoolMaxReadBatchRows; got != want {
+		t.Fatalf("read batch rows = %d, want max batch %d", got, want)
+	}
+}
+
+func TestPlanSnapshotWriteSizingRespectsConfiguredCeiling(t *testing.T) {
+	spool := &snapshotSpool{rowCount: 100000, bytes: 100 * 1024 * 1024}
+	sizing := planSnapshotWriteSizing(spool, 128*1024*1024, 500)
+
+	if got, want := sizing.rowGroupRows, int64(500); got != want {
+		t.Fatalf("row group rows = %d, want configured ceiling %d", got, want)
+	}
+	if got, want := sizing.readBatchRows, int64(500); got != want {
+		t.Fatalf("read batch rows = %d, want configured ceiling %d", got, want)
+	}
+}
+
+func TestPlanSnapshotWriteSizingAllowsSingleOversizedRow(t *testing.T) {
+	spool := &snapshotSpool{rowCount: 1, bytes: 256 * 1024 * 1024}
+	sizing := planSnapshotWriteSizing(spool, 128*1024*1024, 50000)
+
+	if got, want := sizing.rowGroupRows, int64(1); got != want {
+		t.Fatalf("row group rows = %d, want %d", got, want)
+	}
+	if got, want := sizing.readBatchRows, int64(1); got != want {
+		t.Fatalf("read batch rows = %d, want %d", got, want)
+	}
+}
 
 func TestRolledSnapshotCombinesSourceBatchesIntoOneDataFile(t *testing.T) {
 	ctx := context.Background()
@@ -143,6 +203,75 @@ func TestRollingSnapshotBoundsLargeSourceBatchBeforeBuildingArrow(t *testing.T) 
 		t.Fatalf("spool rows = %d, want %d", got, want)
 	}
 	sink.resetSnapshotSpool(state)
+}
+
+func TestRolledSnapshotSplitsWideRowsUsingDynamicSizing(t *testing.T) {
+	ctx := context.Background()
+	tbl, _ := newEqualityDeltaTestTable(t)
+	spoolDir, err := prepareSnapshotSpoolDirectory(t.TempDir(), "job-wide", "state-wide")
+	if err != nil {
+		t.Fatalf("prepareSnapshotSpoolDirectory: %v", err)
+	}
+	sink := &Sink{
+		jobID: "job-wide",
+		cfg: normalizeIcebergConfig(config.IcebergConfig{
+			SnapshotWriteMode:           snapshotWriteModeAppend,
+			SnapshotTargetFileSizeBytes: 32 * 1024,
+		}),
+		snapshotSpoolDir: spoolDir,
+		states:           make(map[string]*tableState),
+	}
+	state := &tableState{
+		sourceKey:       "app.orders",
+		targetNamespace: "bronze",
+		targetTable:     "orders",
+		sourceSchema: &model.TableSchema{
+			SchemaName: "app",
+			TableName:  "orders",
+			Columns: []model.TableColumn{
+				{Name: "id", DataType: "bigint", IsPK: true},
+				{Name: "status", DataType: "varchar"},
+			},
+		},
+		table:              tbl,
+		snapshotAppendSafe: true,
+	}
+	sink.states[state.sourceKey] = state
+
+	random := rand.New(rand.NewSource(42))
+	rows := make([]map[string]interface{}, 32)
+	for i := range rows {
+		payload := make([]byte, 4*1024)
+		if _, err := random.Read(payload); err != nil {
+			t.Fatalf("build random payload: %v", err)
+		}
+		rows[i] = map[string]interface{}{
+			"id":     int64(i + 1),
+			"status": base64.StdEncoding.EncodeToString(payload),
+		}
+	}
+	if err := sink.appendSnapshotSpool(ctx, state, rows, time.Now(), 0); err != nil {
+		t.Fatalf("appendSnapshotSpool: %v", err)
+	}
+	if err := sink.finalizeSnapshotSpool(ctx, state); err != nil {
+		t.Fatalf("finalizeSnapshotSpool: %v", err)
+	}
+
+	rowGroupRows := state.table.Metadata().Properties().GetInt(icetable.ParquetRowGroupLimitKey, 0)
+	if rowGroupRows <= 0 || rowGroupRows >= 50000 {
+		t.Fatalf("Parquet row group rows = %d, want a dynamically reduced value", rowGroupRows)
+	}
+	snapshot := state.table.CurrentSnapshot()
+	if snapshot == nil || snapshot.Summary == nil {
+		t.Fatal("rolled snapshot summary is missing")
+	}
+	addedFiles, err := strconv.Atoi(snapshot.Summary.Properties["added-data-files"])
+	if err != nil {
+		t.Fatalf("parse added-data-files: %v", err)
+	}
+	if addedFiles <= 1 {
+		t.Fatalf("added-data-files = %d, want multiple rolling files for wide rows", addedFiles)
+	}
 }
 
 func TestResetSnapshotSpoolDiscardsPartialTable(t *testing.T) {

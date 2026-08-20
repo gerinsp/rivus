@@ -24,7 +24,18 @@ import (
 	"github.com/gerinsp/rivus/pkg/util"
 )
 
-const snapshotSpoolReadBatchRows int64 = 1000
+const (
+	snapshotSpoolMaxReadBatchRows      int64 = 1000
+	snapshotParquetRowGroupMaxBytes    int64 = 64 * 1024 * 1024
+	snapshotParquetRowGroupRowsDefault int64 = 50000
+)
+
+type snapshotWriteSizing struct {
+	averageRowBytes     int64
+	rowGroupTargetBytes int64
+	rowGroupRows        int64
+	readBatchRows       int64
+}
 
 type snapshotSpool struct {
 	path       string
@@ -39,6 +50,54 @@ type snapshotSpool struct {
 
 func snapshotRollingEnabled(cfg config.IcebergConfig) bool {
 	return cfg.SnapshotRollingEnabled == nil || *cfg.SnapshotRollingEnabled
+}
+
+func planSnapshotWriteSizing(spool *snapshotSpool, targetFileBytes int64, rowGroupRowsCeiling int) snapshotWriteSizing {
+	ceiling := int64(rowGroupRowsCeiling)
+	if ceiling <= 0 {
+		ceiling = snapshotParquetRowGroupRowsDefault
+	}
+
+	sizing := snapshotWriteSizing{
+		rowGroupRows:  ceiling,
+		readBatchRows: min(snapshotSpoolMaxReadBatchRows, ceiling),
+	}
+	if spool == nil || spool.rowCount <= 0 || spool.bytes <= 0 {
+		return sizing
+	}
+
+	// The Arrow IPC spool is deliberately uncompressed, so its average bytes
+	// per row is a conservative estimate for Parquet sizing. Keep small
+	// snapshots simple: when the complete spool already fits in one target
+	// file, there is no reason to persist a lower table-wide row-group limit.
+	sizing.averageRowBytes = (spool.bytes-1)/spool.rowCount + 1
+	if targetFileBytes <= 0 || spool.bytes <= targetFileBytes {
+		return sizing
+	}
+
+	// Iceberg's rolling writer observes compressed bytes only after Parquet
+	// flushes a row group and only decides to roll after an Arrow batch. Aim
+	// each group at no more than half a target file (capped at 64 MiB), and
+	// emit batches no larger than the chosen group. This bounds overshoot to a
+	// small group instead of allowing one wide 50,000-row group to grow by GiB.
+	rowGroupTargetBytes := targetFileBytes / 2
+	if rowGroupTargetBytes <= 0 {
+		rowGroupTargetBytes = 1
+	}
+	if rowGroupTargetBytes > snapshotParquetRowGroupMaxBytes {
+		rowGroupTargetBytes = snapshotParquetRowGroupMaxBytes
+	}
+	sizing.rowGroupTargetBytes = rowGroupTargetBytes
+
+	rowsByBytes := rowGroupTargetBytes / sizing.averageRowBytes
+	if rowsByBytes <= 0 {
+		rowsByBytes = 1
+	}
+	if rowsByBytes < sizing.rowGroupRows {
+		sizing.rowGroupRows = rowsByBytes
+	}
+	sizing.readBatchRows = min(snapshotSpoolMaxReadBatchRows, sizing.rowGroupRows)
+	return sizing
 }
 
 func supportsRollingSnapshotMode(mode string) bool {
@@ -92,12 +151,6 @@ func (s *Sink) appendSnapshotSpool(ctx context.Context, state *tableState, rows 
 	default:
 		return util.Permanent(fmt.Errorf("snapshot rolling spool does not support write mode %q", mode))
 	}
-	if state.snapshotSpool == nil {
-		if err := s.ensureSnapshotRollingWriteProperties(ctx, state); err != nil {
-			return err
-		}
-	}
-
 	// A MySQL snapshot event may contain a very large source batch (for
 	// example, 50,000 wide rows). The direct snapshot writer has always split
 	// such a batch by both row count and MaxBatchBytes. Do the same before
@@ -195,14 +248,13 @@ func (s *Sink) appendSnapshotSpoolChunk(ctx context.Context, state *tableState, 
 	return nil
 }
 
-func (s *Sink) ensureSnapshotRollingWriteProperties(ctx context.Context, state *tableState) error {
-	desired := s.cfg.SnapshotParquetRowGroupRows
+func (s *Sink) ensureSnapshotRollingWriteProperties(ctx context.Context, state *tableState, desired int) (int, error) {
 	if desired <= 0 || state == nil || state.table == nil {
-		return nil
+		return desired, nil
 	}
 	current := state.table.Metadata().Properties().GetInt(icetable.ParquetRowGroupLimitKey, icetable.ParquetRowGroupLimitDefault)
 	if current <= desired {
-		return nil
+		return current, nil
 	}
 	var updated *icetable.Table
 	err := s.withCommitSlot(ctx, commitProgress{
@@ -222,14 +274,14 @@ func (s *Sink) ensureSnapshotRollingWriteProperties(ctx context.Context, state *
 		return err
 	})
 	if err != nil {
-		return s.stateOperationError("snapshot-rolling-properties", state, err)
+		return 0, s.stateOperationError("snapshot-rolling-properties", state, err)
 	}
 	s.mu.Lock()
 	state.table = updated
 	s.updateTargetTableStatesLocked(state.targetNamespace, state.targetTable, updated, time.Now())
 	s.mu.Unlock()
 	log.Printf("[iceberg][job %s] snapshot rolling row group table=%s rows=%d", s.jobID, state.sourceKey, desired)
-	return nil
+	return desired, nil
 }
 
 func (s *Sink) ensureSnapshotSpool(state *tableState, schema *arrow.Schema) (*snapshotSpool, error) {
@@ -305,12 +357,31 @@ func (s *Sink) finalizeSnapshotSpool(ctx context.Context, state *tableState) err
 	if err := spool.file.Close(); err != nil {
 		return fmt.Errorf("close iceberg snapshot spool file for %s: %w", state.sourceKey, err)
 	}
+	info, err := os.Stat(spool.path)
+	if err != nil {
+		return fmt.Errorf("stat completed iceberg snapshot spool for %s: %w", state.sourceKey, err)
+	}
+	spool.bytes = info.Size()
+
+	sizing := planSnapshotWriteSizing(spool, s.cfg.SnapshotTargetFileSizeBytes, s.cfg.SnapshotParquetRowGroupRows)
+	effectiveRows, err := s.ensureSnapshotRollingWriteProperties(ctx, state, int(sizing.rowGroupRows))
+	if err != nil {
+		return err
+	}
+	if effectiveRows <= 0 {
+		effectiveRows = 1
+	}
+	sizing.rowGroupRows = int64(effectiveRows)
+	sizing.readBatchRows = min(snapshotSpoolMaxReadBatchRows, sizing.rowGroupRows)
+	log.Printf("[iceberg][job %s] snapshot write sizing table=%s spool_rows=%d spool_bytes=%d average_row_bytes=%d row_group_target_bytes=%d row_group_rows=%d read_batch_rows=%d target_file_bytes=%d",
+		s.jobID, state.sourceKey, spool.rowCount, spool.bytes, sizing.averageRowBytes, sizing.rowGroupTargetBytes,
+		sizing.rowGroupRows, sizing.readBatchRows, s.cfg.SnapshotTargetFileSizeBytes)
 
 	result := flushResult{operation: "snapshot-rolling-append", rowCount: int(spool.rowCount)}
 	var updated *icetable.Table
 	var startedAt time.Time
 	var duration time.Duration
-	err := s.withCommitSlot(ctx, commitProgress{
+	err = s.withCommitSlot(ctx, commitProgress{
 		operation:       result.operation,
 		sourceKey:       state.sourceKey,
 		targetNamespace: state.targetNamespace,
@@ -319,7 +390,7 @@ func (s *Sink) finalizeSnapshotSpool(ctx context.Context, state *tableState) err
 	}, func() error {
 		startedAt = time.Now()
 		var commitErr error
-		updated, commitErr = s.commitSnapshotSpool(ctx, state, spool)
+		updated, commitErr = s.commitSnapshotSpool(ctx, state, spool, sizing.readBatchRows)
 		duration = time.Since(startedAt)
 		return commitErr
 	})
@@ -333,7 +404,10 @@ func (s *Sink) finalizeSnapshotSpool(ctx context.Context, state *tableState) err
 	return nil
 }
 
-func (s *Sink) commitSnapshotSpool(ctx context.Context, state *tableState, spool *snapshotSpool) (*icetable.Table, error) {
+func (s *Sink) commitSnapshotSpool(ctx context.Context, state *tableState, spool *snapshotSpool, readBatchRows int64) (*icetable.Table, error) {
+	if readBatchRows <= 0 {
+		readBatchRows = 1
+	}
 	file, err := os.Open(spool.path)
 	if err != nil {
 		return nil, err
@@ -352,8 +426,8 @@ func (s *Sink) commitSnapshotSpool(ctx context.Context, state *tableState, spool
 				yield(nil, readErr)
 				return
 			}
-			for start := int64(0); start < record.NumRows(); start += snapshotSpoolReadBatchRows {
-				end := start + snapshotSpoolReadBatchRows
+			for start := int64(0); start < record.NumRows(); start += readBatchRows {
+				end := start + readBatchRows
 				if end > record.NumRows() {
 					end = record.NumRows()
 				}

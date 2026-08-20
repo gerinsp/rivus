@@ -34,6 +34,8 @@ sink:
     # rolling Parquet files near 128 MiB. Small tables still produce one small file.
     snapshot_rolling_enabled: true
     snapshot_target_file_size_bytes: 134217728
+    # Safety ceiling. Rivus automatically lowers this for wide snapshots by
+    # estimating bytes per row from the completed local spool.
     snapshot_parquet_row_group_rows: 50000
     snapshot_spool_directory: /tmp/rivus-snapshot-spool
     snapshot_spool_max_bytes: 21474836480
