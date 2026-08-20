@@ -6,17 +6,12 @@ on:
       - main
   pull_request:
 
-permissions:
-  contents: write
-
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - name: Check out
         uses: actions/checkout@v5
-        with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -43,18 +38,6 @@ jobs:
           done
           grep -q '<script type="module" src="app.js?v=8"></script>' ui/index.html
           ! grep -q 'maintenance-ui.js' ui/index.html
-
-      - name: Resolve and commit temporary fork checksum
-        if: github.event_name == 'pull_request'
-        run: |
-          go mod tidy
-          if ! git diff --quiet -- go.sum; then
-            git config user.name github-actions[bot]
-            git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-            git add go.sum
-            git commit -m "chore: refresh go.sum for patched iceberg-go"
-            git push origin HEAD:${{ github.event.pull_request.head.ref }}
-          fi
 
       - name: Test
         run: go test ./...
