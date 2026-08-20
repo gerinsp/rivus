@@ -331,6 +331,17 @@ func TestWorkerAppliesDurablePauseGracefully(t *testing.T) {
 		t.Fatalf("Get returned error: %v", err)
 	}
 	waitForCondition(t, "streaming job to run", func() bool { return job.GetStatus() == JobStatusRunning })
+	// Job status becomes visible in memory before its synchronous persistence
+	// listener finishes. A real control-plane pause reads the durable row, so
+	// wait for that same externally observable precondition instead of racing
+	// the listener on fast CI machines.
+	waitForCondition(t, "streaming job running state to persist", func() bool {
+		record, ok := store.Get(cfg.ID)
+		return ok &&
+			record.LastStatus == string(JobStatusRunning) &&
+			record.DesiredState == meta.DesiredStateRunning &&
+			record.LeaseOwner == "streaming-pause-1"
+	})
 
 	if updated, err := store.RequestJobPause(context.Background(), cfg.ID); err != nil || !updated {
 		t.Fatalf("RequestJobPause updated=%t err=%v", updated, err)
@@ -349,7 +360,12 @@ func TestWorkerAppliesDurablePauseGracefully(t *testing.T) {
 	}
 	close(allowDrain)
 	waitForCondition(t, "streaming job to pause", func() bool { return job.GetStatus() == JobStatusPaused })
-	record, _ := store.Get(cfg.ID)
+	var record meta.PersistedJob
+	waitForCondition(t, "streaming paused state to persist", func() bool {
+		var ok bool
+		record, ok = store.Get(cfg.ID)
+		return ok && record.LastStatus == string(JobStatusPaused) && record.DesiredState == meta.DesiredStateStopped
+	})
 	if record.LastStatus != string(JobStatusPaused) || record.DesiredState != meta.DesiredStateStopped {
 		t.Fatalf("paused record desired=%s status=%s", record.DesiredState, record.LastStatus)
 	}
