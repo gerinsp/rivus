@@ -105,6 +105,53 @@ func TestSnapshotFirstAttemptWithoutCheckpoint(t *testing.T) {
 	}
 }
 
+func TestControlPlanePersistsAuthoritativeMetaKey(t *testing.T) {
+	store := newMemoryJobStore()
+	manager := NewJobManager(
+		connector.NewRegistry(),
+		WithJobStore(store),
+		WithControlPlaneRole(),
+	)
+	cfg := newTestJobConfig("persisted-meta-key")
+	cfg.Sink.Config["flush_seconds"] = 300
+	cfg.Sink.Config["checkpoint_flush_seconds"] = 300
+
+	job, err := manager.Submit(cfg)
+	if err != nil {
+		t.Fatalf("Submit returned error: %v", err)
+	}
+	record, ok := store.Get(cfg.ID)
+	if !ok {
+		t.Fatal("submitted job was not persisted")
+	}
+	if record.MetaKey == "" {
+		t.Fatal("persisted meta key is empty")
+	}
+	if got := job.MetaKey(); got != record.MetaKey {
+		t.Fatalf("job meta key = %q, persisted = %q", got, record.MetaKey)
+	}
+}
+
+func TestRestoreJobSnapshotUsesPersistedMetaKey(t *testing.T) {
+	manager := NewJobManager(connector.NewRegistry())
+	job := NewJob(newTestJobConfig("restored-meta-key"), connector.NewRegistry())
+	localFallback := job.ensureMetaKey()
+	const authoritative = "rivus/v1/authoritative-worker-key"
+	if localFallback == authoritative {
+		t.Fatal("test setup produced the authoritative key as its fallback")
+	}
+
+	manager.restoreJobSnapshot(job, meta.PersistedJob{
+		ID:         job.Config.ID,
+		MetaKey:    authoritative,
+		LastStatus: string(JobStatusRunning),
+	}, false)
+
+	if got := job.ensureMetaKey(); got != authoritative {
+		t.Fatalf("restored meta key = %q, want %q", got, authoritative)
+	}
+}
+
 func TestRestoreJobSnapshotRestoresPersistedProgress(t *testing.T) {
 	progressJSON, err := json.Marshal(&JobProgress{
 		Phase:            "snapshot",

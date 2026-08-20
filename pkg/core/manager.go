@@ -1122,6 +1122,12 @@ func (m *JobManager) restoreJobSnapshot(job *Job, record meta.PersistedJob, resu
 	}
 
 	job.mu.Lock()
+	if strings.TrimSpace(record.MetaKey) != "" {
+		// The submitting control plane is authoritative for the checkpoint
+		// identity. Always accept the durable value so a master that previously
+		// derived a local fallback converges with the worker that writes offsets.
+		job.metaKey = strings.TrimSpace(record.MetaKey)
+	}
 	job.Created = created
 	job.Updated = updated
 	job.status = status
@@ -1159,6 +1165,7 @@ func (m *JobManager) saveJobRecord(ctx context.Context, job *Job, desired meta.D
 	if m.jobStore == nil || job == nil || job.Config == nil {
 		return nil
 	}
+	metaKey := job.ensureMetaKey()
 
 	job.mu.RLock()
 	cfg := job.Config
@@ -1201,6 +1208,7 @@ func (m *JobManager) saveJobRecord(ctx context.Context, job *Job, desired meta.D
 	record := meta.PersistedJob{
 		ID:            cfg.ID,
 		Name:          name,
+		MetaKey:       metaKey,
 		Config:        m.normalizeConfig(cfg),
 		DesiredState:  desired,
 		ExecutionRole: m.executionRoleForJob(cfg.ID),

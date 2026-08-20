@@ -160,6 +160,37 @@ func (j *Job) MetaKey() string {
 	return j.metaKey
 }
 
+// ensureMetaKey resolves the durable checkpoint identity once and then keeps
+// it stable for the lifetime of the job. Split workers restore this value from
+// job_registry so they cannot derive a different key from a JSON-round-tripped
+// copy of the submitted connector config.
+func (j *Job) ensureMetaKey() string {
+	j.mu.RLock()
+	key := strings.TrimSpace(j.metaKey)
+	cfg := j.Config
+	j.mu.RUnlock()
+	if key != "" || cfg == nil {
+		return key
+	}
+
+	srcType, srcCfg := j.pickSource()
+	sinkType, sinkCfg := j.pickSink()
+	computed := buildMetaKey(
+		cfg.ID,
+		string(normalizeMode(cfg.Mode)),
+		srcType, srcCfg,
+		sinkType, sinkCfg,
+	)
+
+	j.mu.Lock()
+	if strings.TrimSpace(j.metaKey) == "" {
+		j.metaKey = computed
+	}
+	key = j.metaKey
+	j.mu.Unlock()
+	return key
+}
+
 func (j *Job) GetStatus() JobStatus {
 	j.mu.RLock()
 	defer j.mu.RUnlock()
@@ -302,16 +333,8 @@ func (j *Job) checkpointReader() (meta.OffsetStore, string, error) {
 		return store, key, nil
 	}
 
-	srcType, srcCfg := j.pickSource()
-	sinkType, sinkCfg := j.pickSink()
-	computedKey := buildMetaKey(
-		cfg.ID,
-		string(normalizeMode(cfg.Mode)),
-		srcType, srcCfg,
-		sinkType, sinkCfg,
-	)
 	if key == "" {
-		key = computedKey
+		key = j.ensureMetaKey()
 	}
 
 	if store == nil {
@@ -1284,12 +1307,7 @@ func (j *Job) startWithMode(mode config.JobMode) (err error) {
 	effectiveMode := normalizeMode(mode)
 	storedMode := normalizeMode(j.Config.Mode)
 	log.Printf("[job %s] start mode=%s source=%s sink=%s", j.Config.ID, effectiveMode, srcType, sinkType)
-	metaKey := buildMetaKey(
-		j.Config.ID,
-		string(storedMode),
-		srcType, srcCfg,
-		sinkType, sinkCfg,
-	)
+	metaKey := j.ensureMetaKey()
 
 	// store metakey
 	j.mu.Lock()

@@ -340,9 +340,15 @@ func maintenanceSnapshotComplete(ctx context.Context, store *meta.IcebergMainten
 	if mode == config.JobModeLatest || mode == config.JobModeLatestOffset {
 		return true
 	}
-	sourceType, sourceCfg := jobSourceSpec(job.Config)
-	sinkType, sinkCfg := jobSinkSpec(job.Config)
-	metaKey := maintenanceMetaKey(job.Config.ID, string(mode), sourceType, sourceCfg, sinkType, sinkCfg)
+	metaKey := strings.TrimSpace(job.MetaKey)
+	if metaKey == "" {
+		// Backward compatibility for registry rows created before meta_key was
+		// persisted. New rows use the control plane's authoritative key so the
+		// maintenance barrier and streaming checkpoint cannot diverge.
+		sourceType, sourceCfg := jobSourceSpec(job.Config)
+		sinkType, sinkCfg := jobSinkSpec(job.Config)
+		metaKey = maintenanceMetaKey(job.Config.ID, string(mode), sourceType, sourceCfg, sinkType, sinkCfg)
+	}
 	done, found, err := store.SnapshotDone(ctx, metaKey)
 	if err != nil {
 		log.Printf("[maintenance-worker] snapshot barrier lookup job=%s error=%v", job.ID, err)
