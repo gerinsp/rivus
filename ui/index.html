@@ -802,7 +802,7 @@
             <textarea
               id="maintenanceMonitorYaml"
               class="mono mt-3 h-96 w-full rounded-[16px] border border-slate-200 bg-slate-50/90 p-4 text-sm leading-6 text-slate-800 outline-none focus:border-slate-400 focus:bg-white"
-              placeholder="id: barayax-maintenance&#10;name: Barayax Maintenance&#10;mode: maintenance-only&#10;sink:&#10;  type: iceberg_native&#10;  config:&#10;    rest_uri: ${ICEBERG_REST_URI}&#10;    warehouse: ${ICEBERG_WAREHOUSE}&#10;    table_maintenance:&#10;      enabled: true&#10;      executor: hybrid&#10;      catalog_name: asmat&#10;      runner_uri: http://runner-app:8001&#10;      runner_api_token: ${RUNNER_API_TOKEN}&#10;      tables:&#10;        - namespace: barayax_bronze&#10;          table: tbl_absen"
+              placeholder="id: barayax-maintenance&#10;name: Barayax Maintenance&#10;mode: maintenance-only&#10;sink:&#10;  type: iceberg_native&#10;  config:&#10;    rest_uri: ${ICEBERG_REST_URI}&#10;    warehouse: ${ICEBERG_WAREHOUSE}&#10;    table_maintenance:&#10;      enabled: true&#10;      executor: hybrid&#10;      catalog_name: asmat&#10;      runner_uri: http://runner-app:8001&#10;      runner_api_token: ${RUNNER_API_TOKEN}&#10;      namespace:&#10;        - barayax_bronze&#10;      tables:&#10;        - tbl_absen&#10;        - tbl_employee&#10;        - attendance_daily"
             ></textarea>
             <div class="mt-5 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
               <div id="maintenanceMonitorSubmitStatus" class="text-sm text-slate-500">Ready for a maintenance-only YAML definition.</div>

@@ -20,10 +20,13 @@ sink:
       runner_api_token: "${RUNNER_API_TOKEN}"
       runner_resource_profile: small
 
-      # Explicit targets are mandatory. Wildcards are rejected.
+      # Compact form for several tables in one namespace. Wildcards are rejected.
+      namespace:
+        - barayax_bronze
       tables:
-        - namespace: barayax_bronze
-          table: tbl_absen
+        - tbl_absen
+        - tbl_employee
+        - attendance_daily
 
       native_idle_check_interval_seconds: 604800
       native_expire_interval_seconds: 86400
@@ -31,4 +34,3 @@ sink:
       native_snapshot_retain_last: 10
       native_orphan_interval_seconds: 2592000
       native_orphan_min_age_hours: 168
-

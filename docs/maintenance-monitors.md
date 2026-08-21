@@ -42,14 +42,28 @@ sink:
       runner_uri: "${RIVUS_RUNNER_URI}"
       runner_api_token: "${RUNNER_API_TOKEN}"
       runner_resource_profile: small
+      namespace:
+        - barayax_bronze
       tables:
-        - namespace: barayax_bronze
-          table: tbl_absen
+        - tbl_absen
+        - tbl_employee
+        - attendance_daily
 ```
 
-`table_maintenance.tables` is mandatory and accepts only explicit
-`namespace`/`table` pairs. Wildcards are rejected so a monitor cannot
-accidentally enroll an entire warehouse.
+The compact form accepts exactly one `namespace` (either a string or a
+one-item list) and several table names. The existing explicit form remains
+available when a monitor spans namespaces:
+
+```yaml
+tables:
+  - namespace: barayax_bronze
+    table: tbl_absen
+  - namespace: barayax_silver
+    table: attendance_daily
+```
+
+Wildcards are rejected so a monitor cannot accidentally enroll an entire
+warehouse.
 
 ## API
 
@@ -65,4 +79,3 @@ DELETE /api/iceberg/maintenance/monitors/{id}
 
 API responses expose table names and safe backend labels but never return the
 stored sink configuration or credentials.
-

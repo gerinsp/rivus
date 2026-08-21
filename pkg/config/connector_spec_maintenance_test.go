@@ -81,6 +81,52 @@ func TestMaintenanceJSONDefaultsExecutorToHybrid(t *testing.T) {
 	}
 }
 
+func TestMaintenanceNormalizesCompactTargets(t *testing.T) {
+	var spec ConnectorSpec
+	if err := yaml.Unmarshal([]byte(`type: iceberg_native
+config:
+  table_maintenance:
+    enabled: true
+    namespace:
+      - barayax_bronze
+    tables:
+      - tbl_absen
+      - tbl_employee
+      - attendance_daily
+`), &spec); err != nil {
+		t.Fatal(err)
+	}
+	maintenance := spec.Config["table_maintenance"].(map[string]any)
+	if _, exists := maintenance["namespace"]; exists {
+		t.Fatalf("compact namespace was not removed: %#v", maintenance)
+	}
+	tables, ok := maintenance["tables"].([]any)
+	if !ok || len(tables) != 3 {
+		t.Fatalf("normalized tables = %#v", maintenance["tables"])
+	}
+	first, ok := tables[0].(map[string]any)
+	if !ok || first["namespace"] != "barayax_bronze" || first["table"] != "tbl_absen" {
+		t.Fatalf("first normalized table = %#v", tables[0])
+	}
+}
+
+func TestMaintenanceRejectsMultipleCompactNamespaces(t *testing.T) {
+	var spec ConnectorSpec
+	err := yaml.Unmarshal([]byte(`type: iceberg_native
+config:
+  table_maintenance:
+    enabled: true
+    namespace:
+      - barayax_bronze
+      - barayax_silver
+    tables:
+      - tbl_absen
+`), &spec)
+	if err == nil {
+		t.Fatal("expected multiple compact namespaces to be rejected")
+	}
+}
+
 func TestRuntimeMaintenanceDecoderUsesEnabledOnly(t *testing.T) {
 	var cfg struct {
 		Maintenance IcebergTableMaintenanceConfig `yaml:"table_maintenance"`

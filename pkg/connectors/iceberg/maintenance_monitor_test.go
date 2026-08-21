@@ -88,3 +88,27 @@ func TestPrepareMaintenanceMonitorConfigEnforcesOwnerIDLimit(t *testing.T) {
 		t.Fatalf("monitor id length validation error = %v", err)
 	}
 }
+
+func TestPrepareMaintenanceMonitorConfigAcceptsCompactTableList(t *testing.T) {
+	cfg := maintenanceMonitorConfigForTest()
+	maintenance := cfg.Sink.Config["table_maintenance"].(map[string]any)
+	maintenance["namespace"] = []any{"barayax_bronze"}
+	maintenance["tables"] = []any{"tbl_absen", "tbl_employee", "attendance_daily"}
+
+	normalized, targets, err := PrepareMaintenanceMonitorConfig(cfg)
+	if err != nil {
+		t.Fatalf("PrepareMaintenanceMonitorConfig returned error: %v", err)
+	}
+	if len(targets) != 3 {
+		t.Fatalf("normalized targets = %#v", targets)
+	}
+	for _, target := range targets {
+		if target.Namespace != "barayax_bronze" {
+			t.Fatalf("target namespace = %q", target.Namespace)
+		}
+	}
+	maintenance = rawMaintenanceMap(normalized.Sink.Config)
+	if _, exists := maintenance["namespace"]; exists {
+		t.Fatalf("compact namespace was not removed from normalized config: %#v", maintenance)
+	}
+}

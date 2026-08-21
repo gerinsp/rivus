@@ -53,6 +53,14 @@ func PrepareMaintenanceMonitorConfig(cfg *config.JobConfig) (*config.JobConfig, 
 	if !strings.EqualFold(sinkType, "iceberg_native") {
 		return nil, nil, fmt.Errorf("maintenance monitor sink is %q, not iceberg_native", sinkType)
 	}
+	normalizedSinkCfg, err := configMap(sinkCfg)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := config.NormalizeIcebergMaintenanceTargets(normalizedSinkCfg); err != nil {
+		return nil, nil, err
+	}
+	sinkCfg = normalizedSinkCfg
 	iceCfg, err := decodeIcebergConfig(sinkCfg)
 	if err != nil {
 		return nil, nil, err
