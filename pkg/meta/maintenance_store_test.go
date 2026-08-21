@@ -50,3 +50,9 @@ func TestSnapshotIDsDifferTreatsIDsAsOpaque(t *testing.T) {
 		t.Fatal("zero is not a valid current snapshot signal")
 	}
 }
+
+func TestMaintenanceMonitorOwnerIDIsNamespaced(t *testing.T) {
+	if got, want := MaintenanceMonitorOwnerID("  daily-tables  "), "monitor:daily-tables"; got != want {
+		t.Fatalf("MaintenanceMonitorOwnerID() = %q, want %q", got, want)
+	}
+}

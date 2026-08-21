@@ -33,10 +33,11 @@ jobs:
             ui/logs.js \
             ui/job-detail.js \
             ui/iceberg-maintenance.js \
+            ui/maintenance-monitors.js \
             ui/errors.js; do
             node --input-type=module --check < "$file"
           done
-          grep -q '<script type="module" src="app.js?v=8"></script>' ui/index.html
+          grep -q '<script type="module" src="app.js?v=9"></script>' ui/index.html
           ! grep -q 'maintenance-ui.js' ui/index.html
 
       - name: Test

@@ -151,6 +151,13 @@ func orphanCleanupTargets(jobCfg *config.JobConfig, sink *Sink, explicit []strin
 		return dedupeTargets(targets), nil
 	}
 
+	// Maintenance-only monitors have no source selection. Their explicit
+	// targets live with the maintenance settings and are also available to
+	// manual operations issued from the monitor UI.
+	if sink != nil && len(sink.cfg.TableMaintenance.Tables) > 0 {
+		return dedupeTargets(sink.cfg.TableMaintenance.Tables), nil
+	}
+
 	sourceType, sourceCfg := jobSourceSpec(jobCfg)
 	if sourceType == "" || strings.EqualFold(sourceType, "mysql") {
 		mysqlCfg, err := decodeMySQLConfig(sourceCfg)

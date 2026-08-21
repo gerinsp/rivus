@@ -31,6 +31,10 @@ const (
 	JobModeResume                JobMode = "resume"        // lanjutkan dari checkpoint snapshot/offset terakhir
 	JobModeLatestOffset          JobMode = "latest-offset" // resume dari offset (error kalau belum ada)
 	JobModeLatest                JobMode = "latest"        // streaming dari latest (ignore offset/snapshot)
+	// JobModeMaintenanceOnly is a durable Iceberg maintenance registration.
+	// It is submitted through the maintenance-monitor API and never creates a
+	// source, snapshot, or CDC pipeline.
+	JobModeMaintenanceOnly JobMode = "maintenance-only"
 )
 
 type RetryPolicy struct {
@@ -121,7 +125,10 @@ type IcebergTimestampColumnConfig struct {
 // Standalone compatibility backend. AppResource must be reachable by Spark
 // workers when the direct backend is used.
 type IcebergTableMaintenanceConfig struct {
-	Enabled                             bool              `yaml:"enabled" json:"enabled"`
+	Enabled bool `yaml:"enabled" json:"enabled"`
+	// Tables is required by maintenance-only monitors because they do not have
+	// a source table selection from which target tables can be derived.
+	Tables                              []IcebergTarget   `yaml:"tables" json:"tables"`
 	NativeEnabled                       bool              `yaml:"native_enabled" json:"native_enabled"`
 	Executor                            string            `yaml:"executor" json:"executor"`
 	NativeSignalDelaySeconds            int               `yaml:"native_signal_delay_seconds" json:"native_signal_delay_seconds"`

@@ -20,6 +20,7 @@ type Server struct {
 	maintenanceStoreOnce sync.Once
 	maintenanceStore     *meta.IcebergMaintenanceStore
 	maintenanceStoreErr  error
+	maintenanceMonitors  maintenanceMonitorRepository
 }
 
 func NewServer(jm *core.JobManager, uiDir string, auth AuthConfig) *Server {
@@ -77,6 +78,13 @@ func (s *Server) Router() http.Handler {
 	mux.HandleFunc("GET /api/iceberg/maintenance/runs", s.requireAPIAuth(s.handleMaintenanceRuns))
 	mux.HandleFunc("GET /api/iceberg/maintenance/runs/{id}", s.requireAPIAuth(s.handleMaintenanceRun))
 	mux.HandleFunc("GET /api/iceberg/maintenance/tables/{key...}", s.requireAPIAuth(s.handleMaintenanceTableState))
+	mux.HandleFunc("GET /api/iceberg/maintenance/monitors", s.requireAPIAuth(s.handleMaintenanceMonitors))
+	mux.HandleFunc("POST /api/iceberg/maintenance/monitors", s.requireAPIAuth(s.handleMaintenanceMonitors))
+	mux.HandleFunc("GET /api/iceberg/maintenance/monitors/{id}", s.requireAPIAuth(s.handleMaintenanceMonitor))
+	mux.HandleFunc("DELETE /api/iceberg/maintenance/monitors/{id}", s.requireAPIAuth(s.handleMaintenanceMonitor))
+	mux.HandleFunc("POST /api/iceberg/maintenance/monitors/{id}/pause", s.requireAPIAuth(s.handleMaintenanceMonitorPause))
+	mux.HandleFunc("POST /api/iceberg/maintenance/monitors/{id}/resume", s.requireAPIAuth(s.handleMaintenanceMonitorResume))
+	mux.HandleFunc("POST /api/iceberg/maintenance/monitors/{id}/run", s.requireAPIAuth(s.handleMaintenanceMonitorRun))
 
 	mux.HandleFunc("/api/metrics", s.requireAPIAuth(s.handleMetrics))
 	mux.HandleFunc("/api/table-metrics", s.requireAPIAuth(s.handleTableMetrics))

@@ -21,6 +21,7 @@ const (
 	MaintenanceTaskSkipped   = "skipped"
 	MaintenanceTaskFailed    = "failed"
 	MaintenanceTaskRetry     = "retry"
+	MaintenanceTaskCancelled = "cancelled"
 )
 
 type IcebergMaintenanceState struct {
@@ -168,6 +169,15 @@ func (s *IcebergMaintenanceStore) Init(ctx context.Context) error {
 		return fmt.Errorf("maintenance store is nil")
 	}
 	ddls := []string{
+		`CREATE TABLE IF NOT EXISTS iceberg_maintenance_monitors (
+		  monitor_id VARCHAR(255) NOT NULL PRIMARY KEY,
+		  monitor_name VARCHAR(255) NOT NULL,
+		  status VARCHAR(32) NOT NULL,
+		  config_json LONGTEXT NOT NULL,
+		  created_at DATETIME(6) NOT NULL,
+		  updated_at DATETIME(6) NOT NULL,
+		  INDEX idx_maintenance_monitors_status (status, updated_at)
+		)`,
 		`CREATE TABLE IF NOT EXISTS iceberg_maintenance_state (
 		  table_key VARCHAR(512) NOT NULL PRIMARY KEY,
 		  catalog VARCHAR(255) NOT NULL,
@@ -525,8 +535,12 @@ func (s *IcebergMaintenanceStore) DueStates(ctx context.Context, operation strin
 	 active_position_delete_files, next_compaction_check_at, next_expire_check_at, next_orphan_check_at,
 	 last_compaction_at, last_expire_at, last_orphan_at, inventory_lease_owner, inventory_lease_until, lease_owner, lease_until,
 	 attempt_count, last_error, created_at, updated_at
-	FROM iceberg_maintenance_state
+	FROM iceberg_maintenance_state AS state
 	WHERE snapshot_complete = 1 AND %s IS NOT NULL AND %s <= ?
+	  AND (owner_type <> 'monitor' OR EXISTS (
+	    SELECT 1 FROM iceberg_maintenance_monitors AS monitor
+	    WHERE monitor.monitor_id=SUBSTRING(state.owner_job_id, 9) AND monitor.status='ACTIVE'
+	  ))
 	ORDER BY %s ASC, table_key ASC LIMIT ?`, column, column, column)
 	rows, err := s.db.QueryContext(ctx, query, now.UTC(), limit)
 	if err != nil {
@@ -571,6 +585,10 @@ func (s *IcebergMaintenanceStore) ClaimPendingInventoryState(ctx context.Context
 	WHERE snapshot_complete=1 AND next_inventory_check_at IS NOT NULL AND next_inventory_check_at <= ?
 	  AND inventory_priority >= ?
 	  AND (inventory_lease_until IS NULL OR inventory_lease_until < ?)
+	  AND (owner_type <> 'monitor' OR EXISTS (
+	    SELECT 1 FROM iceberg_maintenance_monitors AS monitor
+	    WHERE monitor.monitor_id=SUBSTRING(iceberg_maintenance_state.owner_job_id, 9) AND monitor.status='ACTIVE'
+	  ))
 	ORDER BY inventory_priority DESC, next_inventory_check_at ASC, table_key
 	LIMIT 1 FOR UPDATE SKIP LOCKED`, now.UTC(), minimumPriority, now.UTC())
 	state, err := scanMaintenanceState(row)
@@ -648,6 +666,27 @@ func (s *IcebergMaintenanceStore) RequestInventoryRefresh(ctx context.Context, o
 	return res.RowsAffected()
 }
 
+// RequestTableInventoryRefresh schedules one owner-qualified table. The
+// maintenance monitor worker uses this when it first observes an ACTIVE
+// monitor so a deleted/recreated monitor cannot accidentally reactivate stale
+// tables that are no longer present in its explicit target list.
+func (s *IcebergMaintenanceStore) RequestTableInventoryRefresh(ctx context.Context, tableKey, ownerJobID string, now time.Time) (int64, error) {
+	tableKey = strings.TrimSpace(tableKey)
+	ownerJobID = strings.TrimSpace(ownerJobID)
+	if tableKey == "" || ownerJobID == "" {
+		return 0, fmt.Errorf("maintenance inventory table key and owner id are required")
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE iceberg_maintenance_state
+	SET next_inventory_check_at=?, inventory_priority=100, updated_at=UTC_TIMESTAMP(6)
+	WHERE table_key=? AND owner_job_id=? AND snapshot_complete=1
+	  AND (inventory_lease_until IS NULL OR inventory_lease_until < ?)`,
+		now.UTC(), tableKey, ownerJobID, now.UTC())
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 func (s *IcebergMaintenanceStore) RetryInventoryClaim(ctx context.Context, tableKey, workerID string, retryAt time.Time) error {
 	res, err := s.db.ExecContext(ctx, `UPDATE iceberg_maintenance_state
 	SET inventory_lease_owner=NULL, inventory_lease_until=NULL, next_inventory_check_at=?, updated_at=UTC_TIMESTAMP(6)
@@ -673,13 +712,22 @@ func (s *IcebergMaintenanceStore) EnqueueTask(ctx context.Context, state Iceberg
 	 idempotency_key, table_key, owner_job_id, operation, priority, status, attempt_count,
 	 not_before, schedule_window, payload_json, created_at, updated_at
 ) SELECT ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6)
-WHERE NOT EXISTS (
+WHERE EXISTS (
+	SELECT 1 FROM iceberg_maintenance_state AS state
+	WHERE state.table_key=? AND state.owner_job_id=?
+	  AND (state.owner_type <> 'monitor' OR EXISTS (
+	    SELECT 1 FROM iceberg_maintenance_monitors AS monitor
+	    WHERE monitor.monitor_id=SUBSTRING(state.owner_job_id, 9) AND monitor.status='ACTIVE'
+	  ))
+)
+AND NOT EXISTS (
 	SELECT 1 FROM iceberg_maintenance_tasks AS active
 	WHERE active.table_key=? AND active.operation=?
 	  AND active.status IN ('queued','retry','leased')
 )`
 	res, err := s.db.ExecContext(ctx, stmt,
 		idempotency, state.TableKey, state.OwnerJobID, operation, priority, notBefore.UTC(), scheduleWindow, string(payloadJSON),
+		state.TableKey, state.OwnerJobID,
 		state.TableKey, operation,
 	)
 	if err != nil {
@@ -723,6 +771,11 @@ func (s *IcebergMaintenanceStore) ClaimTasks(ctx context.Context, workerID strin
 	 created_at, updated_at
 	FROM iceberg_maintenance_tasks
 	WHERE status IN ('queued','retry') AND not_before <= ?
+	  AND owner_job_id NOT LIKE 'deleted-monitor:%'
+	  AND (owner_job_id NOT LIKE 'monitor:%' OR EXISTS (
+	    SELECT 1 FROM iceberg_maintenance_monitors AS monitor
+	    WHERE monitor.monitor_id=SUBSTRING(iceberg_maintenance_tasks.owner_job_id, 9) AND monitor.status='ACTIVE'
+	  ))
 	ORDER BY priority ASC, not_before ASC, id ASC
 	LIMIT ? FOR UPDATE SKIP LOCKED`, now.UTC(), limit)
 	if err != nil {

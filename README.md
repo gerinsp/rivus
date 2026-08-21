@@ -46,6 +46,7 @@ Rivus deliberately keeps the execution model small and lakehouse-oriented:
 - **Durable control plane** — job state, checkpoints, leases, and maintenance state live in metadata MySQL.
 - **Operational isolation** — master, streaming, snapshot, and maintenance run as separate processes from the same image.
 - **Built-in maintenance** — Iceberg compaction, snapshot expiration, and orphan cleanup are integrated instead of being treated as an unrelated external workflow.
+- **Maintenance monitors** — existing Iceberg tables can be continuously inventoried and maintained without creating a snapshot or CDC pipeline.
 - **Small operational surface** — one binary, one image, YAML/JSON job definitions, REST API, and web dashboard.
 
 Rivus is not intended to replace a general-purpose stream processor for arbitrary event-time SQL, complex DAGs, or broad message-bus processing. Its scope is intentionally narrower: reliable database-to-lakehouse and database-to-analytics replication.

@@ -71,6 +71,20 @@
           Iceberg Jobs
         </button>
         <button
+          id="tabMaintenanceMonitors"
+          onclick="switchTab('maintenance')"
+          class="tab-button"
+        >
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
+            <path d="M4 7h16"></path>
+            <path d="M7 3v4"></path>
+            <path d="M17 3v4"></path>
+            <rect x="4" y="7" width="16" height="14" rx="2"></rect>
+            <path d="m8 14 2.5 2.5L16 11"></path>
+          </svg>
+          Maintenance Monitors
+        </button>
+        <button
           id="tabLogs"
           onclick="switchTab('logs')"
           class="tab-button"
@@ -480,6 +494,55 @@
       </details>
     </section>
 
+    <section id="maintenanceMonitorsView" class="mt-6 hidden space-y-5">
+      <div class="panel overflow-hidden rounded-[20px]">
+        <div class="flex flex-col gap-4 border-b border-slate-200 px-5 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-6">
+          <div>
+            <div class="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">Iceberg Operations</div>
+            <h2 class="mt-1 text-lg font-semibold text-slate-900">Maintenance Monitors</h2>
+            <p class="mt-1 text-sm text-slate-500">Long-running table inventory and automatic maintenance without snapshot or CDC ingestion.</p>
+          </div>
+          <div class="flex flex-wrap items-center gap-2">
+            <div class="rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-xs font-medium text-emerald-800">
+              Total <span data-bind="maintenance-monitor-count" class="mono">0</span>
+            </div>
+            <button type="button" class="brand-solid-btn rounded-md px-3 py-2 text-sm font-semibold" onclick="openMaintenanceMonitorModal()">
+              New monitor
+            </button>
+          </div>
+        </div>
+
+        <div class="px-5 pt-4 sm:px-6">
+          <div id="maintenanceMonitorsNotice" class="hidden rounded-xl border px-4 py-3 text-sm"></div>
+        </div>
+
+        <div class="table-fade overflow-hidden">
+          <div class="overflow-x-auto">
+            <table class="responsive-table desktop-table min-w-full text-sm">
+              <thead class="bg-slate-50 text-slate-600">
+                <tr class="border-b border-slate-200">
+                  <th class="w-48 px-6 py-4 text-left text-xs font-semibold uppercase tracking-[0.16em]">ID</th>
+                  <th class="w-[28rem] px-6 py-4 text-left text-xs font-semibold uppercase tracking-[0.16em]">Monitor</th>
+                  <th class="w-32 px-6 py-4 text-left text-xs font-semibold uppercase tracking-[0.16em]">Status</th>
+                  <th class="w-44 px-6 py-4 text-left text-xs font-semibold uppercase tracking-[0.16em]">Backend</th>
+                  <th class="w-24 px-6 py-4 text-left text-xs font-semibold uppercase tracking-[0.16em]">Tables</th>
+                  <th class="w-48 px-6 py-4 text-left text-xs font-semibold uppercase tracking-[0.16em]">Last inventory</th>
+                  <th class="w-[20rem] px-6 py-4 text-right text-xs font-semibold uppercase tracking-[0.16em]">Actions</th>
+                </tr>
+              </thead>
+              <tbody id="maintenanceMonitorBody" class="divide-y divide-slate-200"></tbody>
+            </table>
+          </div>
+          <div id="maintenanceMonitorEmpty" class="hidden px-6 py-8">
+            <div class="rounded-xl border border-dashed border-slate-300 bg-slate-50 p-5">
+              <div class="text-sm font-semibold text-slate-800">No maintenance monitors.</div>
+              <div class="mt-1 text-sm text-slate-600">Create one to maintain existing Iceberg tables without starting ingestion.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <section id="logsView" class="mt-6 hidden space-y-5">
       <div class="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
         <div class="rounded-xl border border-slate-200 bg-white px-4 py-3">
@@ -714,6 +777,46 @@
     </div>
   </div>
 
-  <script type="module" src="app.js?v=8"></script>
+  <div id="maintenanceMonitorModal" class="fixed inset-0 z-50 hidden">
+    <div class="absolute inset-0 bg-slate-950/45 backdrop-blur-sm" onclick="closeMaintenanceMonitorModal()"></div>
+    <div class="absolute inset-0 overflow-y-auto">
+      <div class="flex min-h-full items-end justify-center p-0 sm:items-center sm:p-6">
+        <div class="panel mobile-sheet mobile-safe w-full max-w-4xl overflow-hidden border border-slate-200 sm:rounded-[20px]">
+          <div class="border-b border-slate-200 bg-slate-50 px-6 py-4 sm:px-7">
+            <div class="flex items-start justify-between gap-4">
+              <div>
+                <h2 class="text-xl font-semibold text-slate-900">Create Maintenance Monitor</h2>
+                <p class="mt-1 text-sm text-slate-500">Register existing Iceberg tables for long-running maintenance. No source, snapshot, or CDC process is created.</p>
+              </div>
+              <button class="rounded-lg border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-600" onclick="closeMaintenanceMonitorModal()">Close</button>
+            </div>
+          </div>
+          <div class="px-6 py-6 sm:px-7">
+            <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <label for="maintenanceMonitorYaml" class="block text-sm font-medium text-slate-600">Maintenance monitor YAML</label>
+              <label class="inline-flex cursor-pointer items-center justify-center rounded-lg border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-600">
+                Upload YAML
+                <input type="file" accept=".yaml,.yml,text/yaml,application/x-yaml" class="hidden" onchange="loadMaintenanceMonitorFile(event)">
+              </label>
+            </div>
+            <textarea
+              id="maintenanceMonitorYaml"
+              class="mono mt-3 h-96 w-full rounded-[16px] border border-slate-200 bg-slate-50/90 p-4 text-sm leading-6 text-slate-800 outline-none focus:border-slate-400 focus:bg-white"
+              placeholder="id: barayax-maintenance&#10;name: Barayax Maintenance&#10;mode: maintenance-only&#10;sink:&#10;  type: iceberg_native&#10;  config:&#10;    rest_uri: ${ICEBERG_REST_URI}&#10;    warehouse: ${ICEBERG_WAREHOUSE}&#10;    table_maintenance:&#10;      enabled: true&#10;      executor: hybrid&#10;      catalog_name: asmat&#10;      runner_uri: http://runner-app:8001&#10;      runner_api_token: ${RUNNER_API_TOKEN}&#10;      tables:&#10;        - namespace: barayax_bronze&#10;          table: tbl_absen"
+            ></textarea>
+            <div class="mt-5 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+              <div id="maintenanceMonitorSubmitStatus" class="text-sm text-slate-500">Ready for a maintenance-only YAML definition.</div>
+              <div class="flex flex-wrap gap-2">
+                <button class="rounded-lg border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-600" onclick="clearMaintenanceMonitorYaml()">Clear</button>
+                <button id="maintenanceMonitorSubmitButton" class="brand-solid-btn rounded-lg px-5 py-2.5 text-sm font-semibold" onclick="submitMaintenanceMonitor()">Create monitor</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="app.js?v=9"></script>
 </body>
 </html>

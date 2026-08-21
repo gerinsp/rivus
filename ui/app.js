@@ -37,6 +37,15 @@ import {
   showJobDetails,
 } from './job-detail.js';
 import { closeErrorsModal, initErrors, refreshErrors, showErrors } from './errors.js';
+import {
+  clearMaintenanceMonitorYaml,
+  closeMaintenanceMonitorModal,
+  initMaintenanceMonitors,
+  loadMaintenanceMonitorFile,
+  loadMaintenanceMonitors,
+  openMaintenanceMonitorModal,
+  submitMaintenanceMonitor,
+} from './maintenance-monitors.js';
 
 const initialUrl = new URL(window.location.href);
 const initialJobId = initialUrl.searchParams.get('tab') === 'job'
@@ -45,11 +54,13 @@ const initialJobId = initialUrl.searchParams.get('tab') === 'job'
 
 let currentTab = initialJobId
   ? 'job'
-  : initialUrl.searchParams.get('tab') === 'iceberg'
-    ? 'iceberg'
-    : initialUrl.searchParams.get('tab') === 'logs'
-      ? 'logs'
-      : 'doris';
+  : initialUrl.searchParams.get('tab') === 'maintenance'
+    ? 'maintenance'
+    : initialUrl.searchParams.get('tab') === 'iceberg'
+      ? 'iceberg'
+      : initialUrl.searchParams.get('tab') === 'logs'
+        ? 'logs'
+        : 'doris';
 let refreshInFlight = false;
 
 function updateTabUrl() {
@@ -74,7 +85,7 @@ function updateTabUrl() {
     if (lineLimit !== 500) url.searchParams.set('lines', String(lineLimit));
     else url.searchParams.delete('lines');
   } else {
-    url.searchParams.set('tab', currentTab === 'iceberg' ? 'iceberg' : 'doris');
+    url.searchParams.set('tab', currentTab === 'maintenance' ? 'maintenance' : currentTab === 'iceberg' ? 'iceberg' : 'doris');
     url.searchParams.delete('id');
     url.searchParams.delete('log');
     url.searchParams.delete('lines');
@@ -87,16 +98,19 @@ function updateTabUrl() {
 export function switchTab(tab, options = {}) {
   currentTab = tab === 'job'
     ? 'job'
-    : tab === 'logs'
-      ? 'logs'
-      : tab === 'iceberg'
-        ? 'iceberg'
-        : 'doris';
+    : tab === 'maintenance'
+      ? 'maintenance'
+      : tab === 'logs'
+        ? 'logs'
+        : tab === 'iceberg'
+          ? 'iceberg'
+          : 'doris';
 
   const logsActive = currentTab === 'logs';
   const jobActive = currentTab === 'job';
   const dorisActive = currentTab === 'doris';
   const icebergActive = currentTab === 'iceberg';
+  const maintenanceActive = currentTab === 'maintenance';
 
   const toggleHidden = (id, hidden) => {
     document.getElementById(id)?.classList.toggle('hidden', hidden);
@@ -106,18 +120,21 @@ export function switchTab(tab, options = {}) {
     if (el) el.className = active ? 'tab-button tab-button-active' : 'tab-button';
   };
 
-  toggleHidden('jobsView', logsActive || jobActive);
+  toggleHidden('jobsView', logsActive || jobActive || maintenanceActive);
   toggleHidden('jobDetailView', !jobActive);
   toggleHidden('logsView', !logsActive);
+  toggleHidden('maintenanceMonitorsView', !maintenanceActive);
   toggleHidden('dorisJobsView', !dorisActive);
   toggleHidden('icebergJobsView', !icebergActive);
 
   setTabClass('tabDorisJobs', dorisActive);
   setTabClass('tabIcebergJobs', icebergActive);
   setTabClass('tabLogs', logsActive);
+  setTabClass('tabMaintenanceMonitors', maintenanceActive);
 
   if (options.updateUrl !== false) updateTabUrl();
   if (logsActive && options.load !== false) loadLogs();
+  if (maintenanceActive && options.load !== false) loadMaintenanceMonitors();
 }
 
 export async function refreshDashboard(options = {}) {
@@ -133,6 +150,7 @@ export async function refreshDashboard(options = {}) {
 
   try {
     const tasks = [loadJobs(), loadMetrics()];
+    if (currentTab === 'maintenance') tasks.push(loadMaintenanceMonitors());
     if (currentTab === 'logs') tasks.push(refreshLogs({ auto: !!options.auto }));
     if (currentTab === 'job' && getCurrentJobId()) tasks.push(refreshGraph({ silent: !!options.auto }));
     await Promise.allSettled(tasks);
@@ -168,6 +186,11 @@ function installCompatibilityGlobals() {
     changeLogLineLimit,
     renderLogOutput,
     changeLogFollowLatest,
+    openMaintenanceMonitorModal,
+    closeMaintenanceMonitorModal,
+    clearMaintenanceMonitorYaml,
+    loadMaintenanceMonitorFile,
+    submitMaintenanceMonitor,
   });
 }
 
@@ -186,7 +209,12 @@ function bindShellEvents() {
       return;
     }
     const submitModal = document.getElementById('submitModal');
-    if (submitModal && !submitModal.classList.contains('hidden')) closeSubmitModal();
+    if (submitModal && !submitModal.classList.contains('hidden')) {
+      closeSubmitModal();
+      return;
+    }
+    const maintenanceModal = document.getElementById('maintenanceMonitorModal');
+    if (maintenanceModal && !maintenanceModal.classList.contains('hidden')) closeMaintenanceMonitorModal();
   });
 
   document.addEventListener('click', (event) => {
@@ -206,6 +234,7 @@ function startApp() {
   });
   initErrors();
   initJobs({ refreshDashboard, showJobDetails, showLogsForJob, showErrors });
+  initMaintenanceMonitors({ refreshDashboard });
   installCompatibilityGlobals();
   bindShellEvents();
 

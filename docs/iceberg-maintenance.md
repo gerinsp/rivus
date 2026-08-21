@@ -42,6 +42,10 @@ table_maintenance:
 - `enabled: false` — no automatic maintenance tasks are scheduled.
 - `enabled: true` — the durable maintenance worker owns scheduling and execution.
 
+Existing Iceberg tables that are not owned by a snapshot/CDC pipeline can be
+registered as long-running maintenance monitors. Monitors have their own UI and
+lifecycle and never start ingestion. See [maintenance-monitors.md](maintenance-monitors.md).
+
 `executor` controls **compaction** execution:
 
 - `hybrid` — default. The worker analyzes the selected rewrite workload and chooses native or Spark.

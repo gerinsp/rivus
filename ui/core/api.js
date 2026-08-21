@@ -1,4 +1,4 @@
-const MODAL_IDS = ['submitModal', 'errorsModal'];
+const MODAL_IDS = ['submitModal', 'errorsModal', 'maintenanceMonitorModal'];
 const syncFormatter = new Intl.DateTimeFormat(undefined, {
   hour: '2-digit',
   minute: '2-digit',
@@ -110,6 +110,7 @@ export function statusPill(status) {
   const value = (status ?? '-').toString();
   const base = 'inline-flex items-center gap-2 rounded-md border px-2.5 py-1 text-xs font-semibold uppercase tracking-normal';
   const map = {
+    ACTIVE: ['border-emerald-200 bg-emerald-50 text-emerald-800', 'bg-emerald-500'],
     RUNNING: ['border-emerald-200 bg-emerald-50 text-emerald-800', 'bg-emerald-500'],
     PAUSING: ['border-amber-200 bg-amber-50 text-amber-800', 'bg-amber-500'],
     PAUSED: ['border-violet-200 bg-violet-50 text-violet-800', 'bg-violet-500'],

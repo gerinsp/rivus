@@ -1,0 +1,34 @@
+id: barayax-maintenance
+name: Barayax Iceberg Maintenance
+mode: maintenance-only
+
+# Maintenance monitors intentionally have no source connector. They never
+# snapshot a source table and never attach to a CDC/binlog stream.
+sink:
+  type: iceberg_native
+  config:
+    rest_uri: "${ICEBERG_REST_URI}"
+    warehouse: "${ICEBERG_WAREHOUSE}"
+    s3_endpoint: "${ICEBERG_S3_ENDPOINT}"
+    s3_path_style: "${ICEBERG_S3_PATH_STYLE}"
+
+    table_maintenance:
+      enabled: true
+      executor: hybrid
+      catalog_name: asmat
+      runner_uri: "${RIVUS_RUNNER_URI}"
+      runner_api_token: "${RUNNER_API_TOKEN}"
+      runner_resource_profile: small
+
+      # Explicit targets are mandatory. Wildcards are rejected.
+      tables:
+        - namespace: barayax_bronze
+          table: tbl_absen
+
+      native_idle_check_interval_seconds: 604800
+      native_expire_interval_seconds: 86400
+      native_snapshot_max_age_hours: 168
+      native_snapshot_retain_last: 10
+      native_orphan_interval_seconds: 2592000
+      native_orphan_min_age_hours: 168
+

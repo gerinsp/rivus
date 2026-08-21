@@ -26,6 +26,16 @@ func (s *IcebergMaintenanceStore) RecoverExpiredMaintenanceLeases(ctx context.Co
 	WHERE status='leased' AND lease_until IS NOT NULL AND lease_until < ?`, now.UTC(), now.UTC()); err != nil {
 		return err
 	}
+	if _, err := tx.ExecContext(ctx, `UPDATE iceberg_maintenance_tasks AS task
+	LEFT JOIN iceberg_maintenance_monitors AS monitor
+	  ON monitor.monitor_id=SUBSTRING(task.owner_job_id, 9)
+	SET task.status='cancelled', task.lease_owner=NULL, task.lease_until=NULL, task.updated_at=UTC_TIMESTAMP(6)
+	WHERE task.status IN ('queued','retry') AND (
+	  task.owner_job_id LIKE 'deleted-monitor:%'
+	  OR (task.owner_job_id LIKE 'monitor:%' AND (monitor.monitor_id IS NULL OR monitor.status <> 'ACTIVE'))
+	)`); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE iceberg_maintenance_state
 	SET lease_owner=NULL, lease_until=NULL, updated_at=UTC_TIMESTAMP(6)
 	WHERE lease_until IS NOT NULL AND lease_until < ?`, now.UTC()); err != nil {
@@ -70,6 +80,10 @@ func (s *IcebergMaintenanceStore) ClaimPendingInventoryStateForMaintenance(
 	  AND inventory_priority >= ?
 	  AND (inventory_lease_until IS NULL OR inventory_lease_until < ?)
 	  AND (lease_until IS NULL OR lease_until < ?)
+	  AND (owner_type <> 'monitor' OR EXISTS (
+	    SELECT 1 FROM iceberg_maintenance_monitors AS monitor
+	    WHERE monitor.monitor_id=SUBSTRING(iceberg_maintenance_state.owner_job_id, 9) AND monitor.status='ACTIVE'
+	  ))
 	ORDER BY inventory_priority DESC, next_inventory_check_at ASC, table_key
 	LIMIT 1 FOR UPDATE SKIP LOCKED`, now.UTC(), minimumPriority, now.UTC(), now.UTC())
 	state, err := scanMaintenanceState(row)
@@ -135,8 +149,13 @@ func (s *IcebergMaintenanceStore) ClaimTasksForOperation(
 	FROM iceberg_maintenance_tasks AS task
 	JOIN iceberg_maintenance_state AS state ON state.table_key=task.table_key
 	WHERE task.status IN ('queued','retry') AND task.not_before <= ? AND task.operation=?
+	  AND task.owner_job_id NOT LIKE 'deleted-monitor:%'
 	  AND (state.lease_until IS NULL OR state.lease_until < ?)
 	  AND (state.inventory_lease_until IS NULL OR state.inventory_lease_until < ?)
+	  AND (task.owner_job_id NOT LIKE 'monitor:%' OR EXISTS (
+	    SELECT 1 FROM iceberg_maintenance_monitors AS monitor
+	    WHERE monitor.monitor_id=SUBSTRING(task.owner_job_id, 9) AND monitor.status='ACTIVE'
+	  ))
 	ORDER BY task.priority ASC, task.not_before ASC, task.id ASC
 	LIMIT ? FOR UPDATE SKIP LOCKED`, now.UTC(), operation, now.UTC(), now.UTC(), limit)
 	if err != nil {

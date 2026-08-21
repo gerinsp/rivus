@@ -100,6 +100,7 @@ func RunMaintenanceWorkerBounded(ctx context.Context, dsn string, opts Maintenan
 
 	var jobs map[string]maintenanceWorkerJob
 	var lastStateSync time.Time
+	var lastMonitorSync time.Time
 	for {
 		now := time.Now().UTC()
 		if jobs == nil || now.Sub(lastStateSync) >= 10*time.Minute {
@@ -109,10 +110,19 @@ func RunMaintenanceWorkerBounded(ctx context.Context, dsn string, opts Maintenan
 			}
 			registry.Replace(jobs)
 			lastStateSync = now
+			lastMonitorSync = now
 			if opts.Queue && !executorsStarted {
 				startMaintenanceExecutorPools(workerCtx, store, jobStore, registry, opts, concurrency, &executorWG)
 				executorsStarted = true
 			}
+		}
+		if lastMonitorSync.IsZero() || now.Sub(lastMonitorSync) >= opts.PollInterval {
+			jobs, err = syncMaintenanceMonitorStates(workerCtx, store, jobs, now)
+			if err != nil {
+				return err
+			}
+			registry.Replace(jobs)
+			lastMonitorSync = now
 		}
 
 		if opts.Queue {

@@ -264,7 +264,7 @@ func processClaimedMaintenanceTask(
 		return "failed", nil
 	}
 
-	job, ok, resolveErr := resolveMaintenanceWorkerJob(ctx, jobStore, jobs, task.OwnerJobID)
+	job, ok, resolveErr := resolveMaintenanceWorkerJob(ctx, store, jobStore, jobs, task.OwnerJobID)
 	if resolveErr != nil {
 		return "failed", fmt.Errorf("load owner job configuration task=%d: %w", task.ID, resolveErr)
 	}

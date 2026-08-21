@@ -1,6 +1,12 @@
 #!/bin/sh
 set -eu
 
+# Docker Compose may clear the image CMD when this custom entrypoint is used.
+# Preserve the official MySQL image behavior when no explicit command arrives.
+if [ "$#" -eq 0 ]; then
+  set -- mysqld
+fi
+
 docker-entrypoint.sh "$@" &
 mysql_pid=$!
 
