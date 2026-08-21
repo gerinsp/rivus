@@ -206,6 +206,8 @@ export function renderIcebergMaintenance(job, options = {}) {
 
   const checkedAt = maintenance.checked_at ? formatDateTime(maintenance.checked_at) : 'Waiting for first scan';
   const scanned = `${fmtWholeNumber(maintenance.tables_scanned || 0)} / ${fmtWholeNumber(maintenance.tables_total || 0)} tables scanned`;
+  const refreshLabel = String(options.refreshLabel || 'Refresh inventory');
+  const refreshDisabled = options.refreshDisabled === true;
   const errors = Number(maintenance.inventory_errors || 0);
   const inventoryNotice = state === 'paused'
     ? 'This maintenance monitor is paused. Existing inventory remains visible, but automatic scans and maintenance runs will not be scheduled.'
@@ -230,7 +232,7 @@ export function renderIcebergMaintenance(job, options = {}) {
         <div class="flex flex-wrap items-center gap-2">
           <span class="rounded-full border px-3 py-1.5 text-xs font-semibold ${maintenanceStateClass(state)}">${escapeHtml(maintenanceStateLabel(state))}</span>
           <span class="rounded-full border border-slate-200 bg-white px-3 py-1.5 text-[11px] font-semibold text-slate-600">${escapeHtml(scanned)}</span>
-          <button type="button" data-maintenance-inventory-refresh class="brand-outline-btn rounded-md px-3 py-1.5 text-xs font-semibold">Refresh inventory</button>
+          <button type="button" data-maintenance-inventory-refresh class="brand-outline-btn rounded-md px-3 py-1.5 text-xs font-semibold disabled:cursor-not-allowed disabled:opacity-50" ${refreshDisabled ? 'disabled' : ''}>${escapeHtml(refreshLabel)}</button>
           ${historyLink(job, options)}
         </div>
       </div>
@@ -283,7 +285,7 @@ export function renderIcebergMaintenance(job, options = {}) {
         await options.onRefreshInventory();
       } finally {
         refreshButton.disabled = false;
-        refreshButton.textContent = 'Refresh inventory';
+        refreshButton.textContent = refreshLabel;
       }
     });
   }

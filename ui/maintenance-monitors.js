@@ -44,7 +44,6 @@ function monitorActions(monitor) {
   return `
     <div class="flex min-w-max flex-nowrap items-center justify-end gap-2">
       <button type="button" class="${base} border-slate-300 text-slate-800 hover:bg-slate-50" data-monitor-action="details" data-monitor-id="${id}">Details</button>
-      <button type="button" class="${base} border-blue-200 text-blue-800 hover:bg-blue-50" data-monitor-action="run" data-monitor-id="${id}" ${active ? '' : 'disabled'}>Run now</button>
       ${active
         ? `<button type="button" class="${base} border-violet-200 text-violet-800 hover:bg-violet-50" data-monitor-action="pause" data-monitor-id="${id}">Pause</button>`
         : `<button type="button" class="${base} border-emerald-200 text-emerald-800 hover:bg-emerald-50" data-monitor-action="resume" data-monitor-id="${id}">Resume</button>`}
@@ -188,6 +187,8 @@ export async function showMaintenanceMonitorDetails(id) {
     panel,
     historyOwnerID: `monitor:${monitor.id}`,
     historyLabel: "View this monitor's maintenance runs",
+    refreshLabel: 'Scan & maintain now',
+    refreshDisabled: String(monitor.status || '').toUpperCase() !== 'ACTIVE',
     onRefreshInventory: async () => {
       await mutateMonitor(monitor.id, 'run');
       await showMaintenanceMonitorDetails(monitor.id);
