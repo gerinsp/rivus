@@ -89,7 +89,7 @@ sink:
       native_max_selected_input_bytes: 536870912
       native_max_selected_files: 250
       native_max_equality_delete_files: 100
-      position_delete_files_threshold: 25 # Spark compaction after this many active position deletes
+      position_delete_files_threshold: 25 # Compaction after this many active position deletes
       native_target_file_size_bytes: 134217728
       native_scan_concurrency: 1
       native_timeout_seconds: 600
@@ -194,13 +194,14 @@ Rivus runs the `iceberg-go` compaction planner and bases routing on selected rew
 
 - selected input is greater than 512 MiB;
 - more than 250 selected input files (data plus delete files) are involved;
-- more than 100 equality-delete files are involved;
-- position-delete files are present;
+- more than 100 equality-delete files are involved.
 
-Otherwise the rewrite runs natively. It becomes eligible when the current
-snapshot has 200 active small files, 50 active equality-delete files, or at
-least 10 small files totaling 256 MiB. Every result records the actual `engine`
-and `routing_reason`.
+Otherwise the rewrite runs natively. Position-delete files make a table
+eligible after `position_delete_files_threshold` is reached, but do not by
+themselves force a small rewrite to Spark. It also becomes eligible when the
+current snapshot has 200 active small files, 50 active equality-delete files,
+or at least 10 small files totaling 256 MiB. Every result records the actual
+`engine` and `routing_reason`.
 
 ### `executor: native`
 
@@ -249,8 +250,9 @@ Recommended rollout:
 ## Current limitations
 
 - Native sort/Z-order is not implemented; use Spark for those strategies.
-- Hybrid mode routes position-delete work, more than 100 equality deletes, and
-  workloads beyond the native file/byte limits to Spark. Native mode skips
-  those workloads instead of bypassing its safety limits.
+- Hybrid mode routes more than 100 equality deletes and workloads beyond the
+  native file/byte limits to Spark. Position-delete work stays native while it
+  remains within those safety limits. Native mode skips workloads beyond its
+  safety limits instead of routing them to Spark.
 - Heavy Spark execution keeps the existing per-table runner/Spark submission behavior.
 - Native rewrite output is committed atomically, but exact per-attempt uncommitted output paths are not exposed by the current high-level `iceberg-go` rewrite API; the seven-day orphan-cleanup safety window protects cleanup.

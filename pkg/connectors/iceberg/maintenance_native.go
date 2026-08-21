@@ -364,8 +364,8 @@ func compactionTriggersFor(state meta.IcebergMaintenanceState, settings nativeMa
 		EqualityDelete: settings.EqualityDeleteThreshold > 0 && state.ActiveEqualityDeleteFiles >= settings.EqualityDeleteThreshold,
 		// Trino snapshot replacement intentionally leaves a small number of
 		// position-delete files while it replaces the recent history window.
-		// They are handled by Spark after the per-table threshold is reached,
-		// rather than causing one Spark job for every initial snapshot.
+		// Make the table eligible only after the per-table threshold is reached;
+		// engine routing is decided separately from the selected workload size.
 		PositionDelete: settings.PositionDeleteThreshold > 0 && state.ActivePositionDeleteFiles >= settings.PositionDeleteThreshold,
 	}
 }
@@ -639,10 +639,7 @@ func buildCompactionWorkload(plan compaction.Plan) compactionWorkload {
 
 func shouldRouteCompactionToSpark(work compactionWorkload, state meta.IcebergMaintenanceState, settings nativeMaintenanceSettings) (bool, string) {
 	equalityDeletes := maxInt(work.EqualityDeletes, state.ActiveEqualityDeleteFiles)
-	positionDeletes := maxInt(work.PositionDeletes, state.ActivePositionDeleteFiles)
 	switch {
-	case settings.PositionDeleteThreshold > 0 && positionDeletes >= settings.PositionDeleteThreshold:
-		return true, fmt.Sprintf("position-delete files %d reached threshold %d", positionDeletes, settings.PositionDeleteThreshold)
 	case equalityDeletes > settings.MaxEqualityDeleteFiles:
 		return true, fmt.Sprintf("equality-delete files %d exceed native limit %d", equalityDeletes, settings.MaxEqualityDeleteFiles)
 	case work.SelectedBytes > settings.MaxSelectedInputBytes:
