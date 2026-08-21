@@ -62,9 +62,16 @@ func (s *Server) durableIcebergMaintenanceView(ctx context.Context, job *core.Jo
 	if job == nil || job.Config == nil || job.Config.Sink == nil || !strings.EqualFold(strings.TrimSpace(job.Config.Sink.Type), "iceberg_native") {
 		return nil, nil
 	}
+	return s.durableIcebergMaintenanceConfigView(ctx, job.Config, job.Config.ID, false)
+}
+
+func (s *Server) durableIcebergMaintenanceConfigView(ctx context.Context, jobCfg *config.JobConfig, ownerID string, paused bool) (map[string]any, error) {
+	if jobCfg == nil || jobCfg.Sink == nil || !strings.EqualFold(strings.TrimSpace(jobCfg.Sink.Type), "iceberg_native") {
+		return nil, nil
+	}
 
 	var icebergCfg config.IcebergConfig
-	if raw, err := yaml.Marshal(job.Config.Sink.Config); err == nil {
+	if raw, err := yaml.Marshal(jobCfg.Sink.Config); err == nil {
 		_ = yaml.Unmarshal(raw, &icebergCfg)
 	}
 	tm := icebergCfg.TableMaintenance
@@ -73,11 +80,11 @@ func (s *Server) durableIcebergMaintenanceView(ctx context.Context, job *core.Jo
 	if err != nil {
 		return nil, err
 	}
-	states, err := store.ListStatesForOwner(ctx, job.Config.ID, 5000)
+	states, err := store.ListStatesForOwner(ctx, ownerID, 5000)
 	if err != nil {
 		return nil, err
 	}
-	summary, err := store.SummaryForOwner(ctx, job.Config.ID)
+	summary, err := store.SummaryForOwner(ctx, ownerID)
 	if err != nil {
 		return nil, err
 	}
@@ -183,9 +190,9 @@ func (s *Server) durableIcebergMaintenanceView(ctx context.Context, job *core.Jo
 			"eligible_small_bytes":         state.ActiveSmallBytes,
 			"new_data_files":               state.NewDataFiles,
 			"new_equality_delete_files":    state.NewEqualityDeleteFiles,
-			"checked_at":                    checkedAt,
-			"error":                         state.LastError,
-			"operations":                    []string{},
+			"checked_at":                   checkedAt,
+			"error":                        state.LastError,
+			"operations":                   []string{},
 		})
 	}
 
@@ -210,6 +217,14 @@ func (s *Server) durableIcebergMaintenanceView(ctx context.Context, job *core.Jo
 	case summary.QueuedTasks > 0 || summary.RetryTasks > 0 || tablesReady > 0:
 		state = "ready"
 	}
+	if paused {
+		state = "paused"
+	}
+
+	tablesTotal := summary.Tables
+	if len(tm.Tables) > tablesTotal {
+		tablesTotal = len(tm.Tables)
+	}
 
 	checkedAt := ""
 	if !latest.IsZero() {
@@ -233,12 +248,12 @@ func (s *Server) durableIcebergMaintenanceView(ctx context.Context, job *core.Jo
 		"active_position_delete_files":    activePositionDeletes,
 		"eligible_small_files":            eligibleSmallFiles,
 		"eligible_small_bytes":            eligibleSmallBytes,
-		"tables_total":                    summary.Tables,
+		"tables_total":                    tablesTotal,
 		"tables_scanned":                  tablesScanned,
 		"tables_ready":                    tablesReady,
 		"active_runs":                     summary.ActiveLeases,
 		"inventory_errors":                inventoryErrors,
-		"paused":                          false,
+		"paused":                          paused,
 		"checked_at":                      checkedAt,
 		"tables":                          tables,
 	}, nil

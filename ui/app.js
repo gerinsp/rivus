@@ -39,6 +39,7 @@ import {
 import { closeErrorsModal, initErrors, refreshErrors, showErrors } from './errors.js';
 import {
   clearMaintenanceMonitorYaml,
+  closeMaintenanceMonitorDetails,
   closeMaintenanceMonitorModal,
   initMaintenanceMonitors,
   loadMaintenanceMonitorFile,
@@ -189,6 +190,7 @@ function installCompatibilityGlobals() {
     openMaintenanceMonitorModal,
     closeMaintenanceMonitorModal,
     clearMaintenanceMonitorYaml,
+    closeMaintenanceMonitorDetails,
     loadMaintenanceMonitorFile,
     submitMaintenanceMonitor,
   });

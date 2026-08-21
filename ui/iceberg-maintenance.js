@@ -32,6 +32,7 @@ function maintenanceStateLabel(state) {
     running: 'Maintenance running',
     inventory_pending: 'Waiting for inventory scan',
     healthy: 'Healthy',
+    paused: 'Paused',
     error: 'Inventory error',
     disabled: 'Disabled',
   };
@@ -47,6 +48,8 @@ function maintenanceStateClass(state) {
       return 'border-amber-200 bg-amber-50 text-amber-700';
     case 'ready':
       return 'border-amber-200 bg-amber-50 text-amber-700';
+    case 'paused':
+      return 'border-violet-200 bg-violet-50 text-violet-700';
     case 'error':
       return 'border-rose-200 bg-rose-50 text-rose-700';
     case 'healthy':
@@ -83,30 +86,30 @@ function maintenanceMetric(label, value, detail) {
   `;
 }
 
-function workerConfigStrip(job, enabled) {
+function workerConfigStrip(job, enabled, paused = false) {
   const executor = maintenanceExecutor(job, enabled);
   const executorLabel = executor === '-' ? '-' : executor.charAt(0).toUpperCase() + executor.slice(1);
   return `
     <div class="grid gap-3 border-b border-slate-200 bg-slate-50 px-5 py-4 sm:grid-cols-3 sm:px-6">
-      ${maintenanceMetric('Automatic maintenance', enabled ? 'Enabled' : 'Disabled', enabled ? 'Durable worker scheduling is active' : 'No automatic tasks are scheduled')}
+      ${maintenanceMetric('Automatic maintenance', paused ? 'Paused' : enabled ? 'Enabled' : 'Disabled', paused ? 'Scheduling is temporarily stopped' : enabled ? 'Durable worker scheduling is active' : 'No automatic tasks are scheduled')}
       ${maintenanceMetric('Scheduler', 'Maintenance Worker', 'CDC only emits lightweight maintenance signals')}
       ${maintenanceMetric('Executor', executorLabel, 'Compaction policy; cleanup operations stay native')}
     </div>
   `;
 }
 
-function historyLink(job) {
-  const jobID = String(job?.id || '').trim();
-  const maintenanceUI = 'https://data-platform.asmat.app';
+function historyLink(job, options = {}) {
+  const jobID = String(options.historyOwnerID || job?.id || '').trim();
+  const maintenanceUI = String(options.maintenanceUI || 'https://data-platform.asmat.app').replace(/\/$/, '');
   const href = jobID
     ? `${maintenanceUI}/ui/admin/iceberg-maintenance/runs?job_id=${encodeURIComponent(jobID)}`
     : `${maintenanceUI}/ui/admin/iceberg-maintenance/runs`;
-  const label = jobID ? "View this job's maintenance runs" : 'View maintenance runs';
+  const label = options.historyLabel || (jobID ? "View this job's maintenance runs" : 'View maintenance runs');
   return `<a href="${href}" target="_blank" rel="noopener noreferrer" class="brand-outline-btn rounded-md px-3 py-1.5 text-xs font-semibold">${label}</a>`;
 }
 
 export function renderIcebergMaintenance(job, options = {}) {
-  const panel = document.getElementById('icebergMaintenancePanel');
+  const panel = options.panel || document.getElementById('icebergMaintenancePanel');
   if (!panel) return;
 
   const sinkType = String(job?.sink_type || job?.config?.sink?.type || '').trim().toLowerCase();
@@ -148,6 +151,7 @@ export function renderIcebergMaintenance(job, options = {}) {
   }
 
   const state = String(maintenance.state || 'watching');
+  const paused = state.toLowerCase() === 'paused' || maintenance.paused === true;
   const tables = Array.isArray(maintenance.tables) ? [...maintenance.tables] : [];
   const stateOrder = { running: 0, ready: 1, error: 2, accumulating: 3, scanning: 4, waiting_for_snapshot: 5, healthy: 6 };
   tables.sort((left, right) => {
@@ -203,14 +207,16 @@ export function renderIcebergMaintenance(job, options = {}) {
   const checkedAt = maintenance.checked_at ? formatDateTime(maintenance.checked_at) : 'Waiting for first scan';
   const scanned = `${fmtWholeNumber(maintenance.tables_scanned || 0)} / ${fmtWholeNumber(maintenance.tables_total || 0)} tables scanned`;
   const errors = Number(maintenance.inventory_errors || 0);
-  const inventoryNotice = state === 'waiting_for_snapshot'
+  const inventoryNotice = state === 'paused'
+    ? 'This maintenance monitor is paused. Existing inventory remains visible, but automatic scans and maintenance runs will not be scheduled.'
+    : state === 'waiting_for_snapshot'
     ? 'Initial snapshot is still running. The maintenance worker waits for the snapshot barrier; file counts refresh after the snapshot completes.'
     : errors > 0
       ? `${fmtWholeNumber(errors)} table inventory scan(s) failed. Other table counts remain available below.`
       : 'Counts come from active files in the current Iceberg snapshot, not every object stored in S3.';
   const inventoryTone = errors > 0
     ? 'border-rose-200 bg-rose-50 text-rose-700'
-    : state === 'waiting_for_snapshot'
+    : state === 'waiting_for_snapshot' || state === 'paused'
       ? 'border-amber-200 bg-amber-50 text-amber-800'
       : 'border-slate-200 bg-slate-50 text-slate-600';
 
@@ -225,13 +231,13 @@ export function renderIcebergMaintenance(job, options = {}) {
           <span class="rounded-full border px-3 py-1.5 text-xs font-semibold ${maintenanceStateClass(state)}">${escapeHtml(maintenanceStateLabel(state))}</span>
           <span class="rounded-full border border-slate-200 bg-white px-3 py-1.5 text-[11px] font-semibold text-slate-600">${escapeHtml(scanned)}</span>
           <button type="button" data-maintenance-inventory-refresh class="brand-outline-btn rounded-md px-3 py-1.5 text-xs font-semibold">Refresh inventory</button>
-          ${historyLink(job)}
+          ${historyLink(job, options)}
         </div>
       </div>
       <div class="mt-3 text-xs text-slate-500">Last successful inventory check: <span class="font-semibold text-slate-700">${escapeHtml(checkedAt)}</span></div>
     </div>
 
-    ${workerConfigStrip(job, configuredEnabled)}
+    ${workerConfigStrip(job, configuredEnabled, paused)}
 
     <div class="grid gap-3 bg-slate-50 px-5 py-4 sm:grid-cols-2 xl:grid-cols-5 sm:px-6">
       ${maintenanceMetric('Active data files', fmtWholeNumber(maintenance.active_data_files || 0), 'Currently referenced')}

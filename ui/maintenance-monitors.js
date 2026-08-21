@@ -7,9 +7,11 @@ import {
   setModalState,
   statusPill,
 } from './core/api.js';
+import { renderIcebergMaintenance } from './iceberg-maintenance.js';
 
 let refreshDashboard = async () => {};
 let initialized = false;
+let currentMonitorDetailID = '';
 
 export function initMaintenanceMonitors(handlers = {}) {
   refreshDashboard = handlers.refreshDashboard || refreshDashboard;
@@ -41,6 +43,7 @@ function monitorActions(monitor) {
   const base = 'whitespace-nowrap rounded-md border px-3 py-2 text-xs font-semibold transition';
   return `
     <div class="flex min-w-max flex-nowrap items-center justify-end gap-2">
+      <button type="button" class="${base} border-slate-300 text-slate-800 hover:bg-slate-50" data-monitor-action="details" data-monitor-id="${id}">Details</button>
       <button type="button" class="${base} border-blue-200 text-blue-800 hover:bg-blue-50" data-monitor-action="run" data-monitor-id="${id}" ${active ? '' : 'disabled'}>Run now</button>
       ${active
         ? `<button type="button" class="${base} border-violet-200 text-violet-800 hover:bg-violet-50" data-monitor-action="pause" data-monitor-id="${id}">Pause</button>`
@@ -87,6 +90,10 @@ export async function loadMaintenanceMonitors() {
     document.querySelectorAll('[data-bind="maintenance-monitor-count"]').forEach((el) => {
       el.textContent = String(monitors.length);
     });
+    const detail = document.getElementById('maintenanceMonitorDetail');
+    if (currentMonitorDetailID && detail && !detail.classList.contains('hidden')) {
+      await showMaintenanceMonitorDetails(currentMonitorDetailID);
+    }
   } catch (error) {
     setNotice(error.message, 'error');
   }
@@ -105,6 +112,17 @@ async function handleMonitorAction(event) {
   const action = button.dataset.monitorAction;
   const id = button.dataset.monitorId;
   if (!id || !action) return;
+  if (action === 'details') {
+    button.disabled = true;
+    try {
+      await showMaintenanceMonitorDetails(id);
+    } catch (error) {
+      setNotice(error.message, 'error');
+    } finally {
+      button.disabled = false;
+    }
+    return;
+  }
   if (action === 'delete' && !confirm(`Delete maintenance monitor ${id}? Iceberg table data and run history will be preserved.`)) return;
   button.disabled = true;
   try {
@@ -123,6 +141,64 @@ async function handleMonitorAction(event) {
   } finally {
     button.disabled = false;
   }
+}
+
+export async function showMaintenanceMonitorDetails(id) {
+  const response = await apiFetch(`/api/iceberg/maintenance/monitors/${encodeURIComponent(id)}`);
+  const monitor = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(monitor.error || `Unable to load monitor details (${response.status})`);
+
+  const list = document.getElementById('maintenanceMonitorList');
+  const detail = document.getElementById('maintenanceMonitorDetail');
+  const panel = document.getElementById('maintenanceMonitorDetailPanel');
+  if (!detail || !panel) return;
+
+  currentMonitorDetailID = id;
+
+  document.getElementById('maintenanceMonitorDetailName').textContent = monitor.name || monitor.id || 'Maintenance monitor';
+  document.getElementById('maintenanceMonitorDetailID').textContent = monitor.id || '-';
+  document.getElementById('maintenanceMonitorDetailStatus').innerHTML = statusPill(monitor.status);
+  list?.classList.add('hidden');
+  detail.classList.remove('hidden');
+
+  const maintenance = monitor.maintenance || {
+    enabled: true,
+    state: 'inventory_pending',
+    tables_total: Number(monitor.table_count || 0),
+    tables_scanned: 0,
+    tables: [],
+  };
+  const job = {
+    id: `monitor:${monitor.id}`,
+    sink_type: 'iceberg_native',
+    config: {
+      sink: {
+        type: 'iceberg_native',
+        config: {
+          table_maintenance: {
+            enabled: true,
+            executor: monitor.executor || 'hybrid',
+          },
+        },
+      },
+    },
+    iceberg_maintenance: maintenance,
+  };
+  renderIcebergMaintenance(job, {
+    panel,
+    historyOwnerID: `monitor:${monitor.id}`,
+    historyLabel: "View this monitor's maintenance runs",
+    onRefreshInventory: async () => {
+      await mutateMonitor(monitor.id, 'run');
+      await showMaintenanceMonitorDetails(monitor.id);
+    },
+  });
+}
+
+export function closeMaintenanceMonitorDetails() {
+  currentMonitorDetailID = '';
+  document.getElementById('maintenanceMonitorDetail')?.classList.add('hidden');
+  document.getElementById('maintenanceMonitorList')?.classList.remove('hidden');
 }
 
 export function openMaintenanceMonitorModal() {
@@ -184,4 +260,3 @@ export async function submitMaintenanceMonitor() {
     button.disabled = false;
   }
 }
-

@@ -495,7 +495,7 @@
     </section>
 
     <section id="maintenanceMonitorsView" class="mt-6 hidden space-y-5">
-      <div class="panel overflow-hidden rounded-[20px]">
+      <div id="maintenanceMonitorList" class="panel overflow-hidden rounded-[20px]">
         <div class="flex flex-col gap-4 border-b border-slate-200 px-5 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-6">
           <div>
             <div class="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">Iceberg Operations</div>
@@ -540,6 +540,22 @@
             </div>
           </div>
         </div>
+      </div>
+
+      <div id="maintenanceMonitorDetail" class="hidden space-y-4">
+        <div class="panel flex flex-col gap-4 rounded-[20px] px-5 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-6">
+          <div class="flex min-w-0 items-center gap-4">
+            <button type="button" class="brand-outline-btn shrink-0 rounded-md px-3 py-2 text-sm font-semibold" onclick="closeMaintenanceMonitorDetails()">
+              Back to monitors
+            </button>
+            <div class="min-w-0">
+              <div id="maintenanceMonitorDetailName" class="truncate text-lg font-semibold text-slate-900">Maintenance monitor</div>
+              <div id="maintenanceMonitorDetailID" class="mono mt-1 truncate text-xs text-slate-500">-</div>
+            </div>
+          </div>
+          <div id="maintenanceMonitorDetailStatus"></div>
+        </div>
+        <div id="maintenanceMonitorDetailPanel" class="panel overflow-hidden rounded-[20px]"></div>
       </div>
     </section>
 
@@ -817,6 +833,6 @@
     </div>
   </div>
 
-  <script type="module" src="app.js?v=9"></script>
+  <script type="module" src="app.js?v=10"></script>
 </body>
 </html>

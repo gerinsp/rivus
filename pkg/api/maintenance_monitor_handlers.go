@@ -37,6 +37,7 @@ type maintenanceMonitorView struct {
 	LastError       string                        `json:"last_error,omitempty"`
 	CreatedAt       time.Time                     `json:"created_at"`
 	UpdatedAt       time.Time                     `json:"updated_at"`
+	Maintenance     map[string]any                `json:"maintenance,omitempty"`
 }
 
 func (s *Server) handleMaintenanceMonitors(w http.ResponseWriter, r *http.Request) {
@@ -135,6 +136,16 @@ func (s *Server) handleMaintenanceMonitor(w http.ResponseWriter, r *http.Request
 	if err != nil {
 		maintenanceAPIError(w, err, http.StatusInternalServerError)
 		return
+	}
+	if s.maintenanceMonitors == nil {
+		detail, detailErr := s.durableIcebergMaintenanceConfigView(
+			r.Context(), monitor.Config, meta.MaintenanceMonitorOwnerID(monitor.ID), monitor.Status == meta.MaintenanceMonitorPaused,
+		)
+		if detailErr != nil {
+			maintenanceAPIError(w, detailErr, http.StatusInternalServerError)
+			return
+		}
+		view.Maintenance = detail
 	}
 	maintenanceAPIJSON(w, http.StatusOK, view)
 }

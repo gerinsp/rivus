@@ -37,7 +37,7 @@ jobs:
             ui/errors.js; do
             node --input-type=module --check < "$file"
           done
-          grep -q '<script type="module" src="app.js?v=9"></script>' ui/index.html
+          grep -q '<script type="module" src="app.js?v=10"></script>' ui/index.html
           ! grep -q 'maintenance-ui.js' ui/index.html
 
       - name: Test
