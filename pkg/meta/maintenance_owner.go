@@ -17,6 +17,7 @@ type IcebergMaintenanceOwnerSummary struct {
 	RetryTasks         int        `json:"retry_tasks"`
 	ActiveLeases       int        `json:"active_leases"`
 	FailedTasks        int        `json:"failed_tasks"`
+	FailedTables       int        `json:"failed_tables"`
 	OldestQueuedAt     *time.Time `json:"oldest_queued_at,omitempty"`
 	OldestQueuedAgeSec int64      `json:"oldest_queued_age_seconds"`
 }
@@ -77,6 +78,17 @@ func (s *IcebergMaintenanceStore) SummaryForOwner(ctx context.Context, ownerJobI
 	FROM iceberg_maintenance_tasks WHERE owner_job_id=?`, ownerJobID).Scan(
 		&out.QueuedTasks, &out.RetryTasks, &out.ActiveLeases, &out.FailedTasks, &oldest,
 	); err != nil && err != sql.ErrNoRows {
+		return out, err
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(DISTINCT task.table_key)
+	FROM iceberg_maintenance_tasks task
+	JOIN (
+		SELECT table_key, operation, MAX(id) AS id
+		FROM iceberg_maintenance_tasks
+		WHERE owner_job_id=?
+		GROUP BY table_key, operation
+	) latest ON latest.id=task.id
+	WHERE task.status='failed'`, ownerJobID).Scan(&out.FailedTables); err != nil {
 		return out, err
 	}
 	if oldest.Valid {

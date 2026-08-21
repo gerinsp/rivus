@@ -132,6 +132,7 @@ type IcebergMaintenanceSummary struct {
 	RetryTasks         int        `json:"retry_tasks"`
 	ActiveLeases       int        `json:"active_leases"`
 	FailedTasks        int        `json:"failed_tasks"`
+	FailedTables       int        `json:"failed_tables"`
 	OldestQueuedAt     *time.Time `json:"oldest_queued_at,omitempty"`
 	OldestQueuedAgeSec int64      `json:"oldest_queued_age_seconds"`
 }
@@ -970,10 +971,20 @@ func (s *IcebergMaintenanceStore) Summary(ctx context.Context, now time.Time) (I
 	}
 	var oldest sql.NullTime
 	if err := s.db.QueryRowContext(ctx, `SELECT
-	 COALESCE(SUM(status='queued'),0), COALESCE(SUM(status='retry'),0),
-	 COALESCE(SUM(status='leased' AND lease_until > UTC_TIMESTAMP(6)),0), COALESCE(SUM(status='failed'),0),
+		 COALESCE(SUM(status='queued'),0), COALESCE(SUM(status='retry'),0),
+		 COALESCE(SUM(status='leased' AND lease_until > UTC_TIMESTAMP(6)),0), COALESCE(SUM(status='failed'),0),
 	 MIN(CASE WHEN status IN ('queued','retry') THEN created_at END)
 	FROM iceberg_maintenance_tasks`).Scan(&out.QueuedTasks, &out.RetryTasks, &out.ActiveLeases, &out.FailedTasks, &oldest); err != nil {
+		return out, err
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(DISTINCT task.table_key)
+	FROM iceberg_maintenance_tasks task
+	JOIN (
+		SELECT table_key, operation, MAX(id) AS id
+		FROM iceberg_maintenance_tasks
+		GROUP BY table_key, operation
+	) latest ON latest.id=task.id
+	WHERE task.status='failed'`).Scan(&out.FailedTables); err != nil {
 		return out, err
 	}
 	if oldest.Valid {

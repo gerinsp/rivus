@@ -188,7 +188,11 @@ async function load() {
       metric('Queued', fmt.format(summary.queued_tasks || 0), 'Waiting for a worker lease'),
       metric('Retrying', fmt.format(summary.retry_tasks || 0), 'Retryable worker tasks'),
       metric('Running', fmt.format(summary.active_leases || 0), 'Active durable leases'),
-      metric('Failed', fmt.format(summary.failed_tasks || 0), 'Terminal task failures'),
+      metric(
+        summary.failed_tables == null ? 'Terminal failures' : 'Failed tables',
+        fmt.format(summary.failed_tables ?? summary.failed_tasks ?? 0),
+        summary.failed_tables == null ? 'All-time terminal task failures' : 'Latest task for an operation failed terminally',
+      ),
       metric('Oldest queue age', summary.oldest_queued_age_seconds ? `${fmt.format(summary.oldest_queued_age_seconds)} s` : '0 s', summary.oldest_queued_at ? dateText(summary.oldest_queued_at) : 'Queue is clear'),
     ].join('');
     renderRuns(payload);
