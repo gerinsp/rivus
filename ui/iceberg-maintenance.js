@@ -191,7 +191,7 @@ export function renderIcebergMaintenance(job, options = {}) {
         <td class="px-4 py-3 text-xs text-slate-600">
           <div>Small: <span class="mono font-semibold text-slate-800">${fmtWholeNumber(table?.eligible_small_files || 0)} / ${fmtWholeNumber(dataThreshold)}</span></div>
           <div class="mt-1">Equality: <span class="mono font-semibold text-slate-800">${fmtWholeNumber(table?.active_equality_delete_files || 0)} / ${fmtWholeNumber(deleteThreshold)}</span></div>
-          <div class="mt-1">Position: <span class="mono font-semibold text-slate-800">${fmtWholeNumber(table?.active_position_delete_files || 0)} / ${fmtWholeNumber(positionDeleteThreshold)}</span>${Number(table?.active_position_delete_files || 0) >= positionDeleteThreshold ? ' <span class="text-amber-700">→ Spark</span>' : ''}</div>
+          <div class="mt-1">Position: <span class="mono font-semibold text-slate-800">${fmtWholeNumber(table?.active_position_delete_files || 0)} / ${fmtWholeNumber(positionDeleteThreshold)}</span></div>
         </td>
         <td class="px-4 py-3">
           <span class="inline-flex rounded-full border px-2.5 py-1 text-[11px] font-semibold ${maintenanceStateClass(table?.state)}">${escapeHtml(maintenanceStateLabel(table?.state))}</span>
