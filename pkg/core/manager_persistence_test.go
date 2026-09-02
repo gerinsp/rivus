@@ -1543,6 +1543,53 @@ func TestPreflightInitialCountResumePerformsSafeFullReload(t *testing.T) {
 	}
 }
 
+func TestPreflightFreshDorisInitialSnapshotResetsTargets(t *testing.T) {
+	cfg := newTestJobConfig("job-doris-authoritative-initial")
+	cfg.Mode = config.JobModeInitial
+	cfg.Sink = &config.ConnectorSpec{Type: "doris", Config: map[string]any{}}
+	job := NewJob(cfg, connector.NewRegistry())
+
+	src := &countResumeSource{
+		tables: []connector.TableRef{
+			{Schema: "app", Table: "orders"},
+			{Schema: "app", Table: "customers"},
+		},
+	}
+	sink := &authoritativeCountResumeSink{countResumeSink: &countResumeSink{}}
+
+	if err := job.preflight(context.Background(), src, sink, config.JobModeInitial); err != nil {
+		t.Fatalf("preflight returned error: %v", err)
+	}
+	if got, want := len(sink.resetTargets), 2; got != want {
+		t.Fatalf("reset targets = %d, want %d (%#v)", got, want, sink.resetTargets)
+	}
+	reset := map[string]bool{}
+	for _, target := range sink.resetTargets {
+		reset[target] = true
+	}
+	for _, target := range []string{"target.orders", "target.customers"} {
+		if !reset[target] {
+			t.Fatalf("target %q was not reset: %#v", target, sink.resetTargets)
+		}
+	}
+}
+
+func TestPreflightDorisResumeDoesNotResetTargets(t *testing.T) {
+	cfg := newTestJobConfig("job-doris-resume")
+	cfg.Sink = &config.ConnectorSpec{Type: "doris", Config: map[string]any{}}
+	job := NewJob(cfg, connector.NewRegistry())
+
+	src := &countResumeSource{tables: []connector.TableRef{{Schema: "app", Table: "orders"}}}
+	sink := &authoritativeCountResumeSink{countResumeSink: &countResumeSink{}}
+
+	if err := job.preflight(context.Background(), src, sink, config.JobModeResume); err != nil {
+		t.Fatalf("preflight returned error: %v", err)
+	}
+	if len(sink.resetTargets) != 0 {
+		t.Fatalf("resume reset targets = %#v, want none", sink.resetTargets)
+	}
+}
+
 func TestPreflightSnapshotOnlyCountResumeAggregatesFanInTargets(t *testing.T) {
 	cfg := newTestJobConfig("job-count-resume-fan-in")
 	cfg.Mode = config.JobModeSnapshotOnly
@@ -2119,6 +2166,14 @@ type countResumeSink struct {
 	skipWithoutPK bool
 	ensured       []string
 	resetTargets  []string
+}
+
+type authoritativeCountResumeSink struct {
+	*countResumeSink
+}
+
+func (s *authoritativeCountResumeSink) RequiresInitialSnapshotReset() bool {
+	return true
 }
 
 func (s *countResumeSink) Run(context.Context, <-chan model.Event) error {

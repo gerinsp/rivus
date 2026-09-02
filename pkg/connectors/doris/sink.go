@@ -77,6 +77,7 @@ type Sink struct {
 	mu             sync.RWMutex
 	columns        map[string][]string        // key "db.table" -> target cols order
 	columnBindings map[string][]columnBinding // key "db.table" -> source->target cols order
+	primaryKeys    map[string][]string        // key "db.table" -> source primary-key columns
 
 	maxLen   map[string]map[string]int  // "db.table" -> col -> max chars (varchar/char)
 	isString map[string]map[string]bool // "db.table" -> col -> string-ish
@@ -145,6 +146,7 @@ func NewSink(jobID, stateKey string, cfg config.DorisConfig, retry config.RetryP
 		sqlDB:          db,
 		columns:        make(map[string][]string),
 		columnBindings: make(map[string][]columnBinding),
+		primaryKeys:    make(map[string][]string),
 		maxLen:         make(map[string]map[string]int),
 		isString:       make(map[string]map[string]bool),
 	}, nil
@@ -414,6 +416,11 @@ func (s *Sink) EnsureTable(ctx context.Context, targetDB, targetTable string, sc
 	s.mu.Lock()
 	s.columns[key] = colsOrder
 	s.columnBindings[key] = bindings
+	primaryKeys := make([]string, 0, len(pkIdx))
+	for i := 0; i < len(pkIdx); i++ {
+		primaryKeys = append(primaryKeys, bindings[i].Source)
+	}
+	s.primaryKeys[key] = primaryKeys
 	s.mu.Unlock()
 
 	if err := util.RetryWithBackoff(ctx, s.retry, func() error {
@@ -801,6 +808,102 @@ func batchTraceSummary(batch []model.Event) string {
 	return out
 }
 
+type preparedDorisEvent struct {
+	event model.Event
+	pos   int
+}
+
+// prepareBatch converts sink-independent CDC semantics into Doris row
+// operations. In particular, a MySQL UPDATE that changes any primary-key
+// column must delete the old key before upserting the AFTER image. It also
+// collapses multiple operations for one key so a Stream Load contains one
+// deterministic final operation per key.
+func (s *Sink) prepareBatch(targetDB, targetTable string, batch []model.Event) ([]model.Event, error) {
+	if len(batch) == 0 {
+		return nil, nil
+	}
+
+	targetKey := strings.ToLower(targetDB + "." + targetTable)
+	s.mu.RLock()
+	pkCols := append([]string(nil), s.primaryKeys[targetKey]...)
+	s.mu.RUnlock()
+	if len(pkCols) == 0 {
+		return batch, nil
+	}
+
+	preparedByKey := make(map[string]preparedDorisEvent, len(batch))
+	pos := 0
+	remember := func(ev model.Event) error {
+		key, err := dorisEventKey(ev.Data, pkCols)
+		if err != nil {
+			return fmt.Errorf("prepare Doris %s for %s: %w", ev.Type, targetKey, err)
+		}
+		preparedByKey[key] = preparedDorisEvent{event: ev, pos: pos}
+		pos++
+		return nil
+	}
+
+	for _, ev := range batch {
+		if ev.Type == model.EventTypeUpdate && ev.OldData != nil {
+			oldKey, err := dorisEventKey(ev.OldData, pkCols)
+			if err != nil {
+				return nil, fmt.Errorf("prepare Doris UPDATE old key for %s: %w", targetKey, err)
+			}
+			newKey, err := dorisEventKey(ev.Data, pkCols)
+			if err != nil {
+				return nil, fmt.Errorf("prepare Doris UPDATE new key for %s: %w", targetKey, err)
+			}
+			if oldKey != newKey {
+				deleteEvent := ev
+				deleteEvent.Type = model.EventTypeDelete
+				deleteEvent.Data = ev.OldData
+				deleteEvent.OldData = nil
+				if err := remember(deleteEvent); err != nil {
+					return nil, err
+				}
+			}
+		}
+		if err := remember(ev); err != nil {
+			return nil, err
+		}
+	}
+
+	prepared := make([]preparedDorisEvent, 0, len(preparedByKey))
+	for _, ev := range preparedByKey {
+		prepared = append(prepared, ev)
+	}
+	sort.Slice(prepared, func(i, j int) bool { return prepared[i].pos < prepared[j].pos })
+
+	out := make([]model.Event, 0, len(prepared))
+	for _, ev := range prepared {
+		out = append(out, ev.event)
+	}
+	return out, nil
+}
+
+func dorisEventKey(row map[string]interface{}, pkCols []string) (string, error) {
+	if row == nil {
+		return "", fmt.Errorf("row is nil")
+	}
+
+	values := make([]interface{}, 0, len(pkCols))
+	for _, col := range pkCols {
+		value, ok := row[col]
+		if !ok {
+			return "", fmt.Errorf("primary-key column %q is missing", col)
+		}
+		if value == nil {
+			return "", fmt.Errorf("primary-key column %q is NULL", col)
+		}
+		values = append(values, value)
+	}
+	raw, err := json.Marshal(values)
+	if err != nil {
+		return "", fmt.Errorf("encode primary key: %w", err)
+	}
+	return string(raw), nil
+}
+
 func (s *Sink) sendBatch(ctx context.Context, targetDB, targetTable string, batch []model.Event) error {
 	if len(batch) == 0 {
 		return nil
@@ -971,10 +1074,14 @@ func (s *Sink) recordDorisSinkFlush(batch []model.Event, targetTable string, dur
 }
 
 func (s *Sink) sendBatchForRun(ctx context.Context, targetDB, targetTable string, batch []model.Event) error {
-	if s.sendBatchOverride != nil {
-		return s.sendBatchOverride(ctx, targetDB, targetTable, batch)
+	prepared, err := s.prepareBatch(targetDB, targetTable, batch)
+	if err != nil {
+		return err
 	}
-	return s.sendBatch(ctx, targetDB, targetTable, batch)
+	if s.sendBatchOverride != nil {
+		return s.sendBatchOverride(ctx, targetDB, targetTable, prepared)
+	}
+	return s.sendBatch(ctx, targetDB, targetTable, prepared)
 }
 
 type dorisRunState struct {

@@ -97,6 +97,10 @@ func (a *sinkAdapter) ResetTargetTable(ctx context.Context, targetSchema, target
 	return a.inner.ResetTargetTable(ctx, targetSchema, targetTable)
 }
 
+func (a *sinkAdapter) RequiresInitialSnapshotReset() bool {
+	return true
+}
+
 func decodeDorisSourceConfig(v any) (SourceConfig, error) {
 	switch t := v.(type) {
 	case SourceConfig:

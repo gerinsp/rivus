@@ -161,3 +161,9 @@ type TargetTableRowCounter interface {
 type TargetTableResetter interface {
 	ResetTargetTable(ctx context.Context, targetSchema, targetTable string) error
 }
+
+// AuthoritativeInitialSnapshot marks sinks whose fresh initial snapshot must
+// replace, rather than only upsert into, the existing target contents.
+type AuthoritativeInitialSnapshot interface {
+	RequiresInitialSnapshotReset() bool
+}

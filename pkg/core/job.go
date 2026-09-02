@@ -1154,7 +1154,11 @@ func (j *Job) preflight(ctx context.Context, src connector.Source, sink connecto
 	sp, hasSP := src.(connector.SchemaProvider)
 	tm, hasTM := sink.(connector.TableManager)
 	sc, hasSC := sink.(connector.SchemaConsumer)
-	safeSnapshotReload := snapshotCountResumeSupported(mode) && snapshotOnlyCountResumeEnabled(j.Config.Metadata)
+	authoritativeSink, hasAuthoritativeInitialSnapshot := sink.(connector.AuthoritativeInitialSnapshot)
+	freshAuthoritativeSnapshot := hasAuthoritativeInitialSnapshot && authoritativeSink.RequiresInitialSnapshotReset() &&
+		(mode == config.JobModeInitial || mode == config.JobModeSnapshotHandoff)
+	safeSnapshotReload := freshAuthoritativeSnapshot ||
+		(snapshotCountResumeSupported(mode) && snapshotOnlyCountResumeEnabled(j.Config.Metadata))
 	pkSkipper, skipMissingPK := sink.(connector.SnapshotPrimaryKeySkipper)
 	skipMissingPK = mode == config.JobModeSnapshotOnly && skipMissingPK
 

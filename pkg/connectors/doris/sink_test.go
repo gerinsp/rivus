@@ -140,6 +140,141 @@ func TestWriteBatchPayloadAddsDeleteMarker(t *testing.T) {
 	}
 }
 
+func TestPrepareBatchKeepsFullAfterImageForSameKeyUpdate(t *testing.T) {
+	sink := &Sink{
+		primaryKeys: map[string][]string{
+			"target.schedule": {"TglBerangkat", "IdProduk"},
+		},
+	}
+	event := model.Event{
+		Type: model.EventTypeUpdate,
+		OldData: map[string]interface{}{
+			"TglBerangkat": "2026-08-13",
+			"IdProduk":     int64(16463),
+			"IdLayout":     nil,
+		},
+		Data: map[string]interface{}{
+			"TglBerangkat":  "2026-08-13",
+			"IdProduk":      int64(16463),
+			"IdLayout":      int64(14),
+			"KodeKendaraan": "WH-14",
+			"NomorPlat":     "WH-14",
+			"IdSopir":       int64(1002),
+		},
+	}
+
+	prepared, err := sink.prepareBatch("target", "schedule", []model.Event{event})
+	if err != nil {
+		t.Fatalf("prepareBatch() returned error: %v", err)
+	}
+	if got, want := len(prepared), 1; got != want {
+		t.Fatalf("prepared events = %d, want %d", got, want)
+	}
+	if prepared[0].Type != model.EventTypeUpdate {
+		t.Fatalf("prepared type = %s, want UPDATE", prepared[0].Type)
+	}
+	if got, want := prepared[0].Data["KodeKendaraan"], "WH-14"; got != want {
+		t.Fatalf("KodeKendaraan = %v, want %v", got, want)
+	}
+	if got, want := prepared[0].Data["IdSopir"], int64(1002); got != want {
+		t.Fatalf("IdSopir = %v, want %v", got, want)
+	}
+}
+
+func TestPrepareBatchPrimaryKeyUpdateDeletesOldKeyAndUpsertsAfterImage(t *testing.T) {
+	sink := &Sink{
+		primaryKeys: map[string][]string{
+			"target.schedule": {"TglBerangkat", "IdProduk"},
+		},
+	}
+	event := model.Event{
+		Type: model.EventTypeUpdate,
+		OldData: map[string]interface{}{
+			"TglBerangkat": "2026-08-13",
+			"IdProduk":     int64(905),
+			"NomorPlat":    "WHJTG-40",
+		},
+		Data: map[string]interface{}{
+			"TglBerangkat": "2026-08-14",
+			"IdProduk":     int64(905),
+			"NomorPlat":    "WHJTG-40",
+		},
+	}
+
+	prepared, err := sink.prepareBatch("target", "schedule", []model.Event{event})
+	if err != nil {
+		t.Fatalf("prepareBatch() returned error: %v", err)
+	}
+	if got, want := len(prepared), 2; got != want {
+		t.Fatalf("prepared events = %d, want %d", got, want)
+	}
+	if prepared[0].Type != model.EventTypeDelete {
+		t.Fatalf("first prepared type = %s, want DELETE", prepared[0].Type)
+	}
+	if got, want := prepared[0].Data["TglBerangkat"], "2026-08-13"; got != want {
+		t.Fatalf("deleted key date = %v, want %v", got, want)
+	}
+	if prepared[1].Type != model.EventTypeUpdate {
+		t.Fatalf("second prepared type = %s, want UPDATE", prepared[1].Type)
+	}
+	if got, want := prepared[1].Data["TglBerangkat"], "2026-08-14"; got != want {
+		t.Fatalf("upserted key date = %v, want %v", got, want)
+	}
+}
+
+func TestPrepareBatchCollapsesMultipleEventsToLatestOperationPerKey(t *testing.T) {
+	sink := &Sink{
+		primaryKeys: map[string][]string{
+			"target.orders": {"id"},
+		},
+	}
+	batch := []model.Event{
+		{Type: model.EventTypeInsert, Data: map[string]interface{}{"id": int64(1), "status": "NEW"}},
+		{
+			Type:    model.EventTypeUpdate,
+			OldData: map[string]interface{}{"id": int64(1), "status": "NEW"},
+			Data:    map[string]interface{}{"id": int64(1), "status": "PAID"},
+		},
+		{
+			Type:    model.EventTypeUpdate,
+			OldData: map[string]interface{}{"id": int64(1), "status": "PAID"},
+			Data:    map[string]interface{}{"id": int64(1), "status": "SHIPPED"},
+		},
+		{Type: model.EventTypeInsert, Data: map[string]interface{}{"id": int64(2), "status": "NEW"}},
+		{Type: model.EventTypeDelete, Data: map[string]interface{}{"id": int64(2), "status": "NEW"}},
+	}
+
+	prepared, err := sink.prepareBatch("target", "orders", batch)
+	if err != nil {
+		t.Fatalf("prepareBatch() returned error: %v", err)
+	}
+	if got, want := len(prepared), 2; got != want {
+		t.Fatalf("prepared events = %d, want %d", got, want)
+	}
+	if got, want := prepared[0].Data["status"], "SHIPPED"; got != want {
+		t.Fatalf("latest status = %v, want %v", got, want)
+	}
+	if prepared[1].Type != model.EventTypeDelete {
+		t.Fatalf("second prepared type = %s, want DELETE", prepared[1].Type)
+	}
+}
+
+func TestPrepareBatchRejectsMissingPrimaryKey(t *testing.T) {
+	sink := &Sink{
+		primaryKeys: map[string][]string{
+			"target.orders": {"id"},
+		},
+	}
+
+	_, err := sink.prepareBatch("target", "orders", []model.Event{{
+		Type: model.EventTypeUpdate,
+		Data: map[string]interface{}{"status": "PAID"},
+	}})
+	if err == nil || !strings.Contains(err.Error(), `primary-key column "id" is missing`) {
+		t.Fatalf("prepareBatch() error = %v, want missing primary-key error", err)
+	}
+}
+
 func TestWriteBatchPayloadNormalizesMySQLPartialDates(t *testing.T) {
 	var payload bytes.Buffer
 	err := (&Sink{}).writeBatchPayload(
