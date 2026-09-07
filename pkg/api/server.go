@@ -26,7 +26,7 @@ type Server struct {
 func NewServer(jm *core.JobManager, uiDir string, auth AuthConfig) *Server {
 	ms, err := NewMetricsSampler()
 	if err != nil {
-		// kalau gagal, tetap jalan tanpa metrics
+		// if failed, keep running without metrics
 		ms = nil
 	} else {
 		ms.Start()
@@ -66,12 +66,9 @@ func (s *Server) Router() http.Handler {
 	mux.HandleFunc("GET /metrics", s.handlePrometheusMetrics)
 
 	mux.HandleFunc("/api/jobs", s.requireAPIAuth(s.handleJobs))
-	// Exact GET route uses durable worker state so the master UI does not show
-	// stale in-memory progress/maintenance after execution moved to workers.
 	mux.HandleFunc("GET /api/jobs/{id}", s.requireAPIAuth(s.handleJobDetail))
-	// Keep manual orphan cleanup on the master as a control-plane action only.
-	// The specific route wins over the generic /api/jobs/ fallback below.
 	mux.HandleFunc("POST /api/jobs/{id}/iceberg/orphans", s.requireAPIAuth(s.handleQueuedJobIcebergOrphans))
+	mux.HandleFunc("POST /api/jobs/{id}/iceberg/maintenance", s.requireAPIAuth(s.handleQueuedJobIcebergMaintenance))
 	mux.HandleFunc("/api/jobs/", s.requireAPIAuth(s.handleJobByID))
 
 	mux.HandleFunc("GET /api/iceberg/maintenance/summary", s.requireAPIAuth(s.handleMaintenanceSummary))
