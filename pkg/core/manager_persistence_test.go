@@ -16,6 +16,22 @@ import (
 	"github.com/google/uuid"
 )
 
+func TestSubmitRejectsMaintenanceOnlyMonitorConfig(t *testing.T) {
+	manager := NewJobManager(connector.NewRegistry())
+	cfg := &config.JobConfig{
+		ID:   "warehouse-maintenance",
+		Name: "Warehouse Maintenance",
+		Mode: config.JobModeMaintenanceOnly,
+	}
+
+	if _, err := manager.Submit(cfg); err == nil || !strings.Contains(err.Error(), "Maintenance Monitors") {
+		t.Fatalf("Submit() error = %v, want Maintenance Monitors guidance", err)
+	}
+	if manager.HasJob(cfg.ID) {
+		t.Fatal("rejected maintenance-only config must not be registered as an ingestion job")
+	}
+}
+
 func TestRestorePersistedJobsLoadsStoppedAndResumesRunning(t *testing.T) {
 	store := newMemoryJobStore()
 	store.jobs["job-running"] = meta.PersistedJob{

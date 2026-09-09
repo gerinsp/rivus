@@ -173,7 +173,7 @@ func syncMaintenanceStates(ctx context.Context, store *meta.IcebergMaintenanceSt
 	jobs := make(map[string]maintenanceWorkerJob)
 	claimedTables := make(map[string]string)
 	for _, job := range persisted {
-		if job.Config == nil {
+		if job.Config == nil || isStandaloneMaintenanceMonitorConfig(job.Config) {
 			continue
 		}
 		sinkType, sinkCfg := jobSinkSpec(job.Config)
@@ -420,7 +420,7 @@ func resolveMaintenanceWorkerJob(ctx context.Context, store *meta.IcebergMainten
 	}
 	for _, job := range persisted {
 		id := firstNonEmpty(strings.TrimSpace(job.ID), jobConfigID(job.Config))
-		if id != jobID || job.Config == nil {
+		if id != jobID || job.Config == nil || isStandaloneMaintenanceMonitorConfig(job.Config) {
 			continue
 		}
 		sinkType, sinkCfg := jobSinkSpec(job.Config)
@@ -464,6 +464,17 @@ func jobConfigID(cfg *config.JobConfig) string {
 		return ""
 	}
 	return strings.TrimSpace(cfg.ID)
+}
+
+// Standalone maintenance registrations belong to the monitor control plane.
+// Older Rivus versions could persist them in job_registry before failing to
+// start a source-less ingestion pipeline. Those legacy rows must not reserve
+// table ownership ahead of the real monitor with the same targets.
+func isStandaloneMaintenanceMonitorConfig(cfg *config.JobConfig) bool {
+	if cfg == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(string(cfg.Mode)), string(config.JobModeMaintenanceOnly))
 }
 
 func maintenanceSnapshotComplete(ctx context.Context, store *meta.IcebergMaintenanceStore, job meta.PersistedJob) bool {

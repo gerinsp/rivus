@@ -1,6 +1,7 @@
 package iceberg
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -8,6 +9,51 @@ import (
 	"github.com/gerinsp/rivus/pkg/config"
 	"github.com/gerinsp/rivus/pkg/meta"
 )
+
+type maintenanceWorkerJobStoreStub struct {
+	jobs []meta.PersistedJob
+}
+
+func (s maintenanceWorkerJobStoreStub) Init(context.Context) error { return nil }
+
+func (s maintenanceWorkerJobStoreStub) SaveJob(context.Context, meta.PersistedJob) error { return nil }
+
+func (s maintenanceWorkerJobStoreStub) LoadJobs(context.Context) ([]meta.PersistedJob, error) {
+	return s.jobs, nil
+}
+
+func (s maintenanceWorkerJobStoreStub) DeleteJob(context.Context, string) error { return nil }
+
+func TestStandaloneMaintenanceMonitorConfigDoesNotClaimLegacyJobOwnership(t *testing.T) {
+	if !isStandaloneMaintenanceMonitorConfig(&config.JobConfig{Mode: config.JobModeMaintenanceOnly}) {
+		t.Fatal("maintenance-only config must be recognized as a standalone monitor")
+	}
+	if isStandaloneMaintenanceMonitorConfig(&config.JobConfig{Mode: config.JobModeInitial}) {
+		t.Fatal("ingestion config must remain eligible for maintenance ownership")
+	}
+	if isStandaloneMaintenanceMonitorConfig(nil) {
+		t.Fatal("nil config must not be recognized as a standalone monitor")
+	}
+}
+
+func TestResolveMaintenanceWorkerJobIgnoresArchivedMaintenanceMonitorRegistration(t *testing.T) {
+	cfg := maintenanceMonitorConfigForTest()
+	jobStore := maintenanceWorkerJobStoreStub{jobs: []meta.PersistedJob{{
+		ID:         cfg.ID,
+		Config:     cfg,
+		LastStatus: "FAILED",
+	}}}
+
+	_, found, err := resolveMaintenanceWorkerJob(
+		context.Background(), nil, jobStore, nil, cfg.ID,
+	)
+	if err != nil {
+		t.Fatalf("resolveMaintenanceWorkerJob() error = %v", err)
+	}
+	if found {
+		t.Fatal("archived maintenance-only job must not remain an inventory owner")
+	}
+}
 
 func TestDeterministicJitterStableAndBounded(t *testing.T) {
 	window := 24 * time.Hour
