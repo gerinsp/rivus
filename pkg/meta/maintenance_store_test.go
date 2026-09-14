@@ -56,3 +56,17 @@ func TestMaintenanceMonitorOwnerIDIsNamespaced(t *testing.T) {
 		t.Fatalf("MaintenanceMonitorOwnerID() = %q, want %q", got, want)
 	}
 }
+
+func TestLatestMaintenanceFailuresQueryUsesCurrentTaskPerOperation(t *testing.T) {
+	for _, fragment := range []string{
+		"SELECT table_key, operation, MAX(id) AS id",
+		"GROUP BY table_key, operation",
+		"latest.id=task.id",
+		"WHERE task.status='failed'",
+		"state.owner_job_id=task.owner_job_id",
+	} {
+		if !strings.Contains(latestMaintenanceFailuresQuery, fragment) {
+			t.Fatalf("latest-failure SQL missing %q: %s", fragment, latestMaintenanceFailuresQuery)
+		}
+	}
+}

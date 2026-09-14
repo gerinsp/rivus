@@ -37,6 +37,89 @@ func (s *Server) handleMaintenanceSummary(w http.ResponseWriter, r *http.Request
 	maintenanceAPIJSON(w, http.StatusOK, summary)
 }
 
+func (s *Server) handleMaintenanceFailures(w http.ResponseWriter, r *http.Request) {
+	store, ok := s.maintenanceAPIStore(w)
+	if !ok {
+		return
+	}
+	limit := maintenanceQueryInt(r, "limit", 50, 1, 200)
+	failures, err := store.ListLatestFailures(r.Context(), limit)
+	if err != nil {
+		maintenanceAPIError(w, err, http.StatusInternalServerError)
+		return
+	}
+	maintenanceAPIJSON(w, http.StatusOK, map[string]any{
+		"failures": failures,
+		"limit":    limit,
+	})
+}
+
+func (s *Server) handleMaintenanceFailureRetry(w http.ResponseWriter, r *http.Request) {
+	taskID, err := strconv.ParseInt(strings.TrimSpace(r.PathValue("id")), 10, 64)
+	if err != nil || taskID <= 0 {
+		maintenanceAPIError(w, fmt.Errorf("invalid maintenance task id"), http.StatusBadRequest)
+		return
+	}
+	store, ok := s.maintenanceAPIStore(w)
+	if !ok {
+		return
+	}
+	failure, err := store.GetLatestFailure(r.Context(), taskID)
+	if err != nil {
+		maintenanceAPIError(w, err, http.StatusInternalServerError)
+		return
+	}
+	if failure == nil {
+		maintenanceAPIError(w, fmt.Errorf("maintenance failure is no longer current"), http.StatusNotFound)
+		return
+	}
+	if !failure.CanRetry {
+		maintenanceAPIError(w, fmt.Errorf("maintenance failure cannot be retried because its table state or owner is inactive"), http.StatusConflict)
+		return
+	}
+
+	payload := make(map[string]any, len(failure.Payload)+2)
+	for key, value := range failure.Payload {
+		payload[key] = value
+	}
+	payload["manual"] = true
+	payload["retried_task_id"] = failure.TaskID
+	now := time.Now().UTC()
+	state := meta.IcebergMaintenanceState{
+		TableKey:         failure.TableKey,
+		Catalog:          failure.Catalog,
+		Namespace:        failure.Namespace,
+		Table:            failure.Table,
+		OwnerType:        failure.OwnerType,
+		OwnerJobID:       failure.OwnerJobID,
+		SnapshotComplete: failure.SnapshotComplete,
+	}
+	queued, err := store.EnqueueTask(
+		r.Context(),
+		state,
+		failure.Operation,
+		failure.Priority,
+		fmt.Sprintf("manual-retry-%s-%d", failure.Operation, now.UnixNano()),
+		now,
+		payload,
+	)
+	if err != nil {
+		maintenanceAPIError(w, err, http.StatusInternalServerError)
+		return
+	}
+	if !queued {
+		maintenanceAPIError(w, fmt.Errorf("a task for this table and operation is already queued or running"), http.StatusConflict)
+		return
+	}
+	maintenanceAPIJSON(w, http.StatusAccepted, map[string]any{
+		"task_id":   failure.TaskID,
+		"table_key": failure.TableKey,
+		"operation": failure.Operation,
+		"queued":    true,
+		"message":   "maintenance retry queued",
+	})
+}
+
 func (s *Server) handleMaintenanceRuns(w http.ResponseWriter, r *http.Request) {
 	store, ok := s.maintenanceAPIStore(w)
 	if !ok {

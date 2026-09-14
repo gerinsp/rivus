@@ -138,6 +138,27 @@ type IcebergMaintenanceSummary struct {
 	OldestQueuedAgeSec int64      `json:"oldest_queued_age_seconds"`
 }
 
+// IcebergMaintenanceFailure is the latest failed task for one table and
+// operation. A failure stops being current as soon as a newer task is queued,
+// retried, or completed for the same table and operation.
+type IcebergMaintenanceFailure struct {
+	TaskID           int64          `json:"task_id"`
+	TableKey         string         `json:"table_key"`
+	Catalog          string         `json:"catalog,omitempty"`
+	Namespace        string         `json:"namespace,omitempty"`
+	Table            string         `json:"table,omitempty"`
+	OwnerType        string         `json:"owner_type,omitempty"`
+	OwnerJobID       string         `json:"owner_job_id"`
+	Operation        string         `json:"operation"`
+	AttemptCount     int            `json:"attempt_count"`
+	LastError        string         `json:"last_error"`
+	UpdatedAt        time.Time      `json:"updated_at"`
+	CanRetry         bool           `json:"can_retry"`
+	Priority         int            `json:"-"`
+	SnapshotComplete bool           `json:"-"`
+	Payload          map[string]any `json:"-"`
+}
+
 type IcebergMaintenanceStore struct {
 	db *sql.DB
 }
@@ -1049,6 +1070,102 @@ func (s *IcebergMaintenanceStore) Summary(ctx context.Context, now time.Time) (I
 		}
 	}
 	return out, nil
+}
+
+func (s *IcebergMaintenanceStore) ListLatestFailures(ctx context.Context, limit int) ([]IcebergMaintenanceFailure, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	rows, err := s.db.QueryContext(ctx, latestMaintenanceFailuresQuery+` ORDER BY task.updated_at DESC, task.id DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]IcebergMaintenanceFailure, 0, limit)
+	for rows.Next() {
+		failure, err := scanMaintenanceFailure(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, failure)
+	}
+	return out, rows.Err()
+}
+
+func (s *IcebergMaintenanceStore) GetLatestFailure(ctx context.Context, taskID int64) (*IcebergMaintenanceFailure, error) {
+	failure, err := scanMaintenanceFailure(s.db.QueryRowContext(ctx, latestMaintenanceFailuresQuery+` AND task.id=?`, taskID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &failure, nil
+}
+
+const latestMaintenanceFailuresQuery = `SELECT
+	task.id, task.table_key, state.catalog, state.namespace_name, state.table_name,
+	state.owner_type, task.owner_job_id, task.operation, task.attempt_count,
+	task.last_error, task.updated_at, task.priority, state.snapshot_complete,
+	task.payload_json,
+	CASE
+		WHEN state.table_key IS NULL OR state.snapshot_complete=0 THEN 0
+		WHEN state.owner_type='monitor' THEN EXISTS (
+			SELECT 1 FROM iceberg_maintenance_monitors AS monitor
+			WHERE monitor.monitor_id=SUBSTRING(state.owner_job_id, 9) AND monitor.status='ACTIVE'
+		)
+		ELSE 1
+	END AS can_retry
+FROM iceberg_maintenance_tasks AS task
+JOIN (
+	SELECT table_key, operation, MAX(id) AS id
+	FROM iceberg_maintenance_tasks
+	GROUP BY table_key, operation
+) AS latest ON latest.id=task.id
+LEFT JOIN iceberg_maintenance_state AS state
+	ON state.table_key=task.table_key AND state.owner_job_id=task.owner_job_id
+WHERE task.status='failed'`
+
+func scanMaintenanceFailure(row rowScanner) (IcebergMaintenanceFailure, error) {
+	var failure IcebergMaintenanceFailure
+	var catalog, namespace, table, ownerType, lastError, payloadJSON sql.NullString
+	var snapshotComplete sql.NullInt64
+	var canRetry int
+	err := row.Scan(
+		&failure.TaskID,
+		&failure.TableKey,
+		&catalog,
+		&namespace,
+		&table,
+		&ownerType,
+		&failure.OwnerJobID,
+		&failure.Operation,
+		&failure.AttemptCount,
+		&lastError,
+		&failure.UpdatedAt,
+		&failure.Priority,
+		&snapshotComplete,
+		&payloadJSON,
+		&canRetry,
+	)
+	if err != nil {
+		return failure, err
+	}
+	failure.Catalog = catalog.String
+	failure.Namespace = namespace.String
+	failure.Table = table.String
+	failure.OwnerType = ownerType.String
+	failure.LastError = lastError.String
+	failure.SnapshotComplete = snapshotComplete.Valid && snapshotComplete.Int64 != 0
+	failure.CanRetry = canRetry != 0
+	failure.Payload = map[string]any{}
+	if payloadJSON.Valid && strings.TrimSpace(payloadJSON.String) != "" {
+		if err := json.Unmarshal([]byte(payloadJSON.String), &failure.Payload); err != nil {
+			return failure, fmt.Errorf("decode maintenance task %d payload: %w", failure.TaskID, err)
+		}
+	}
+	return failure, nil
 }
 
 func (s *IcebergMaintenanceStore) ListRuns(ctx context.Context, limit, offset int) ([]IcebergMaintenanceRun, error) {
