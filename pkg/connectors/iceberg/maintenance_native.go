@@ -879,6 +879,70 @@ type orphanDiskRecord struct {
 	Size int64  `json:"size,omitempty"`
 }
 
+type orphanReferenceIndexStats struct {
+	Snapshots          int
+	ManifestLists      int
+	UniqueManifests    int
+	DuplicateManifests int
+	DataFileReferences int64
+}
+
+// orphanBucketWriter amortizes filesystem work across the full scan. The old
+// path opened, appended to, and closed a bucket file for every referenced data
+// file, turning a large table into millions of local open/close operations.
+// Writers are opened lazily, so small tables do not consume all 256 descriptors.
+type orphanBucketWriter struct {
+	tempDir string
+	kind    string
+	files   [orphanHashBuckets]*os.File
+	writers [orphanHashBuckets]*bufio.Writer
+	closed  bool
+}
+
+func newOrphanBucketWriter(tempDir, kind string) *orphanBucketWriter {
+	return &orphanBucketWriter{tempDir: tempDir, kind: kind}
+}
+
+func (w *orphanBucketWriter) Append(record orphanDiskRecord) error {
+	if w == nil || w.closed {
+		return fmt.Errorf("orphan bucket writer is closed")
+	}
+	bucket := int(sha256.Sum256([]byte(record.Path))[0])
+	if w.writers[bucket] == nil {
+		f, err := os.OpenFile(bucketFile(w.tempDir, w.kind, bucket), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			return err
+		}
+		w.files[bucket] = f
+		w.writers[bucket] = bufio.NewWriterSize(f, 32*1024)
+	}
+	encoded, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	if _, err := w.writers[bucket].Write(encoded); err != nil {
+		return err
+	}
+	return w.writers[bucket].WriteByte('\n')
+}
+
+func (w *orphanBucketWriter) Close() error {
+	if w == nil || w.closed {
+		return nil
+	}
+	w.closed = true
+	var out error
+	for bucket := 0; bucket < orphanHashBuckets; bucket++ {
+		if w.writers[bucket] != nil {
+			out = errors.Join(out, w.writers[bucket].Flush())
+		}
+		if w.files[bucket] != nil {
+			out = errors.Join(out, w.files[bucket].Close())
+		}
+	}
+	return out
+}
+
 func executeBoundedOrphanCleanup(ctx context.Context, tbl *icetable.Table, result meta.IcebergMaintenanceResult, settings nativeMaintenanceSettings) nativeTaskOutcome {
 	if settings.OrphanMinAge < defaultNativeOrphanAge {
 		result.Error = fmt.Sprintf("orphan minimum age %s is below mandatory safety floor %s", settings.OrphanMinAge, defaultNativeOrphanAge)
@@ -910,13 +974,28 @@ func executeBoundedOrphanCleanup(ctx context.Context, tbl *icetable.Table, resul
 	}
 	defer os.RemoveAll(tempDir)
 
-	if err := writeReferencedFileBuckets(ctx, tbl, fsys, tempDir); err != nil {
+	indexStarted := time.Now()
+	indexStats, err := writeReferencedFileBuckets(ctx, tbl, fsys, tempDir)
+	result.Details = map[string]any{
+		"dry_run":                      settings.OrphanDryRun,
+		"minimum_age_hours":            settings.OrphanMinAge.Hours(),
+		"disk_buckets":                 orphanHashBuckets,
+		"reference_index_duration_ms":  time.Since(indexStarted).Milliseconds(),
+		"snapshots_indexed":            indexStats.Snapshots,
+		"manifest_lists_indexed":       indexStats.ManifestLists,
+		"unique_manifests_indexed":     indexStats.UniqueManifests,
+		"duplicate_manifests_skipped":  indexStats.DuplicateManifests,
+		"data_file_references_indexed": indexStats.DataFileReferences,
+	}
+	if err != nil {
 		result.Error = fmt.Sprintf("index referenced files: %v", err)
 		return nativeTaskOutcome{Result: result, Retryable: true}
 	}
 	cutoff := time.Now().Add(-settings.OrphanMinAge)
 	var scannedBytes int64
-	if err := listable.WalkDir(tbl.Location(), func(path string, entry stdfs.DirEntry, walkErr error) error {
+	candidateWriter := newOrphanBucketWriter(tempDir, "candidate")
+	listStarted := time.Now()
+	walkErr := listable.WalkDir(tbl.Location(), func(path string, entry stdfs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
@@ -937,9 +1016,17 @@ func executeBoundedOrphanCleanup(ctx context.Context, tbl *icetable.Table, resul
 			return err
 		}
 		scannedBytes += info.Size()
-		return appendBucketRecord(tempDir, "candidate", orphanDiskRecord{Path: path, Size: info.Size()})
-	}); err != nil {
-		result.Error = fmt.Sprintf("stream object listing: %v", err)
+		return candidateWriter.Append(orphanDiskRecord{Path: path, Size: info.Size()})
+	})
+	closeErr := candidateWriter.Close()
+	result.Details["object_listing_duration_ms"] = time.Since(listStarted).Milliseconds()
+	result.Details["scan_bytes"] = scannedBytes
+	if walkErr != nil {
+		result.Error = fmt.Sprintf("stream object listing: %v", walkErr)
+		return nativeTaskOutcome{Result: result, Retryable: true}
+	}
+	if closeErr != nil {
+		result.Error = fmt.Sprintf("flush candidate index: %v", closeErr)
 		return nativeTaskOutcome{Result: result, Retryable: true}
 	}
 
@@ -998,19 +1085,20 @@ func executeBoundedOrphanCleanup(ctx context.Context, tbl *icetable.Table, resul
 	result.OrphanCandidates = candidates
 	result.DeletedFiles = deleted
 	result.DeletedBytes = deletedBytes
-	result.Details = map[string]any{
-		"dry_run":           settings.OrphanDryRun,
-		"minimum_age_hours": settings.OrphanMinAge.Hours(),
-		"scan_bytes":        scannedBytes,
-		"disk_buckets":      orphanHashBuckets,
-	}
 	result.Status = "succeeded"
 	result.RoutingReason = "bounded-memory disk-bucket orphan cleanup"
 	return nativeTaskOutcome{Result: result}
 }
 
-func writeReferencedFileBuckets(ctx context.Context, tbl *icetable.Table, fsys iceio.IO, tempDir string) error {
+func writeReferencedFileBuckets(ctx context.Context, tbl *icetable.Table, fsys iceio.IO, tempDir string) (stats orphanReferenceIndexStats, err error) {
+	writer := newOrphanBucketWriter(tempDir, "reference")
+	defer func() {
+		err = errors.Join(err, writer.Close())
+	}()
 	add := func(path string) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		path = strings.TrimSpace(path)
 		if path == "" {
 			return nil
@@ -1018,73 +1106,66 @@ func writeReferencedFileBuckets(ctx context.Context, tbl *icetable.Table, fsys i
 		if err := ensureSameStoragePrefix(tbl.Location(), path); err != nil {
 			return err
 		}
-		return appendBucketRecord(tempDir, "reference", orphanDiskRecord{Path: path})
+		return writer.Append(orphanDiskRecord{Path: path})
 	}
 	if err := add(tbl.MetadataLocation()); err != nil {
-		return err
+		return stats, err
 	}
 	for entry := range tbl.Metadata().PreviousFiles() {
 		if err := add(entry.MetadataFile); err != nil {
-			return err
+			return stats, err
 		}
 	}
 	if err := add(strings.TrimRight(tbl.Location(), "/") + "/metadata/version-hint.text"); err != nil {
-		return err
+		return stats, err
 	}
 	for stat := range tbl.Metadata().Statistics() {
 		if err := add(stat.StatisticsPath); err != nil {
-			return err
+			return stats, err
 		}
 	}
 	for stat := range tbl.Metadata().PartitionStatistics() {
 		if err := add(stat.StatisticsPath); err != nil {
-			return err
+			return stats, err
 		}
 	}
+	seenManifests := make(map[string]struct{})
 	for _, snapshot := range tbl.Metadata().Snapshots() {
+		stats.Snapshots++
 		if err := ctx.Err(); err != nil {
-			return err
+			return stats, err
 		}
 		if err := add(snapshot.ManifestList); err != nil {
-			return err
+			return stats, err
 		}
+		stats.ManifestLists++
 		manifests, err := snapshot.Manifests(fsys)
 		if err != nil {
-			return fmt.Errorf("snapshot %d manifests: %w", snapshot.SnapshotID, err)
+			return stats, fmt.Errorf("snapshot %d manifests: %w", snapshot.SnapshotID, err)
 		}
 		for _, manifest := range manifests {
-			if err := add(manifest.FilePath()); err != nil {
-				return err
+			manifestPath := strings.TrimSpace(manifest.FilePath())
+			if _, exists := seenManifests[manifestPath]; exists {
+				stats.DuplicateManifests++
+				continue
+			}
+			seenManifests[manifestPath] = struct{}{}
+			stats.UniqueManifests++
+			if err := add(manifestPath); err != nil {
+				return stats, err
 			}
 			for entry, err := range manifest.Entries(fsys, true) {
 				if err != nil {
-					return err
+					return stats, fmt.Errorf("manifest %s entries: %w", manifestPath, err)
 				}
 				if err := add(entry.DataFile().FilePath()); err != nil {
-					return err
+					return stats, err
 				}
+				stats.DataFileReferences++
 			}
 		}
 	}
-	return nil
-}
-
-func appendBucketRecord(tempDir, kind string, record orphanDiskRecord) error {
-	bucket := int(sha256.Sum256([]byte(record.Path))[0])
-	path := bucketFile(tempDir, kind, bucket)
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-	if err != nil {
-		return err
-	}
-	encoded, err := json.Marshal(record)
-	if err == nil {
-		_, err = f.Write(append(encoded, '\n'))
-	}
-	closeErr := f.Close()
-	if err != nil {
-		return err
-	}
-	return closeErr
+	return stats, nil
 }
 
 func bucketFile(tempDir, kind string, bucket int) string {
