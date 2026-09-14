@@ -221,10 +221,17 @@ Native compaction uses atomic `RewriteDataFiles`, applies equality deletes while
 
 ## CDC priority and snapshot barrier
 
-CDC never pauses for maintenance. Successful Rivus commits mark the table
+Native maintenance does not pause CDC. Successful Rivus commits mark the table
 inventory dirty and bring its metadata scan forward. The worker uses the
 resulting *active* small-file and equality-delete counts—not raw commit
-counts—to decide whether compaction is due.
+counts—to decide whether compaction is due. Automatic compaction first tries
+twice without pausing CDC. In hybrid or Spark mode, attempt three and later
+escalate to coordinated Spark only when the preceding failure is an Iceberg
+commit or branch-change conflict. Runner-app then pauses only the Rivus writers
+that target the table, waits for them to stop committing, and resumes them
+after Spark finishes. Timeouts, resource failures, and other errors do not
+pause writers. Direct/manual Spark compaction remains coordinated by default.
+Snapshot expiration and orphan cleanup remain online and do not pause writers.
 
 Initial snapshots remain protected by a snapshot-complete barrier. Native compaction verifies its starting snapshot before staging work. Iceberg commit conflicts are retryable maintenance failures, so CDC wins concurrent writes.
 

@@ -58,6 +58,9 @@ type TableMaintenanceRequest struct {
 	Tables         []string                    `json:"tables,omitempty"`
 	Operations     []TableMaintenanceOperation `json:"operations"`
 	ExternalRunKey string                      `json:"-"`
+	// PauseRivusWriters overrides runner-app writer coordination for this
+	// submission. Nil keeps the safe default: coordinate compaction only.
+	PauseRivusWriters *bool `json:"-"`
 	// ResourceProfile overrides the configured runner profile for this one
 	// submission. Automatic maintenance uses it to right-size Spark without
 	// changing the persisted CDC job configuration.
@@ -186,7 +189,7 @@ func SubmitTableMaintenanceForJobConfig(
 			return nil, fmt.Errorf("invalid maintenance resource profile %q", profile)
 		}
 	}
-	return submitPreparedTableMaintenance(ctx, jobID, jobCfg.Name, iceCfg, targets, operations, statements, req.ExternalRunKey)
+	return submitPreparedTableMaintenance(ctx, jobID, jobCfg.Name, iceCfg, targets, operations, statements, req.ExternalRunKey, req.PauseRivusWriters)
 }
 
 func submitPreparedTableMaintenance(
@@ -198,9 +201,10 @@ func submitPreparedTableMaintenance(
 	operations []string,
 	statements []maintenanceStatement,
 	externalRunKey string,
+	pauseRivusWriters *bool,
 ) (*TableMaintenanceSubmission, error) {
 	if maintenanceUsesRunner(iceCfg.TableMaintenance) {
-		return submitRunnerTableMaintenance(ctx, jobID, jobName, iceCfg, targets, operations, statements, externalRunKey)
+		return submitRunnerTableMaintenance(ctx, jobID, jobName, iceCfg, targets, operations, statements, externalRunKey, pauseRivusWriters)
 	}
 	payload, err := json.Marshal(maintenancePayload{JobID: jobID, Statements: statements})
 	if err != nil {
@@ -247,6 +251,7 @@ func submitRunnerTableMaintenance(
 	operations []string,
 	statements []maintenanceStatement,
 	externalRunKey string,
+	pauseRivusWritersOverride *bool,
 ) (*TableMaintenanceSubmission, error) {
 	tableNames := make([]string, 0, len(targets))
 	for _, target := range targets {
@@ -265,6 +270,10 @@ func submitRunnerTableMaintenance(
 		externalRunKey = fmt.Sprintf("rivus-maintenance:%s:%d", jobID, now)
 	}
 	mode := maintenanceDisplayMode(operations)
+	pauseRivusWriters := mode == "compaction"
+	if pauseRivusWritersOverride != nil {
+		pauseRivusWriters = pauseRivusWriters && *pauseRivusWritersOverride
+	}
 	request := runnerMaintenanceRequest{
 		Filename:        fmt.Sprintf("rivus_iceberg_maintenance_%d.sql", now),
 		Content:         strings.Join(content, "\n"),
@@ -285,7 +294,7 @@ func submitRunnerTableMaintenance(
 				"mode":                mode,
 				"tables":              tableNames,
 				"operations":          operations,
-				"pause_rivus_writers": false,
+				"pause_rivus_writers": pauseRivusWriters,
 			},
 		},
 	}

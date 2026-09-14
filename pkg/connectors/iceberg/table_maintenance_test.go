@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gerinsp/rivus/pkg/config"
+	"github.com/gerinsp/rivus/pkg/meta"
 )
 
 func TestBuildMaintenanceSQLUsesTypedAllowlistedOptions(t *testing.T) {
@@ -359,7 +360,7 @@ func TestRunnerAppMaintenanceSubmissionStatusAndCancel(t *testing.T) {
 	if submitted.JobContext["maintenance_mode"] != "compaction" || maintenance["mode"] != "compaction" {
 		t.Fatalf("maintenance display mode context = %#v", submitted.JobContext)
 	}
-	if maintenance["pause_rivus_writers"] != false {
+	if maintenance["pause_rivus_writers"] != true {
 		t.Fatalf("pause_rivus_writers = %#v", maintenance["pause_rivus_writers"])
 	}
 
@@ -370,6 +371,55 @@ func TestRunnerAppMaintenanceSubmissionStatusAndCancel(t *testing.T) {
 	cancelled, err := CancelTableMaintenanceForJobConfig(context.Background(), jobCfg, result.SubmissionID)
 	if err != nil || cancelled.DriverState != "KILLED" {
 		t.Fatalf("runner cancel = %#v, err=%v", cancelled, err)
+	}
+}
+
+func TestRunnerAppCleanupSubmissionKeepsRivusWritersOnline(t *testing.T) {
+	var submitted runnerMaintenanceRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&submitted); err != nil {
+			t.Fatalf("decode runner request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"job_id":"runner-cleanup-1","job_name":"maintenance","status":"starting"}`))
+	}))
+	defer server.Close()
+
+	jobCfg := runnerMaintenanceTestJobConfig(server.URL)
+	_, err := SubmitTableMaintenanceForJobConfig(context.Background(), "job-1", jobCfg, TableMaintenanceRequest{
+		Tables:     []string{"analytics.orders"},
+		Operations: []TableMaintenanceOperation{{Type: "expire_snapshots"}},
+	}, true)
+	if err != nil {
+		t.Fatalf("submit cleanup through runner-app: %v", err)
+	}
+	maintenance := submitted.JobContext["iceberg_maintenance"].(map[string]any)
+	if submitted.JobContext["maintenance_mode"] != "cleanup" || maintenance["pause_rivus_writers"] != false {
+		t.Fatalf("cleanup coordination context = %#v", submitted.JobContext)
+	}
+}
+
+func TestAutomaticSparkCompactionCoordinatesOnlyAfterRepeatedCommitConflict(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		attempt   int
+		lastError string
+		want      bool
+	}{
+		{name: "first conflict", attempt: 1, lastError: "CommitFailedException: branch main has changed", want: false},
+		{name: "second conflict", attempt: 2, lastError: "CommitFailedException: branch main has changed", want: false},
+		{name: "third conflict", attempt: 3, lastError: "CommitFailedException: branch main has changed", want: true},
+		{name: "fifth branch conflict", attempt: 5, lastError: "Requirement failed: branch main has changed", want: true},
+		{name: "third resource failure", attempt: 3, lastError: "Spark executor out of memory", want: false},
+		{name: "third timeout", attempt: 3, lastError: "context deadline exceeded", want: false},
+		{name: "third attempt without prior failure", attempt: 3, want: false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			task := meta.IcebergMaintenanceTask{AttemptCount: tt.attempt, LastError: tt.lastError}
+			if got := shouldCoordinateSparkCompaction(task); got != tt.want {
+				t.Fatalf("coordination = %t, want %t", got, tt.want)
+			}
+		})
 	}
 }
 

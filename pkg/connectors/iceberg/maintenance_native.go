@@ -469,6 +469,13 @@ func executeHybridCompaction(
 	// when those files are small in total.
 	routeSpark, reason := shouldRouteCompactionToSpark(work, state, settings)
 	eligible := triggers.Any()
+	coordinateAfterConflict := shouldCoordinateSparkCompaction(task)
+	if eligible && coordinateAfterConflict && settings.Executor != maintenanceExecutorNative {
+		nativeCancel()
+		result.Engine = "spark"
+		result.RoutingReason = "repeated Iceberg commit conflict; escalating to coordinated Spark compaction"
+		return executeSparkCompactionFallback(ctx, jobID, jobCfg, iceCfg, state, task, result, settings, work, hasDeleteWork(work, state))
+	}
 	if work.SelectedDataFiles == 0 {
 		// The native planner can have no usable group even when a table has a
 		// dangerous delete-file count. Let Spark make its own plan in hybrid
@@ -668,6 +675,7 @@ func executeSparkCompactionFallback(
 	work compactionWorkload,
 	deleteTriggered bool,
 ) nativeTaskOutcome {
+	pauseRivusWriters := shouldCoordinateSparkCompaction(task)
 	minInputFiles := settings.MinSmallFiles
 	if deleteTriggered {
 		minInputFiles = 1
@@ -686,12 +694,14 @@ func executeSparkCompactionFallback(
 	}
 	result.Details["spark_resource_profile"] = resourceProfile
 	result.Details["spark_resource_sizing"] = sizingReason
+	result.Details["spark_writer_coordination"] = pauseRivusWriters
 	request := TableMaintenanceRequest{
 		Tables: []string{tableKey(state.Namespace, state.Table)},
 		// Keep retries idempotent within one durable attempt while allowing a
 		// later, right-sized attempt to create a new runner job.
-		ExternalRunKey:  fmt.Sprintf("rivus-maintenance:%d:%d", task.ID, task.AttemptCount),
-		ResourceProfile: resourceProfile,
+		ExternalRunKey:    fmt.Sprintf("rivus-maintenance:%d:%d", task.ID, task.AttemptCount),
+		ResourceProfile:   resourceProfile,
+		PauseRivusWriters: &pauseRivusWriters,
 		Operations: []TableMaintenanceOperation{{
 			Type:    "rewrite_data_files",
 			Options: compactOptions,
@@ -737,6 +747,16 @@ func executeSparkCompactionFallback(
 			}
 		}
 	}
+}
+
+func shouldCoordinateSparkCompaction(task meta.IcebergMaintenanceTask) bool {
+	if task.AttemptCount < 3 {
+		return false
+	}
+	errorText := strings.ToLower(strings.TrimSpace(task.LastError))
+	return strings.Contains(errorText, "commitfailedexception") ||
+		strings.Contains(errorText, "branch main has changed") ||
+		(strings.Contains(errorText, "requirement failed") && strings.Contains(errorText, "branch"))
 }
 
 func dynamicSparkResourceProfile(configured string, work compactionWorkload, task meta.IcebergMaintenanceTask) (string, string) {
