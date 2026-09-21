@@ -165,7 +165,12 @@ func (s *nativeMaintenanceSignaler) persistSignal(ctx context.Context, signal na
 		}
 		return
 	}
-	tableIdentity := canonicalMaintenanceTableKey(maintenanceCatalogName(s.cfg), signal.target.Namespace, signal.target.Table)
+	catalogName, err := maintenanceIdentityCatalogName(s.cfg)
+	if err != nil {
+		log.Printf("[iceberg][job %s] native maintenance physical catalog unresolved: %v", s.jobID, err)
+		return
+	}
+	tableIdentity := canonicalMaintenanceTableKey(catalogName, signal.target.Namespace, signal.target.Table)
 	now := time.Now().UTC()
 	due := now.Add(s.signalDelay()).Add(deterministicJitter(tableIdentity+"|signal", s.signalDelay()/5))
 	orphanDue := now.Add(s.orphanInterval()).Add(deterministicJitter(tableIdentity+"|orphan-write", s.orphanInterval()/10))

@@ -10,6 +10,7 @@ import (
 	"log"
 	"math"
 	"os"
+	"path"
 	"runtime"
 	"runtime/debug"
 	"strconv"
@@ -31,6 +32,7 @@ const (
 	defaultMaintenanceDuePageSize   = 100
 	defaultCompactionCheckInterval  = 7 * 24 * time.Hour
 	interactiveInventoryBatchSize   = 3
+	maintenanceJobStateSyncInterval = 5 * time.Minute
 )
 
 type MaintenanceWorkerOptions struct {
@@ -43,9 +45,11 @@ type MaintenanceWorkerOptions struct {
 }
 
 type maintenanceWorkerJob struct {
-	Job       meta.PersistedJob
-	Settings  nativeMaintenanceSettings
-	OwnerType string
+	Job                meta.PersistedJob
+	Settings           nativeMaintenanceSettings
+	OwnerType          string
+	MonitorTargets     []maintenanceMonitorTarget
+	MonitorDiscoveryAt time.Time
 }
 
 func RunMaintenanceWorker(ctx context.Context, dsn string, opts MaintenanceWorkerOptions) error {
@@ -103,12 +107,13 @@ func RunMaintenanceWorker(ctx context.Context, dsn string, opts MaintenanceWorke
 		opts.WorkerID, opts.Queue, opts.PollInterval, opts.LeaseDuration, opts.TaskPageSize, opts.DuePageSize)
 
 	var jobs map[string]maintenanceWorkerJob
+	var streamExclusions []maintenanceMonitorTarget
 	var lastStateSync time.Time
 	var lastMonitorSync time.Time
 	for {
 		now := time.Now().UTC()
-		if jobs == nil || now.Sub(lastStateSync) >= 10*time.Minute {
-			jobs, err = syncMaintenanceStates(ctx, store, jobStore, now)
+		if jobs == nil || now.Sub(lastStateSync) >= maintenanceJobStateSyncInterval {
+			jobs, streamExclusions, err = syncMaintenanceStates(ctx, store, jobStore, now)
 			if err != nil {
 				return err
 			}
@@ -116,7 +121,7 @@ func RunMaintenanceWorker(ctx context.Context, dsn string, opts MaintenanceWorke
 			lastMonitorSync = now
 		}
 		if lastMonitorSync.IsZero() || now.Sub(lastMonitorSync) >= opts.PollInterval {
-			jobs, err = syncMaintenanceMonitorStates(ctx, store, jobs, now)
+			jobs, err = syncMaintenanceMonitorStates(ctx, store, jobs, streamExclusions, now)
 			if err != nil {
 				return err
 			}
@@ -165,11 +170,12 @@ func RunMaintenanceWorker(ctx context.Context, dsn string, opts MaintenanceWorke
 	}
 }
 
-func syncMaintenanceStates(ctx context.Context, store *meta.IcebergMaintenanceStore, jobStore meta.JobStore, now time.Time) (map[string]maintenanceWorkerJob, error) {
+func syncMaintenanceStates(ctx context.Context, store *meta.IcebergMaintenanceStore, jobStore meta.JobStore, now time.Time) (map[string]maintenanceWorkerJob, []maintenanceMonitorTarget, error) {
 	persisted, err := jobStore.LoadJobs(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("load persisted jobs for maintenance: %w", err)
+		return nil, nil, fmt.Errorf("load persisted jobs for maintenance: %w", err)
 	}
+	streamExclusions := streamingMaintenanceExclusions(persisted)
 	jobs := make(map[string]maintenanceWorkerJob)
 	claimedTables := make(map[string]string)
 	for _, job := range persisted {
@@ -203,7 +209,11 @@ func syncMaintenanceStates(ctx context.Context, store *meta.IcebergMaintenanceSt
 		jobs[jobID] = maintenanceWorkerJob{Job: job, Settings: settings, OwnerType: "job"}
 
 		snapshotComplete := maintenanceSnapshotComplete(ctx, store, job)
-		catalogName := maintenanceCatalogName(iceCfg)
+		catalogName, err := maintenanceIdentityCatalogName(iceCfg)
+		if err != nil {
+			log.Printf("[maintenance-worker] skip job=%s unresolved physical catalog: %v", job.ID, err)
+			continue
+		}
 		for _, target := range targets {
 			tableIdentity := canonicalMaintenanceTableKey(catalogName, target.Namespace, target.Table)
 			if owner, exists := claimedTables[tableIdentity]; exists && owner != jobID {
@@ -225,27 +235,118 @@ func syncMaintenanceStates(ctx context.Context, store *meta.IcebergMaintenanceSt
 				SnapshotComplete:     snapshotComplete,
 				NextInventoryCheckAt: &inventoryDue,
 			}, compactionDue, expireDue, orphanDue); err != nil {
-				return nil, fmt.Errorf("upsert maintenance state %s: %w", tableIdentity, err)
+				return nil, nil, fmt.Errorf("upsert maintenance state %s: %w", tableIdentity, err)
 			}
 		}
 	}
 
-	return syncMaintenanceMonitorStates(ctx, store, jobs, now)
+	jobs, err = syncMaintenanceMonitorStates(ctx, store, jobs, streamExclusions, now)
+	return jobs, streamExclusions, err
+}
+
+// streamingMaintenanceExclusions reserves every Iceberg target selected by a
+// streaming job, whether or not that job enables the maintenance worker. The
+// catalog monitor is a fallback for non-streaming tables only.
+func streamingMaintenanceExclusions(persisted []meta.PersistedJob) []maintenanceMonitorTarget {
+	seen := make(map[string]struct{})
+	var exclusions []maintenanceMonitorTarget
+	for _, job := range persisted {
+		if job.Config == nil || !isStreamingJobConfig(job.Config) {
+			continue
+		}
+		sinkType, sinkCfg := jobSinkSpec(job.Config)
+		if !strings.EqualFold(sinkType, "iceberg_native") {
+			continue
+		}
+		iceCfg, err := decodeIcebergConfig(sinkCfg)
+		if err != nil {
+			continue
+		}
+		catalogName, catalogErr := maintenanceIdentityCatalogName(iceCfg)
+		if catalogErr != nil {
+			log.Printf("[maintenance-worker] skip streaming reservation job=%s: %v", job.ID, catalogErr)
+			continue
+		}
+		selectors, err := maintenanceReservationSelectors(job.Config, iceCfg)
+		if err != nil || len(selectors) == 0 {
+			// If a streaming selection cannot be projected safely, reserve the
+			// whole catalog instead of risking concurrent maintenance ownership.
+			selectors = []meta.IcebergMaintenanceReservationSelector{{Catalog: catalogName, NamespacePattern: "*", TablePattern: "*"}}
+		}
+		for _, selector := range selectors {
+			exclusion := maintenanceMonitorTarget{Catalog: catalogName, Namespace: selector.NamespacePattern, Table: selector.TablePattern}
+			key := exclusion.Catalog + "\x00" + exclusion.Namespace + "\x00" + exclusion.Table
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+			exclusions = append(exclusions, exclusion)
+		}
+	}
+	return exclusions
+}
+
+func isStreamingJobConfig(cfg *config.JobConfig) bool {
+	if cfg == nil || cfg.Mode == config.JobModeMaintenanceOnly || cfg.Mode == config.JobModeSnapshotOnly {
+		return false
+	}
+	return true
+}
+
+func maintenanceTargetExcludedByStream(exclusions []maintenanceMonitorTarget, target maintenanceMonitorTarget) bool {
+	return newStreamingExclusionMatcher(exclusions).Excludes(target)
+}
+
+type streamingExclusionMatcher struct {
+	exact    map[string]struct{}
+	patterns []maintenanceMonitorTarget
+}
+
+func newStreamingExclusionMatcher(exclusions []maintenanceMonitorTarget) streamingExclusionMatcher {
+	matcher := streamingExclusionMatcher{exact: make(map[string]struct{}, len(exclusions))}
+	for _, exclusion := range exclusions {
+		if hasGlobMeta(exclusion.Namespace) || hasGlobMeta(exclusion.Table) {
+			matcher.patterns = append(matcher.patterns, exclusion)
+			continue
+		}
+		matcher.exact[canonicalMaintenanceTableKey(exclusion.Catalog, exclusion.Namespace, exclusion.Table)] = struct{}{}
+	}
+	return matcher
+}
+
+func (m streamingExclusionMatcher) Excludes(target maintenanceMonitorTarget) bool {
+	if _, exists := m.exact[canonicalMaintenanceTableKey(target.Catalog, target.Namespace, target.Table)]; exists {
+		return true
+	}
+	for _, exclusion := range m.patterns {
+		if exclusion.Catalog != target.Catalog {
+			continue
+		}
+		namespaceMatch, namespaceErr := path.Match(exclusion.Namespace, target.Namespace)
+		tableMatch, tableErr := path.Match(exclusion.Table, target.Table)
+		if namespaceErr == nil && tableErr == nil && namespaceMatch && tableMatch {
+			return true
+		}
+	}
+	return false
 }
 
 // syncMaintenanceMonitorStates is intentionally cheap and runs every worker
 // poll, independently of the ten-minute ingestion-job rescan. This makes a
 // newly created, paused, or resumed monitor take effect promptly without
 // repeatedly walking thousands of ingestion jobs.
-func syncMaintenanceMonitorStates(ctx context.Context, store *meta.IcebergMaintenanceStore, jobs map[string]maintenanceWorkerJob, now time.Time) (map[string]maintenanceWorkerJob, error) {
+func syncMaintenanceMonitorStates(ctx context.Context, store *meta.IcebergMaintenanceStore, jobs map[string]maintenanceWorkerJob, streamExclusions []maintenanceMonitorTarget, now time.Time) (map[string]maintenanceWorkerJob, error) {
 	if jobs == nil {
 		jobs = make(map[string]maintenanceWorkerJob)
 	}
 	claimedTables := make(map[string]string)
+	streamMatcher := newStreamingExclusionMatcher(streamExclusions)
 	previouslyActive := make(map[string]struct{})
+	previousMonitors := make(map[string]maintenanceWorkerJob)
 	for ownerID, job := range jobs {
 		if strings.HasPrefix(ownerID, "monitor:") {
 			previouslyActive[ownerID] = struct{}{}
+			previousMonitors[ownerID] = job
 			delete(jobs, ownerID)
 			continue
 		}
@@ -261,7 +362,10 @@ func syncMaintenanceMonitorStates(ctx context.Context, store *meta.IcebergMainte
 		if err != nil {
 			continue
 		}
-		catalogName := maintenanceCatalogName(iceCfg)
+		catalogName, err := maintenanceIdentityCatalogName(iceCfg)
+		if err != nil {
+			continue
+		}
 		for _, target := range targets {
 			claimedTables[canonicalMaintenanceTableKey(catalogName, target.Namespace, target.Table)] = ownerID
 		}
@@ -275,7 +379,7 @@ func syncMaintenanceMonitorStates(ctx context.Context, store *meta.IcebergMainte
 		if monitor.Status != meta.MaintenanceMonitorActive || monitor.Config == nil {
 			continue
 		}
-		cfg, targets, err := PrepareMaintenanceMonitorConfig(monitor.Config)
+		cfg, explicitTargets, err := PrepareMaintenanceMonitorConfig(monitor.Config)
 		if err != nil {
 			log.Printf("[maintenance-worker] skip monitor=%s invalid config: %v", monitor.ID, err)
 			continue
@@ -293,14 +397,60 @@ func syncMaintenanceMonitorStates(ctx context.Context, store *meta.IcebergMainte
 		}
 		ownerID := meta.MaintenanceMonitorOwnerID(monitor.ID)
 		_, wasActive := previouslyActive[ownerID]
+		reconcileStreamExclusions := !wasActive
+		catalogName, err := maintenanceIdentityCatalogName(iceCfg)
+		if err != nil {
+			log.Printf("[maintenance-worker] skip monitor=%s unresolved physical catalog: %v", monitor.ID, err)
+			continue
+		}
+		targets := make([]maintenanceMonitorTarget, 0, len(explicitTargets))
+		for _, target := range explicitTargets {
+			targets = append(targets, maintenanceMonitorTarget{Catalog: catalogName, Namespace: target.Namespace, Table: target.Table})
+		}
+		discoveryAt := time.Time{}
+		if catalogMonitoringEnabled(iceCfg) {
+			previous := previousMonitors[ownerID]
+			interval := maintenanceDiscoveryInterval(iceCfg)
+			if !previous.MonitorDiscoveryAt.IsZero() && now.Sub(previous.MonitorDiscoveryAt) < interval {
+				targets = previous.MonitorTargets
+				discoveryAt = previous.MonitorDiscoveryAt
+			} else {
+				discoveryCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+				discovered, discoveryErr := discoverCatalogMonitorTargets(discoveryCtx, cfg, iceCfg)
+				cancel()
+				if discoveryErr != nil {
+					if previous.MonitorDiscoveryAt.IsZero() {
+						log.Printf("[maintenance-worker] skip monitor=%s catalog discovery failed: %v", monitor.ID, discoveryErr)
+						continue
+					}
+					log.Printf("[maintenance-worker] monitor=%s catalog discovery failed; using %d cached targets: %v", monitor.ID, len(previous.MonitorTargets), discoveryErr)
+					targets = previous.MonitorTargets
+					discoveryAt = previous.MonitorDiscoveryAt
+				} else {
+					targets = discovered
+					discoveryAt = now
+					reconcileStreamExclusions = true
+					log.Printf("[maintenance-worker] monitor=%s discovered %d matching Iceberg tables", monitor.ID, len(targets))
+				}
+			}
+		}
 		persisted := meta.PersistedJob{
 			ID: ownerID, Name: monitor.Name, Config: cfg,
 			DesiredState: meta.DesiredStateRunning, LastStatus: "RUNNING",
 		}
-		jobs[ownerID] = maintenanceWorkerJob{Job: persisted, Settings: settings, OwnerType: "monitor"}
-		catalogName := maintenanceCatalogName(iceCfg)
+		jobs[ownerID] = maintenanceWorkerJob{
+			Job: persisted, Settings: settings, OwnerType: "monitor",
+			MonitorTargets: targets, MonitorDiscoveryAt: discoveryAt,
+		}
+		excludedTableKeys := make([]string, 0)
 		for _, target := range targets {
-			tableIdentity := canonicalMaintenanceTableKey(catalogName, target.Namespace, target.Table)
+			tableIdentity := canonicalMaintenanceTableKey(target.Catalog, target.Namespace, target.Table)
+			if streamMatcher.Excludes(target) {
+				if reconcileStreamExclusions {
+					excludedTableKeys = append(excludedTableKeys, tableIdentity)
+				}
+				continue
+			}
 			if owner, exists := claimedTables[tableIdentity]; exists && owner != ownerID {
 				log.Printf("[maintenance-worker] skip monitor table already owned table=%s owner=%s monitor=%s", tableIdentity, owner, monitor.ID)
 				continue
@@ -311,7 +461,7 @@ func syncMaintenanceMonitorStates(ctx context.Context, store *meta.IcebergMainte
 			expireDue := now.Add(deterministicJitter(tableIdentity+"|expire", settings.ExpireInterval))
 			orphanDue := now.Add(deterministicJitter(tableIdentity+"|orphan", settings.OrphanInactiveInterval))
 			if err := store.UpsertState(ctx, meta.IcebergMaintenanceState{
-				TableKey: tableIdentity, Catalog: catalogName, Namespace: target.Namespace, Table: target.Table,
+				TableKey: tableIdentity, Catalog: target.Catalog, Namespace: target.Namespace, Table: target.Table,
 				OwnerType: "monitor", OwnerJobID: ownerID, SnapshotComplete: true,
 				NextInventoryCheckAt: &inventoryDue,
 			}, compactionDue, expireDue, orphanDue); err != nil {
@@ -322,6 +472,12 @@ func syncMaintenanceMonitorStates(ctx context.Context, store *meta.IcebergMainte
 					return nil, fmt.Errorf("schedule initial inventory for maintenance monitor %s table %s: %w", monitor.ID, tableIdentity, err)
 				}
 			}
+		}
+		if reconcileStreamExclusions && len(excludedTableKeys) > 0 {
+			if err := store.ExcludeMonitorTables(ctx, ownerID, excludedTableKeys, now); err != nil {
+				return nil, fmt.Errorf("exclude streaming tables from maintenance monitor %s: %w", monitor.ID, err)
+			}
+			log.Printf("[maintenance-worker] monitor=%s excluded %d streaming-owned tables", monitor.ID, len(excludedTableKeys))
 		}
 	}
 	return jobs, nil
@@ -391,9 +547,15 @@ func scanClaimedInventory(ctx context.Context, store *meta.IcebergMaintenanceSto
 		_ = store.RecordStateError(ctx, state.TableKey, message)
 		return store.RetryInventoryClaim(ctx, state.TableKey, opts.WorkerID, now.Add(defaultInventoryRetryBackoff))
 	}
+	stateConfig, err := maintenanceWorkerConfigForState(job.Job.Config, state)
+	if err != nil {
+		message := fmt.Sprintf("resolve catalog configuration for inventory scan: %v", err)
+		_ = store.RecordStateError(ctx, state.TableKey, message)
+		return store.RetryInventoryClaim(ctx, state.TableKey, opts.WorkerID, now.Add(defaultInventoryRetryBackoff))
+	}
 
 	scanCtx, cancel := context.WithTimeout(ctx, job.Settings.Timeout)
-	err = refreshPendingInventory(scanCtx, store, job.Job.Config, state, job.Settings)
+	err = refreshPendingInventory(scanCtx, store, stateConfig, state, job.Settings)
 	cancel()
 	if err != nil {
 		_ = store.RecordStateError(ctx, state.TableKey, err.Error())
@@ -403,6 +565,21 @@ func scanClaimedInventory(ctx context.Context, store *meta.IcebergMaintenanceSto
 		return nil
 	}
 	return store.FinishInventoryClaim(ctx, state.TableKey, opts.WorkerID, state.LastSnapshotID)
+}
+
+func maintenanceWorkerConfigForState(cfg *config.JobConfig, state meta.IcebergMaintenanceState) (*config.JobConfig, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("maintenance owner config is nil")
+	}
+	_, sinkCfg := jobSinkSpec(cfg)
+	iceCfg, err := decodeIcebergConfig(sinkCfg)
+	if err != nil {
+		return nil, err
+	}
+	if !catalogMonitoringEnabled(iceCfg) {
+		return cfg, nil
+	}
+	return maintenanceMonitorConfigForCatalog(cfg, state.Catalog)
 }
 
 // resolveMaintenanceWorkerJob uses the periodically refreshed job map during
@@ -585,6 +762,14 @@ func processMaintenancePage(ctx context.Context, store *meta.IcebergMaintenanceS
 			}
 			continue
 		}
+		streamOwned, streamErr := skipStreamingOwnedMonitorTask(ctx, store, jobStore, opts.WorkerID, runID, task, *state)
+		if streamErr != nil {
+			return len(tasks), streamErr
+		}
+		if streamOwned {
+			skipped++
+			continue
+		}
 		job, ok, resolveErr := resolveMaintenanceWorkerJob(ctx, store, jobStore, jobs, task.OwnerJobID)
 		if resolveErr != nil {
 			return len(tasks), fmt.Errorf("load owner job configuration task=%d: %w", task.ID, resolveErr)
@@ -596,6 +781,18 @@ func processMaintenancePage(ctx context.Context, store *meta.IcebergMaintenanceS
 				return len(tasks), fmt.Errorf("store maintenance preflight result task=%d: %w", task.ID, err)
 			}
 			if err := store.FinishTask(ctx, task.ID, opts.WorkerID, meta.MaintenanceTaskFailed, message, nil); err != nil {
+				return len(tasks), err
+			}
+			continue
+		}
+		stateConfig, configErr := maintenanceWorkerConfigForState(job.Job.Config, *state)
+		if configErr != nil {
+			failures++
+			message := fmt.Sprintf("resolve catalog configuration: %v", configErr)
+			if err := store.InsertResult(ctx, maintenancePreflightFailureResult(runID, task, message)); err != nil {
+				return len(tasks), err
+			}
+			if err := store.FinishTask(ctx, task.ID, opts.WorkerID, meta.MaintenanceTaskRetry, message, timePtr(time.Now().Add(time.Minute))); err != nil {
 				return len(tasks), err
 			}
 			continue
@@ -625,7 +822,7 @@ func processMaintenancePage(ctx context.Context, store *meta.IcebergMaintenanceS
 			}
 		}(task.ID)
 
-		outcome := executeNativeMaintenanceTask(ctx, store, task.OwnerJobID, job.Job.Config, *state, task, job.Settings)
+		outcome := executeNativeMaintenanceTask(ctx, store, task.OwnerJobID, stateConfig, *state, task, job.Settings)
 		leaseCancel()
 		leaseWG.Wait()
 		outcome.Result.RunID = runID
@@ -682,6 +879,55 @@ func maintenancePreflightFailureResult(runID int64, task meta.IcebergMaintenance
 		Error:         message,
 		CreatedAt:     time.Now().UTC(),
 	}
+}
+
+func maintenanceOwnershipSkipResult(runID int64, task meta.IcebergMaintenanceTask, message string) meta.IcebergMaintenanceResult {
+	return meta.IcebergMaintenanceResult{
+		RunID:         runID,
+		TaskID:        task.ID,
+		TableKey:      task.TableKey,
+		Operation:     task.Operation,
+		Engine:        "none",
+		RoutingReason: "Table is owned by a streaming job",
+		Status:        "skipped",
+		Attempt:       task.AttemptCount,
+		Error:         message,
+		CreatedAt:     time.Now().UTC(),
+	}
+}
+
+func skipStreamingOwnedMonitorTask(
+	ctx context.Context,
+	store *meta.IcebergMaintenanceStore,
+	jobStore meta.JobStore,
+	workerID string,
+	runID int64,
+	task meta.IcebergMaintenanceTask,
+	state meta.IcebergMaintenanceState,
+) (bool, error) {
+	if !strings.HasPrefix(task.OwnerJobID, "monitor:") {
+		return false, nil
+	}
+	persisted, err := jobStore.LoadJobs(ctx)
+	if err != nil {
+		return false, fmt.Errorf("refresh streaming ownership before catalog maintenance: %w", err)
+	}
+	matcher := newStreamingExclusionMatcher(streamingMaintenanceExclusions(persisted))
+	if !matcher.Excludes(maintenanceMonitorTarget{Catalog: state.Catalog, Namespace: state.Namespace, Table: state.Table}) {
+		return false, nil
+	}
+
+	message := "catalog maintenance skipped because the table is selected by a streaming job"
+	if err := store.InsertResult(ctx, maintenanceOwnershipSkipResult(runID, task, message)); err != nil {
+		return false, fmt.Errorf("store maintenance ownership result task=%d: %w", task.ID, err)
+	}
+	if err := store.ExcludeMonitorTables(ctx, task.OwnerJobID, []string{state.TableKey}, time.Now().UTC()); err != nil {
+		return false, fmt.Errorf("exclude streaming-owned maintenance table %s: %w", state.TableKey, err)
+	}
+	if err := store.FinishTask(ctx, task.ID, workerID, meta.MaintenanceTaskCancelled, message, nil); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func nativeMaintenanceEnabledFromRaw(sinkCfg any) bool {
