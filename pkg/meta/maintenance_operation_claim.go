@@ -20,7 +20,6 @@ func (s *IcebergMaintenanceStore) RecoverExpiredMaintenanceLeases(ctx context.Co
 		return err
 	}
 	defer tx.Rollback()
-
 	if _, err := tx.ExecContext(ctx, `UPDATE iceberg_maintenance_tasks
 	SET status='retry', lease_owner=NULL, lease_until=NULL, not_before=?, updated_at=UTC_TIMESTAMP(6)
 	WHERE status='leased' AND lease_until IS NOT NULL AND lease_until < ?`, now.UTC(), now.UTC()); err != nil {
@@ -145,7 +144,7 @@ func (s *IcebergMaintenanceStore) ClaimTasksForOperation(
 
 	rows, err := tx.QueryContext(ctx, `SELECT task.id, task.idempotency_key, task.table_key, task.owner_job_id, task.operation,
 	 task.priority, task.status, task.attempt_count, task.not_before, task.schedule_window, task.payload_json, task.last_error,
-	 task.created_at, task.updated_at
+	 task.created_at, task.updated_at, state.catalog
 	FROM iceberg_maintenance_tasks AS task
 	JOIN iceberg_maintenance_state AS state ON state.table_key=task.table_key
 	WHERE task.status IN ('queued','retry') AND task.not_before <= ? AND task.operation=?
@@ -157,15 +156,17 @@ func (s *IcebergMaintenanceStore) ClaimTasksForOperation(
 	    WHERE monitor.monitor_id=SUBSTRING(task.owner_job_id, 9) AND monitor.status='ACTIVE'
 	  ))
 	ORDER BY task.priority ASC, task.not_before ASC, task.id ASC
-	LIMIT ? FOR UPDATE SKIP LOCKED`, now.UTC(), operation, now.UTC(), now.UTC(), limit)
+	LIMIT ?`, now.UTC(), operation, now.UTC(), now.UTC(), limit)
 	if err != nil {
 		return nil, err
 	}
 
 	var tasks []IcebergMaintenanceTask
+	catalogs := make([]string, 0, limit)
 	for rows.Next() {
 		var task IcebergMaintenanceTask
 		var payloadJSON, lastError sql.NullString
+		var catalog string
 		if err := rows.Scan(
 			&task.ID,
 			&task.IdempotencyKey,
@@ -181,6 +182,7 @@ func (s *IcebergMaintenanceStore) ClaimTasksForOperation(
 			&lastError,
 			&task.CreatedAt,
 			&task.UpdatedAt,
+			&catalog,
 		); err != nil {
 			rows.Close()
 			return nil, err
@@ -192,6 +194,7 @@ func (s *IcebergMaintenanceStore) ClaimTasksForOperation(
 			task.LastError = lastError.String
 		}
 		tasks = append(tasks, task)
+		catalogs = append(catalogs, catalog)
 	}
 	if err := rows.Close(); err != nil {
 		return nil, err
@@ -201,7 +204,45 @@ func (s *IcebergMaintenanceStore) ClaimTasksForOperation(
 	}
 
 	until := now.Add(lease).UTC()
+	claimed := make([]IcebergMaintenanceTask, 0, len(tasks))
 	for i := range tasks {
+		// Reservation changes take the catalog guard before touching table
+		// state. Claims use the same order, preventing a maintenance task
+		// from entering while ownership is being transferred.
+		if err := lockMaintenanceCatalogs(ctx, tx, []string{catalogs[i]}, now); err != nil {
+			return nil, err
+		}
+		var state maintenanceReservationState
+		var currentStatus string
+		var currentTaskOwner string
+		if err := tx.QueryRowContext(ctx, `SELECT task.status, task.owner_job_id,
+			state.table_key, state.catalog, state.namespace_name, state.table_name,
+			state.owner_type, state.owner_job_id, state.lease_until
+			FROM iceberg_maintenance_tasks AS task
+			JOIN iceberg_maintenance_state AS state ON state.table_key=task.table_key
+			WHERE task.id=? FOR UPDATE`, tasks[i].ID).Scan(
+			&currentStatus, &currentTaskOwner,
+			&state.TableKey, &state.Catalog, &state.Namespace, &state.Table,
+			&state.OwnerType, &state.OwnerJobID, &state.LeaseUntil,
+		); err != nil {
+			return nil, err
+		}
+		if currentStatus != MaintenanceTaskQueued && currentStatus != MaintenanceTaskRetry {
+			continue
+		}
+		reservations, err := loadActiveMaintenanceReservations(ctx, tx, state.Catalog)
+		if err != nil {
+			return nil, err
+		}
+		reservation := matchingMaintenanceReservation(reservations, state)
+		if currentTaskOwner != tasks[i].OwnerJobID || state.OwnerJobID != tasks[i].OwnerJobID ||
+			(reservation.OwnerJobID != "" && reservation.OwnerJobID != tasks[i].OwnerJobID) {
+			if _, err := tx.ExecContext(ctx, `UPDATE iceberg_maintenance_tasks SET status='cancelled',
+				lease_owner=NULL, lease_until=NULL, updated_at=UTC_TIMESTAMP(6) WHERE id=?`, tasks[i].ID); err != nil {
+				return nil, err
+			}
+			continue
+		}
 		res, err := tx.ExecContext(ctx, `UPDATE iceberg_maintenance_state
 		SET lease_owner=?, lease_until=?, updated_at=UTC_TIMESTAMP(6)
 		WHERE table_key=?
@@ -228,12 +269,13 @@ func (s *IcebergMaintenanceStore) ClaimTasksForOperation(
 		tasks[i].LeaseOwner = workerID
 		tasks[i].LeaseUntil = &until
 		tasks[i].AttemptCount++
+		claimed = append(claimed, tasks[i])
 	}
 
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	return tasks, nil
+	return claimed, nil
 }
 
 // RenewTaskAndTableLease keeps the task lease and its table-level execution

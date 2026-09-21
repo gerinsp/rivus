@@ -92,6 +92,28 @@ func TestReservationDuringActiveLeaseReturnsBusy(t *testing.T) {
 	}
 }
 
+func TestClaimRejectsTaskAfterOwnerTransfer(t *testing.T) {
+	store, _, tableKey := newMaintenanceOwnershipIntegrationStore(t)
+	seedQueuedMonitorTask(t, store, tableKey, "monitor:general", nil)
+	if _, err := store.db.ExecContext(context.Background(), `UPDATE iceberg_maintenance_state
+		SET owner_type='streaming', owner_job_id='stream-orders' WHERE table_key=?`, tableKey); err != nil {
+		t.Fatal(err)
+	}
+
+	tasks, err := store.ClaimTasksForOperation(
+		context.Background(), "worker-1", time.Now(), time.Minute, "compact", 1,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 0 {
+		t.Fatalf("claimed %d stale tasks, want 0", len(tasks))
+	}
+	if got := maintenanceTaskStatus(t, store, tableKey); got != MaintenanceTaskCancelled {
+		t.Fatalf("task status = %q, want %q", got, MaintenanceTaskCancelled)
+	}
+}
+
 func TestOldSubmissionCannotReleaseNewReservation(t *testing.T) {
 	store, catalog, _ := newMaintenanceOwnershipIntegrationStore(t)
 	selector := []IcebergMaintenanceReservationSelector{{Catalog: catalog, NamespacePattern: "sales", TablePattern: "orders"}}

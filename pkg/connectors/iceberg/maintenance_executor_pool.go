@@ -263,7 +263,6 @@ func processClaimedMaintenanceTask(
 		}
 		return "failed", nil
 	}
-
 	job, ok, resolveErr := resolveMaintenanceWorkerJob(ctx, store, jobStore, jobs, task.OwnerJobID)
 	if resolveErr != nil {
 		return "failed", fmt.Errorf("load owner job configuration task=%d: %w", task.ID, resolveErr)
@@ -274,6 +273,17 @@ func processClaimedMaintenanceTask(
 			return "failed", fmt.Errorf("store maintenance preflight result task=%d: %w", task.ID, err)
 		}
 		if err := store.FinishTask(ctx, task.ID, workerID, meta.MaintenanceTaskFailed, message, nil); err != nil {
+			return "failed", err
+		}
+		return "failed", nil
+	}
+	stateConfig, configErr := maintenanceWorkerConfigForState(job.Job.Config, *state)
+	if configErr != nil {
+		message := fmt.Sprintf("resolve catalog configuration: %v", configErr)
+		if err := store.InsertResult(ctx, maintenancePreflightFailureResult(runID, task, message)); err != nil {
+			return "failed", err
+		}
+		if err := store.FinishTask(ctx, task.ID, workerID, meta.MaintenanceTaskRetry, message, timePtr(time.Now().Add(time.Minute))); err != nil {
 			return "failed", err
 		}
 		return "failed", nil
@@ -311,7 +321,7 @@ func processClaimedMaintenanceTask(
 	}()
 
 	taskSettings := maintenanceSettingsForTask(job.Settings, task)
-	outcome := executeNativeMaintenanceTask(taskCtx, store, task.OwnerJobID, job.Job.Config, *state, task, taskSettings)
+	outcome := executeNativeMaintenanceTask(taskCtx, store, task.OwnerJobID, stateConfig, *state, task, taskSettings)
 	taskCancel()
 	leaseWG.Wait()
 	outcome.Result.RunID = runID

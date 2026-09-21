@@ -825,14 +825,6 @@ func processMaintenancePage(ctx context.Context, store *meta.IcebergMaintenanceS
 			}
 			continue
 		}
-		streamOwned, streamErr := skipStreamingOwnedMonitorTask(ctx, store, jobStore, opts.WorkerID, runID, task, *state)
-		if streamErr != nil {
-			return len(tasks), streamErr
-		}
-		if streamOwned {
-			skipped++
-			continue
-		}
 		job, ok, resolveErr := resolveMaintenanceWorkerJob(ctx, store, jobStore, jobs, task.OwnerJobID)
 		if resolveErr != nil {
 			return len(tasks), fmt.Errorf("load owner job configuration task=%d: %w", task.ID, resolveErr)
@@ -942,55 +934,6 @@ func maintenancePreflightFailureResult(runID int64, task meta.IcebergMaintenance
 		Error:         message,
 		CreatedAt:     time.Now().UTC(),
 	}
-}
-
-func maintenanceOwnershipSkipResult(runID int64, task meta.IcebergMaintenanceTask, message string) meta.IcebergMaintenanceResult {
-	return meta.IcebergMaintenanceResult{
-		RunID:         runID,
-		TaskID:        task.ID,
-		TableKey:      task.TableKey,
-		Operation:     task.Operation,
-		Engine:        "none",
-		RoutingReason: "Table is owned by a streaming job",
-		Status:        "skipped",
-		Attempt:       task.AttemptCount,
-		Error:         message,
-		CreatedAt:     time.Now().UTC(),
-	}
-}
-
-func skipStreamingOwnedMonitorTask(
-	ctx context.Context,
-	store *meta.IcebergMaintenanceStore,
-	jobStore meta.JobStore,
-	workerID string,
-	runID int64,
-	task meta.IcebergMaintenanceTask,
-	state meta.IcebergMaintenanceState,
-) (bool, error) {
-	if !strings.HasPrefix(task.OwnerJobID, "monitor:") {
-		return false, nil
-	}
-	persisted, err := jobStore.LoadJobs(ctx)
-	if err != nil {
-		return false, fmt.Errorf("refresh streaming ownership before catalog maintenance: %w", err)
-	}
-	matcher := newStreamingExclusionMatcher(streamingMaintenanceExclusions(persisted))
-	if !matcher.Excludes(maintenanceMonitorTarget{Catalog: state.Catalog, Namespace: state.Namespace, Table: state.Table}) {
-		return false, nil
-	}
-
-	message := "catalog maintenance skipped because the table is selected by a streaming job"
-	if err := store.InsertResult(ctx, maintenanceOwnershipSkipResult(runID, task, message)); err != nil {
-		return false, fmt.Errorf("store maintenance ownership result task=%d: %w", task.ID, err)
-	}
-	if err := store.ExcludeMonitorTables(ctx, task.OwnerJobID, []string{state.TableKey}, time.Now().UTC()); err != nil {
-		return false, fmt.Errorf("exclude streaming-owned maintenance table %s: %w", state.TableKey, err)
-	}
-	if err := store.FinishTask(ctx, task.ID, workerID, meta.MaintenanceTaskCancelled, message, nil); err != nil {
-		return false, err
-	}
-	return true, nil
 }
 
 func nativeMaintenanceEnabledFromRaw(sinkCfg any) bool {
