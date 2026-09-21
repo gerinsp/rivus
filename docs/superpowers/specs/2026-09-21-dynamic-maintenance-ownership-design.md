@@ -2,6 +2,51 @@
 
 Date: 2026-09-21
 
+## Plain-Language Summary
+
+You can create one general Metalake maintenance monitor. It automatically
+finds new Iceberg catalogs, schemas, and tables, so you do not need to delete
+and submit the monitor again whenever a table is added.
+
+The main rule is simple: **only one system may control a table at a time.**
+
+- If a table belongs to a running streaming job, the streaming job controls
+  it. The general monitor skips it.
+- If a table is being loaded by a snapshot job, the snapshot job controls it.
+  After the snapshot finishes successfully, the general monitor may maintain
+  it automatically.
+- If the snapshot fails or stops before finishing, the table stays protected
+  until that snapshot job is deleted.
+- If a catalog, schema, or table contains static data that does not need
+  maintenance, you can exclude it from the general monitor.
+- If maintenance is already running when a streaming job wants the table, the
+  streaming job waits until maintenance finishes. They never run against the
+  same table together.
+
+You may also create more-specific maintenance monitors. The more-specific
+monitor wins:
+
+```text
+specific table > schema > catalog > whole Metalake
+```
+
+For example:
+
+- The whole-Metalake monitor discovers every eligible table.
+- `asmat.analytics` can be excluded because its data is static.
+- A streaming table in `asmat.orders` is skipped automatically.
+- A new non-streaming table in `asmat.sales` is picked up automatically.
+- A special monitor for `asmat.sales.monthly_report` controls only that table
+  instead of the general monitor.
+
+To support thousands of tables, each discovery compares the new list with the
+previous list. Rivus only saves what changed. New tables enter the inventory
+queue gradually rather than all 6,700 tables being scanned immediately.
+
+If catalog discovery fails temporarily, Rivus keeps the previous valid list.
+It does not remove tables or cancel their maintenance because of one failed
+scan.
+
 ## Purpose
 
 Allow one Metalake maintenance monitor to discover newly created Iceberg
