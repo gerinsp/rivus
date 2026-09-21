@@ -275,8 +275,10 @@ combinations; ownership specificity resolves overlaps. Invalid glob syntax,
 a table exclusion without a namespace, and unresolved physical identity are
 rejected with actionable validation errors.
 
-Monitor details expose discovered, owned, reserved, excluded, conflicted, and
-retired counts plus the last successful discovery time and latest error.
+Monitor details expose discovered, owned, reserved, conflicted, and retired
+table counts plus an excluded-scope count, the last successful discovery time,
+and the latest error. A fully excluded catalog or namespace is not scanned
+merely to count the tables underneath it.
 
 ## Failure Handling
 
