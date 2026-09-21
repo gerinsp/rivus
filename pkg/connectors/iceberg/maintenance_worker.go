@@ -175,6 +175,9 @@ func syncMaintenanceStates(ctx context.Context, store *meta.IcebergMaintenanceSt
 	if err != nil {
 		return nil, nil, fmt.Errorf("load persisted jobs for maintenance: %w", err)
 	}
+	if err := reconcilePersistedMaintenanceReservations(ctx, store, persisted, now); err != nil {
+		return nil, nil, fmt.Errorf("reconcile maintenance reservations: %w", err)
+	}
 	streamExclusions := streamingMaintenanceExclusions(persisted)
 	jobs := make(map[string]maintenanceWorkerJob)
 	claimedTables := make(map[string]string)
@@ -242,6 +245,66 @@ func syncMaintenanceStates(ctx context.Context, store *meta.IcebergMaintenanceSt
 
 	jobs, err = syncMaintenanceMonitorStates(ctx, store, jobs, streamExclusions, now)
 	return jobs, streamExclusions, err
+}
+
+func reservationMustRemain(job meta.PersistedJob, snapshotDone bool) bool {
+	if job.Config == nil {
+		return false
+	}
+	if normalizeMaintenanceMode(job.Config.Mode) == config.JobModeSnapshotOnly {
+		return !snapshotDone
+	}
+	if strings.EqualFold(strings.TrimSpace(job.LastStatus), "PAUSED") {
+		return true
+	}
+	return job.DesiredState == meta.DesiredStateRunning
+}
+
+func reconcilePersistedMaintenanceReservations(
+	ctx context.Context,
+	store *meta.IcebergMaintenanceStore,
+	jobs []meta.PersistedJob,
+	now time.Time,
+) error {
+	keep := make(map[string]string)
+	for _, job := range jobs {
+		if job.Config == nil || isStandaloneMaintenanceMonitorConfig(job.Config) {
+			continue
+		}
+		sinkType, sinkCfg := jobSinkSpec(job.Config)
+		if !strings.EqualFold(sinkType, "iceberg_native") {
+			continue
+		}
+		snapshotDone := false
+		if normalizeMaintenanceMode(job.Config.Mode) == config.JobModeSnapshotOnly {
+			snapshotDone = maintenanceSnapshotComplete(ctx, store, job)
+		}
+		if !reservationMustRemain(job, snapshotDone) {
+			continue
+		}
+		iceCfg, err := decodeIcebergConfig(sinkCfg)
+		if err != nil {
+			return fmt.Errorf("decode reservation job %s: %w", job.ID, err)
+		}
+		selectors, err := maintenanceReservationSelectors(job.Config, iceCfg)
+		if err != nil {
+			return fmt.Errorf("project reservation job %s: %w", job.ID, err)
+		}
+		ownerID := firstNonEmpty(strings.TrimSpace(job.ID), strings.TrimSpace(job.Config.ID))
+		submissionID := strings.TrimSpace(job.SubmissionID)
+		if submissionID == "" {
+			submissionID = ownerID + ":legacy"
+		}
+		kind := meta.MaintenanceReservationStreaming
+		if normalizeMaintenanceMode(job.Config.Mode) == config.JobModeSnapshotOnly {
+			kind = meta.MaintenanceReservationSnapshot
+		}
+		if err := store.SyncMaintenanceReservations(ctx, ownerID, submissionID, kind, selectors, now); err != nil {
+			return err
+		}
+		keep[ownerID] = submissionID
+	}
+	return store.ReleaseMaintenanceReservationsExcept(ctx, keep, now)
 }
 
 // streamingMaintenanceExclusions reserves every Iceberg target selected by a

@@ -7,6 +7,31 @@ import (
 	"github.com/gerinsp/rivus/pkg/meta"
 )
 
+func TestReservationMustRemainForSnapshotUntilDurableCompletion(t *testing.T) {
+	job := meta.PersistedJob{
+		Config:       &config.JobConfig{Mode: config.JobModeSnapshotOnly},
+		DesiredState: meta.DesiredStateStopped,
+		LastStatus:   "FAILED",
+	}
+	if !reservationMustRemain(job, false) {
+		t.Fatal("incomplete failed snapshot must stay reserved")
+	}
+	if reservationMustRemain(job, true) {
+		t.Fatal("durably completed snapshot must release")
+	}
+}
+
+func TestReservationMustRemainForPausedStreaming(t *testing.T) {
+	job := meta.PersistedJob{
+		Config:       &config.JobConfig{Mode: config.JobModeLatest},
+		DesiredState: meta.DesiredStateStopped,
+		LastStatus:   "PAUSED",
+	}
+	if !reservationMustRemain(job, false) {
+		t.Fatal("paused streaming job must stay reserved")
+	}
+}
+
 func TestMaintenanceIdentityCatalogNameUsesPhysicalWarehouse(t *testing.T) {
 	cfg := config.IcebergConfig{
 		Warehouse:   "asmat",

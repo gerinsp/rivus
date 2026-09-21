@@ -637,6 +637,7 @@ func (m *JobManager) Delete(id string) error {
 		if !job.waitRunDone(30 * time.Second) {
 			log.Printf("[job %s] delete timeout waiting for pipeline shutdown; cleaning metadata anyway", id)
 		}
+		m.applyMaintenanceOwnershipStatus(job, job.GetStatus(), true)
 		job.CleanupMeta()
 	}()
 	return nil
@@ -661,6 +662,39 @@ func (m *JobManager) newManagedJob(cfg *config.JobConfig) *Job {
 	return job
 }
 
+func shouldReleaseMaintenanceOwnership(mode config.JobMode, status JobStatus, deleted bool) bool {
+	if deleted {
+		return true
+	}
+	if normalizeMode(mode) == config.JobModeSnapshotOnly {
+		return status == JobStatusDone
+	}
+	return status == JobStatusStopped || status == JobStatusFailed
+}
+
+func (m *JobManager) applyMaintenanceOwnershipStatus(job *Job, status JobStatus, deleted bool) {
+	if job == nil || job.Config == nil || !shouldReleaseMaintenanceOwnership(job.Config.Mode, status, deleted) {
+		return
+	}
+	job.mu.RLock()
+	lifecycle := job.maintenanceOwnership
+	job.mu.RUnlock()
+	if lifecycle == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var err error
+	if !deleted && normalizeMode(job.Config.Mode) == config.JobModeSnapshotOnly && status == JobStatusDone {
+		err = lifecycle.SnapshotCompleted(ctx)
+	} else {
+		err = lifecycle.Release(ctx)
+	}
+	if err != nil {
+		log.Printf("[job-manager] maintenance ownership transition failed job=%s status=%s: %v", job.Config.ID, status, err)
+	}
+}
+
 func (m *JobManager) attachStatusListener(job *Job) {
 	job.setStatusListener(func(status JobStatus) {
 		if status == JobStatusFailed && m.failureNotifier != nil && !m.failureNotificationDeferred(job.Config.ID) {
@@ -681,6 +715,7 @@ func (m *JobManager) attachStatusListener(job *Job) {
 		if err := m.saveManagedJobRecordIfCurrent(context.Background(), job, status, desired, persistedStatus); err != nil && !errors.Is(err, ErrJobWorkerLeaseLost) {
 			log.Printf("[job-manager] persist job state failed job=%s status=%s: %v", job.Config.ID, status, err)
 		}
+		m.applyMaintenanceOwnershipStatus(job, status, false)
 		if m.workerRole != WorkerRoleAll && snapshotStatusReleasesSlot(status) {
 			m.releaseWorkerLease(job.Config.ID, job.SubmissionID())
 		}

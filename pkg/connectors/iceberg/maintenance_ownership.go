@@ -1,14 +1,79 @@
 package iceberg
 
 import (
+	"context"
 	"fmt"
+	"os"
 	"path"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/gerinsp/rivus/pkg/config"
+	"github.com/gerinsp/rivus/pkg/connector"
 	"github.com/gerinsp/rivus/pkg/meta"
 )
+
+type icebergMaintenanceOwnership struct {
+	store        *meta.IcebergMaintenanceStore
+	ownerJobID   string
+	submissionID string
+	metaKey      string
+	kind         string
+	storedMode   config.JobMode
+	selectors    []meta.IcebergMaintenanceReservationSelector
+}
+
+func newIcebergMaintenanceOwnership(jctx connector.JobContext, cfg config.IcebergConfig) (*icebergMaintenanceOwnership, error) {
+	dsn := strings.TrimSpace(os.Getenv("RIVUS_META_MYSQL_DSN"))
+	if dsn == "" || jctx.JobConfig == nil {
+		return nil, nil
+	}
+	selectors, err := maintenanceReservationSelectors(jctx.JobConfig, cfg)
+	if err != nil {
+		return nil, err
+	}
+	store, err := sharedNativeMaintenanceSignalStore(dsn)
+	if err != nil {
+		return nil, err
+	}
+	kind := meta.MaintenanceReservationStreaming
+	if jctx.StoredMode == config.JobModeSnapshotOnly {
+		kind = meta.MaintenanceReservationSnapshot
+	}
+	return &icebergMaintenanceOwnership{
+		store: store, ownerJobID: jctx.JobID, submissionID: jctx.SubmissionID,
+		metaKey: jctx.MetaKey, kind: kind, storedMode: jctx.StoredMode, selectors: selectors,
+	}, nil
+}
+
+func (o *icebergMaintenanceOwnership) Reserve(ctx context.Context) error {
+	if o == nil {
+		return nil
+	}
+	return o.store.SyncMaintenanceReservations(ctx, o.ownerJobID, o.submissionID, o.kind, o.selectors, time.Now().UTC())
+}
+
+func (o *icebergMaintenanceOwnership) SnapshotCompleted(ctx context.Context) error {
+	if o == nil || o.storedMode != config.JobModeSnapshotOnly {
+		return nil
+	}
+	done, found, err := o.store.SnapshotDone(ctx, o.metaKey)
+	if err != nil {
+		return err
+	}
+	if !found || !done {
+		return fmt.Errorf("snapshot completion is not durable for job %s", o.ownerJobID)
+	}
+	return o.Release(ctx)
+}
+
+func (o *icebergMaintenanceOwnership) Release(ctx context.Context) error {
+	if o == nil {
+		return nil
+	}
+	return o.store.ReleaseMaintenanceReservations(ctx, o.ownerJobID, o.submissionID, time.Now().UTC())
+}
 
 type sourceTableSelector struct {
 	SchemaPattern string
