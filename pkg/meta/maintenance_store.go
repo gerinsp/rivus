@@ -190,6 +190,25 @@ func (s *IcebergMaintenanceStore) Init(ctx context.Context) error {
 		return fmt.Errorf("maintenance store is nil")
 	}
 	ddls := []string{
+		`CREATE TABLE IF NOT EXISTS iceberg_maintenance_catalog_guards (
+		  catalog VARCHAR(255) NOT NULL PRIMARY KEY,
+		  updated_at DATETIME(6) NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS iceberg_maintenance_reservations (
+		  id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		  reservation_key CHAR(64) NOT NULL,
+		  owner_job_id VARCHAR(255) NOT NULL,
+		  submission_id VARCHAR(64) NOT NULL,
+		  reservation_kind VARCHAR(32) NOT NULL,
+		  catalog VARCHAR(255) NOT NULL,
+		  namespace_pattern VARCHAR(512) NOT NULL,
+		  table_pattern VARCHAR(255) NOT NULL,
+		  active TINYINT(1) NOT NULL DEFAULT 1,
+		  created_at DATETIME(6) NOT NULL,
+		  updated_at DATETIME(6) NOT NULL,
+		  UNIQUE KEY uq_maintenance_reservation (reservation_key),
+		  INDEX idx_maintenance_reservation_catalog (catalog, active)
+		)`,
 		`CREATE TABLE IF NOT EXISTS iceberg_maintenance_monitors (
 		  monitor_id VARCHAR(255) NOT NULL PRIMARY KEY,
 		  monitor_name VARCHAR(255) NOT NULL,
