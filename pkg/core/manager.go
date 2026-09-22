@@ -82,19 +82,21 @@ type JobManager struct {
 	failureRetryInitial      time.Duration
 	failureRetryMax          time.Duration
 
-	jobStore            meta.JobStore
-	defaultMetaMySQL    string
-	autoResume          bool
-	jobStoreReady       bool
-	jobStoreReadyLock   sync.Mutex
-	workerRole          WorkerRole
-	workerID            string
-	workerPollInterval  time.Duration
-	workerLeaseDuration time.Duration
-	executionRoles      map[string]meta.JobExecutionRole
-	workerLeases        map[string]string
-	progressPersistMu   sync.Mutex
-	lastProgressPersist map[string]time.Time
+	jobStore             meta.JobStore
+	defaultMetaMySQL     string
+	autoResume           bool
+	jobStoreReady        bool
+	jobStoreReadyLock    sync.Mutex
+	workerRole           WorkerRole
+	workerID             string
+	workerPollInterval   time.Duration
+	workerLeaseDuration  time.Duration
+	executionRoles       map[string]meta.JobExecutionRole
+	workerLeases         map[string]string
+	progressPersistMu    sync.Mutex
+	lastProgressPersist  map[string]time.Time
+	maintenanceReleaseMu sync.Mutex
+	maintenanceReleases  map[string]struct{}
 
 	maxConcurrentSnapshotJobs int
 	snapshotQueue             []string
@@ -208,6 +210,7 @@ func NewJobManager(reg *connector.Registry, opts ...JobManagerOption) *JobManage
 		executionRoles:            make(map[string]meta.JobExecutionRole),
 		workerLeases:              make(map[string]string),
 		lastProgressPersist:       make(map[string]time.Time),
+		maintenanceReleases:       make(map[string]struct{}),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -619,9 +622,8 @@ func (m *JobManager) Delete(id string) error {
 	delete(m.startingSnapshotJobs, id)
 	m.mu.Unlock()
 
-	// The API should not wait for a connector to drain or a metadata DB round trip.
-	// Detach first so late shutdown transitions cannot restore a deleted job record.
-	job.markPersistenceDeleted()
+	// Detach from the API immediately, but retain a durable STOPPING row and
+	// reservation until every source/sink goroutine has drained.
 	job.setStatusListener(nil)
 	job.setProgressListener(nil)
 	job.requestStop()
@@ -631,11 +633,19 @@ func (m *JobManager) Delete(id string) error {
 			delete(m.deletingJobs, id)
 			m.mu.Unlock()
 		}()
+		if err := m.saveManagedJobRecord(context.Background(), job, meta.DesiredStateStopped, JobStatus("STOPPING")); err != nil {
+			log.Printf("[job-manager] persist deleting job state failed job=%s: %v", id, err)
+		}
+		job.markPersistenceDeleted()
+		if !job.waitRunDone(30 * time.Second) {
+			log.Printf("[job %s] delete still waiting for pipeline shutdown; ownership remains reserved", id)
+			if done := job.currentRunDone(); done != nil {
+				<-done
+			}
+		}
+		m.applyMaintenanceOwnershipStatus(job, job.GetStatus(), true)
 		if err := m.deletePersistedJobForJob(context.Background(), job, id); err != nil {
 			log.Printf("[job-manager] delete persisted job failed job=%s: %v", id, err)
-		}
-		if !job.waitRunDone(30 * time.Second) {
-			log.Printf("[job %s] delete timeout waiting for pipeline shutdown; cleaning metadata anyway", id)
 		}
 		job.CleanupMeta()
 	}()
@@ -661,6 +671,75 @@ func (m *JobManager) newManagedJob(cfg *config.JobConfig) *Job {
 	return job
 }
 
+func shouldReleaseMaintenanceOwnership(mode config.JobMode, status JobStatus, deleted bool) bool {
+	if deleted {
+		return true
+	}
+	if normalizeMode(mode) == config.JobModeSnapshotOnly {
+		return status == JobStatusDone
+	}
+	return status == JobStatusStopped || status == JobStatusFailed
+}
+
+func (m *JobManager) applyMaintenanceOwnershipStatus(job *Job, status JobStatus, deleted bool) {
+	if job == nil || job.Config == nil || !shouldReleaseMaintenanceOwnership(job.Config.Mode, status, deleted) {
+		return
+	}
+	job.mu.RLock()
+	lifecycle := job.maintenanceOwnership
+	job.mu.RUnlock()
+	if lifecycle == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var err error
+	if !deleted && normalizeMode(job.Config.Mode) == config.JobModeSnapshotOnly && status == JobStatusDone {
+		err = lifecycle.SnapshotCompleted(ctx)
+	} else {
+		err = lifecycle.Release(ctx)
+	}
+	if err != nil {
+		log.Printf("[job-manager] maintenance ownership transition failed job=%s status=%s: %v", job.Config.ID, status, err)
+	}
+}
+
+func (m *JobManager) deferMaintenanceOwnershipStatus(job *Job, status JobStatus) {
+	if job == nil || job.Config == nil {
+		return
+	}
+	done := job.currentRunDone()
+	if done == nil {
+		m.applyMaintenanceOwnershipStatus(job, status, false)
+		return
+	}
+	key := job.Config.ID + "\x00" + job.SubmissionID()
+	m.maintenanceReleaseMu.Lock()
+	if _, exists := m.maintenanceReleases[key]; exists {
+		m.maintenanceReleaseMu.Unlock()
+		return
+	}
+	m.maintenanceReleases[key] = struct{}{}
+	m.maintenanceReleaseMu.Unlock()
+	go func() {
+		<-done
+		m.maintenanceReleaseMu.Lock()
+		delete(m.maintenanceReleases, key)
+		m.maintenanceReleaseMu.Unlock()
+		finalStatus := job.GetStatus()
+		if err := m.saveManagedJobRecordIfCurrent(context.Background(), job, finalStatus, m.desiredStateForJobStatus(job.Config.ID, finalStatus), finalStatus); err != nil && !errors.Is(err, ErrJobWorkerLeaseLost) {
+			log.Printf("[job-manager] persist drained ownership state failed job=%s status=%s: %v", job.Config.ID, finalStatus, err)
+		}
+		m.applyMaintenanceOwnershipStatus(job, finalStatus, false)
+		if m.workerRole != WorkerRoleAll && snapshotStatusReleasesSlot(finalStatus) {
+			m.releaseWorkerLease(job.Config.ID, job.SubmissionID())
+		}
+		if snapshotStatusReleasesSlot(finalStatus) {
+			m.startQueuedSnapshotJobsAsync()
+		}
+	}()
+}
+
 func (m *JobManager) attachStatusListener(job *Job) {
 	job.setStatusListener(func(status JobStatus) {
 		if status == JobStatusFailed && m.failureNotifier != nil && !m.failureNotificationDeferred(job.Config.ID) {
@@ -670,6 +749,10 @@ func (m *JobManager) attachStatusListener(job *Job) {
 		}
 		persistedStatus := status
 		desired := m.desiredStateForJobStatus(job.Config.ID, status)
+		releaseAfterDrain := shouldReleaseMaintenanceOwnership(job.Config.Mode, status, false) && job.runActive()
+		if releaseAfterDrain {
+			persistedStatus = JobStatus("STOPPING")
+		}
 		if m.workerRole == WorkerRoleSnapshot && status == JobStatusDone && normalizeMode(job.Config.Mode) == config.JobModeInitial {
 			m.mu.Lock()
 			m.executionRoles[job.Config.ID] = meta.JobExecutionRoleStreaming
@@ -681,10 +764,15 @@ func (m *JobManager) attachStatusListener(job *Job) {
 		if err := m.saveManagedJobRecordIfCurrent(context.Background(), job, status, desired, persistedStatus); err != nil && !errors.Is(err, ErrJobWorkerLeaseLost) {
 			log.Printf("[job-manager] persist job state failed job=%s status=%s: %v", job.Config.ID, status, err)
 		}
-		if m.workerRole != WorkerRoleAll && snapshotStatusReleasesSlot(status) {
+		if releaseAfterDrain {
+			m.deferMaintenanceOwnershipStatus(job, status)
+		} else {
+			m.applyMaintenanceOwnershipStatus(job, status, false)
+		}
+		if !releaseAfterDrain && m.workerRole != WorkerRoleAll && snapshotStatusReleasesSlot(status) {
 			m.releaseWorkerLease(job.Config.ID, job.SubmissionID())
 		}
-		if snapshotStatusReleasesSlot(status) {
+		if !releaseAfterDrain && snapshotStatusReleasesSlot(status) {
 			m.startQueuedSnapshotJobsAsync()
 		}
 	})

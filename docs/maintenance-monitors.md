@@ -11,8 +11,8 @@ expiration, and orphan cleanup.
 - `ACTIVE` monitors are inventoried and scheduled continuously.
 - `PAUSED` monitors do not create or claim new work. An operation that already
   owns a lease is allowed to finish.
-- Resuming a monitor schedules an immediate inventory refresh and brings its
-  maintenance checks forward.
+- Resuming a monitor makes it eligible again. Background inventory remains
+  paced, so thousands of tables do not start scanning at once.
 - Deleting a monitor disables future schedules and cancels queued/retry work.
   Iceberg data and historical maintenance runs are preserved.
 
@@ -62,8 +62,93 @@ tables:
     table: attendance_daily
 ```
 
-Wildcards are rejected so a monitor cannot accidentally enroll an entire
-warehouse.
+For automatic catalog discovery, use the dedicated `catalog_monitoring` block.
+The worker asks the Gravitino management API for matching catalogs, then asks
+the Iceberg REST API for matching namespaces and tables. It refreshes every
+five minutes by default and enrolls new matches without another submission:
+
+```yaml
+table_maintenance:
+  enabled: true
+  catalog_monitoring:
+    enabled: true
+    api_uri: ${GRAVITINO_URI}
+    metalake: lakehouse
+    discovery_interval_seconds: 300
+    catalog_patterns:
+      - "*"
+    namespace_patterns:
+      - "*"
+    table_patterns:
+      - "*"
+
+    # Optional monitor-local exclusions. Missing namespace means the entire
+    # catalog; missing table means the entire namespace.
+    exclude:
+      - catalog: archive
+        reason: immutable catalog
+      - catalog: asmat
+        namespace: analytics
+        reason: immutable schema; no new writes
+      - catalog: asmat
+        namespace: reporting
+        table: "temporary_*"
+```
+
+Patterns use shell-style `*`, `?`, and character classes. Dynamic selection
+uses the clearly separate `catalog_monitoring` block; it does not use a
+confusing `tables: [{table: "*"}]` shape. The legacy `tables` field is only for
+an explicit list of exact tables. One monitor cannot use both forms.
+
+Exclusions are local to this monitor and are applied before discovered tables
+are registered. This lets a general metalake monitor omit an immutable catalog,
+one schema within a catalog, or selected table patterns. `catalog` is required;
+`namespace` and `table` narrow the exclusion. A table exclusion must include
+its namespace so the same table name in another schema remains eligible.
+
+Catalog monitoring performs maintenance for **non-streaming tables only**.
+Rivus still records a matching streaming or incomplete snapshot table in the
+monitor's discovery results, but marks it “Used by streaming/snapshot” and does
+not schedule monitor maintenance for it. This makes the protection visible and
+lets the monitor claim the table automatically when that reservation is safely
+released. A paused streaming job stays protected. A stopped streaming job
+releases its protection. A snapshot-only job remains protected until its
+snapshot succeeds durably (or the job is deleted).
+
+## Layered monitors and precedence
+
+You may register a whole-Metalake monitor, a catalog monitor, a schema monitor,
+and exact-table monitors at the same time. Rivus resolves each physical table
+with this precedence:
+
+1. streaming job
+2. incomplete snapshot-only job
+3. exact table monitor
+4. schema monitor
+5. catalog monitor
+6. whole-Metalake monitor
+
+For example, a general Metalake monitor can cover newly created tables while a
+more specific monitor gives `asmat.analytics.orders` a different maintenance
+profile. Equal-specificity overlaps remain stable: the current owner keeps the
+table and the other monitor reports “Owned by another monitor” instead of
+ownership oscillating.
+
+`warehouse` is the physical Gravitino/Iceberg catalog used for ownership.
+`catalog_name` is only the Spark catalog alias used while executing maintenance;
+it must not be used to decide whether two jobs refer to the same physical table.
+
+The monitor API reports:
+
+- `discovered_count`: current matching tables.
+- `owned_count`: tables maintained by this monitor.
+- `reserved_count`: tables protected by streaming or snapshot ingestion.
+- `excluded_scope_count`: configured catalog/schema/table exclusion rules.
+- `conflict_count`: tables owned by a more specific or already-established monitor.
+- `retired_count`: tables no longer returned by a successful discovery.
+
+If discovery fails, Rivus keeps the last successful membership and reports the
+error. A successful empty discovery is different: it retires the old matches.
 
 ## API
 

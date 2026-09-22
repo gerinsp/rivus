@@ -40,17 +40,18 @@ const (
 )
 
 type Sink struct {
-	jobID              string
-	stateKey           string
-	jobName            string
-	cfg                config.IcebergConfig
-	retry              config.RetryPolicy
-	offsetSto          meta.OffsetStore
-	progress           connector.ProgressReporter
-	catalog            icecatalog.Catalog
-	maintenance        *tableMaintenanceMonitor
-	maintenanceSignals *nativeMaintenanceSignaler
-	snapshotSpoolDir   string
+	jobID                string
+	stateKey             string
+	jobName              string
+	cfg                  config.IcebergConfig
+	retry                config.RetryPolicy
+	offsetSto            meta.OffsetStore
+	progress             connector.ProgressReporter
+	catalog              icecatalog.Catalog
+	maintenance          *tableMaintenanceMonitor
+	maintenanceSignals   *nativeMaintenanceSignaler
+	maintenanceOwnership connector.MaintenanceOwnershipLifecycle
+	snapshotSpoolDir     string
 
 	equalityCommitter cdcEqualityCommitter
 
@@ -60,6 +61,13 @@ type Sink struct {
 	pendingOffset              *model.SourceOffset
 	lastCheckpointCommitAt     time.Time
 	lastCheckpointBlockedLogAt time.Time
+}
+
+func (s *Sink) MaintenanceOwnershipLifecycle() connector.MaintenanceOwnershipLifecycle {
+	if s == nil {
+		return nil
+	}
+	return s.maintenanceOwnership
 }
 
 type tableState struct {

@@ -36,6 +36,33 @@ func TestStandaloneMaintenanceMonitorConfigDoesNotClaimLegacyJobOwnership(t *tes
 	}
 }
 
+func TestCatalogMonitorExcludesOnlyStreamingOwnedTables(t *testing.T) {
+	streamCfg := &config.JobConfig{
+		ID: "stream-orders", Mode: config.JobModeInitial,
+		Source: &config.ConnectorSpec{Type: "mysql", Config: map[string]any{
+			"tables": []any{"app.stream_*"},
+		}},
+		Sink: &config.ConnectorSpec{Type: "iceberg_native", Config: map[string]any{
+			"rest_uri": "http://iceberg-rest:8181", "warehouse": "asmat", "default_namespace": "analytics",
+		}},
+	}
+	exclusions := streamingMaintenanceExclusions([]meta.PersistedJob{{ID: streamCfg.ID, Config: streamCfg}})
+	if !maintenanceTargetExcludedByStream(exclusions, maintenanceMonitorTarget{Catalog: "asmat", Namespace: "analytics", Table: "stream_orders"}) {
+		t.Fatalf("streaming-owned table was not excluded by %#v", exclusions)
+	}
+	if maintenanceTargetExcludedByStream(exclusions, maintenanceMonitorTarget{Catalog: "asmat", Namespace: "analytics", Table: "manual_rollup"}) {
+		t.Fatalf("non-streaming table in the same schema was excluded by %#v", exclusions)
+	}
+	if maintenanceTargetExcludedByStream(exclusions, maintenanceMonitorTarget{Catalog: "ds", Namespace: "analytics", Table: "stream_orders"}) {
+		t.Fatal("same table pattern in another catalog was excluded")
+	}
+
+	streamCfg.Mode = config.JobModeSnapshotOnly
+	if got := streamingMaintenanceExclusions([]meta.PersistedJob{{ID: streamCfg.ID, Config: streamCfg}}); len(got) != 0 {
+		t.Fatalf("snapshot-only job exclusions = %#v, want none", got)
+	}
+}
+
 func TestResolveMaintenanceWorkerJobIgnoresArchivedMaintenanceMonitorRegistration(t *testing.T) {
 	cfg := maintenanceMonitorConfigForTest()
 	jobStore := maintenanceWorkerJobStoreStub{jobs: []meta.PersistedJob{{

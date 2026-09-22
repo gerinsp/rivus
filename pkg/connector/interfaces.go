@@ -9,19 +9,33 @@ import (
 )
 
 type JobContext struct {
-	JobID      string
-	JobName    string
-	MetaKey    string
-	Mode       config.JobMode
-	StoredMode config.JobMode
-	SinkType   string
-	SinkConfig any
+	JobID        string
+	SubmissionID string
+	JobName      string
+	MetaKey      string
+	Mode         config.JobMode
+	StoredMode   config.JobMode
+	SinkType     string
+	SinkConfig   any
+	SourceType   string
+	SourceConfig any
+	JobConfig    *config.JobConfig
 
 	Retry     config.RetryPolicy
 	MetaStore meta.OffsetStore
 
 	Metadata       map[string]string
 	ReportProgress ProgressReporter
+}
+
+type MaintenanceOwnershipLifecycle interface {
+	Reserve(context.Context) error
+	SnapshotCompleted(context.Context) error
+	Release(context.Context) error
+}
+
+type MaintenanceOwnershipProvider interface {
+	MaintenanceOwnershipLifecycle() MaintenanceOwnershipLifecycle
 }
 
 type Source interface {

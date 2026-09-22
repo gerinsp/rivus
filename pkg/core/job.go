@@ -118,15 +118,16 @@ type Job struct {
 	Created time.Time
 	Updated time.Time
 
-	mu               sync.RWMutex
-	status           JobStatus
-	errors           []JobError
-	progress         *JobProgress
-	maintenance      *connector.TableMaintenanceStatus
-	cancelFunc       context.CancelFunc
-	sourceCancelFunc context.CancelFunc
-	runDone          chan struct{}
-	pauseRequested   bool
+	mu                   sync.RWMutex
+	status               JobStatus
+	errors               []JobError
+	progress             *JobProgress
+	maintenance          *connector.TableMaintenanceStatus
+	maintenanceOwnership connector.MaintenanceOwnershipLifecycle
+	cancelFunc           context.CancelFunc
+	sourceCancelFunc     context.CancelFunc
+	runDone              chan struct{}
+	pauseRequested       bool
 
 	statusListener     func(JobStatus)
 	progressListener   func(*JobProgress)
@@ -1342,16 +1343,20 @@ func (j *Job) startWithMode(mode config.JobMode) (err error) {
 	j.mu.Unlock()
 
 	jctx := connector.JobContext{
-		JobID:      j.Config.ID,
-		JobName:    j.Config.Name,
-		MetaKey:    metaKey,
-		Mode:       effectiveMode,
-		StoredMode: storedMode,
-		SinkType:   sinkType,
-		SinkConfig: sinkCfg,
-		Retry:      j.Config.Retry,
-		MetaStore:  j.metaStore,
-		Metadata:   j.Config.Metadata,
+		JobID:        j.Config.ID,
+		SubmissionID: j.SubmissionID(),
+		JobName:      j.Config.Name,
+		MetaKey:      metaKey,
+		Mode:         effectiveMode,
+		StoredMode:   storedMode,
+		SinkType:     sinkType,
+		SinkConfig:   sinkCfg,
+		SourceType:   srcType,
+		SourceConfig: srcCfg,
+		JobConfig:    j.Config,
+		Retry:        j.Config.Retry,
+		MetaStore:    j.metaStore,
+		Metadata:     j.Config.Metadata,
 		ReportProgress: func(info connector.ProgressInfo) {
 			j.updateProgress(info)
 		},
@@ -1366,6 +1371,17 @@ func (j *Job) startWithMode(mode config.JobMode) (err error) {
 	sink, err := j.registry.NewSink(sinkType, jctx, sinkCfg)
 	if err != nil {
 		return j.failStart("sink", err, cancel)
+	}
+	if provider, ok := sink.(connector.MaintenanceOwnershipProvider); ok {
+		lifecycle := provider.MaintenanceOwnershipLifecycle()
+		if lifecycle != nil {
+			if err := lifecycle.Reserve(ctx); err != nil {
+				return j.failStart("maintenance ownership", err, cancel)
+			}
+			j.mu.Lock()
+			j.maintenanceOwnership = lifecycle
+			j.mu.Unlock()
+		}
 	}
 	j.updateTableMaintenanceStatus(nil)
 	if reporter, ok := sink.(connector.TableMaintenanceStatusReporterSetter); ok {

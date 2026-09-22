@@ -915,15 +915,19 @@ func TestDeleteReturnsBeforePipelineFinishesDraining(t *testing.T) {
 	if _, err := manager.Get("job-slow-delete"); !errors.Is(err, ErrJobNotFound) {
 		t.Fatalf("deleted job remains visible: %v", err)
 	}
-	waitForCondition(t, "job record deletion", func() bool {
-		_, ok := store.Get("job-slow-delete")
-		return !ok
+	waitForCondition(t, "retained stopped job record", func() bool {
+		record, ok := store.Get("job-slow-delete")
+		return ok && record.DesiredState == meta.DesiredStateStopped && record.LastStatus == "STOPPING"
 	})
 
 	releasePipeline()
 	if !job.waitRunDone(2 * time.Second) {
 		t.Fatal("pipeline did not finish after release")
 	}
+	waitForCondition(t, "job record deletion after pipeline drain", func() bool {
+		_, ok := store.Get("job-slow-delete")
+		return !ok
+	})
 }
 
 func TestDeleteWinsOverInFlightJobPersistence(t *testing.T) {

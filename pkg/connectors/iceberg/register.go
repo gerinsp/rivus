@@ -21,6 +21,11 @@ func Register(reg *connector.Registry) {
 		if err != nil {
 			return nil, err
 		}
+		ownership, err := newIcebergMaintenanceOwnership(jctx, icfg)
+		if err != nil {
+			return nil, err
+		}
+		sink.maintenanceOwnership = ownership
 		if sink.maintenanceSignals != nil {
 			sink.maintenanceSignals.setInitialSnapshotComplete(maintenanceStartsComplete(jctx.Mode))
 		}

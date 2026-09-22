@@ -33,7 +33,15 @@ type maintenanceMonitorView struct {
 	ResourceProfile string                        `json:"resource_profile"`
 	Tables          []config.IcebergTarget        `json:"tables"`
 	TableCount      int                           `json:"table_count"`
+	DiscoveredCount int                           `json:"discovered_count"`
+	OwnedCount      int                           `json:"owned_count"`
+	ReservedCount   int                           `json:"reserved_count"`
+	ExcludedCount   int                           `json:"excluded_scope_count"`
+	ConflictCount   int                           `json:"conflict_count"`
+	RetiredCount    int                           `json:"retired_count"`
 	LastInventoryAt *time.Time                    `json:"last_inventory_at,omitempty"`
+	LastDiscoveryAt *time.Time                    `json:"last_discovery_at,omitempty"`
+	DiscoveryError  string                        `json:"last_discovery_error,omitempty"`
 	LastError       string                        `json:"last_error,omitempty"`
 	CreatedAt       time.Time                     `json:"created_at"`
 	UpdatedAt       time.Time                     `json:"updated_at"`
@@ -74,12 +82,14 @@ func (s *Server) handleMaintenanceMonitors(w http.ResponseWriter, r *http.Reques
 		maintenanceAPIError(w, err, http.StatusBadRequest)
 		return
 	}
-	if err := ensureMaintenanceMonitorTargetsAvailable(r.Context(), store, normalized); err != nil {
-		maintenanceAPIError(w, err, http.StatusConflict)
+	excludedCount, err := iceberg.MaintenanceMonitorExcludedScopeCount(normalized)
+	if err != nil {
+		maintenanceAPIError(w, err, http.StatusBadRequest)
 		return
 	}
 	monitor := meta.IcebergMaintenanceMonitor{
 		ID: normalized.ID, Name: normalized.Name, Status: meta.MaintenanceMonitorActive, Config: normalized,
+		ExcludedScopeCount: excludedCount,
 	}
 	if err := store.CreateMonitor(r.Context(), monitor); err != nil {
 		if errors.Is(err, meta.ErrMaintenanceMonitorExists) {
@@ -242,6 +252,10 @@ func maintenanceMonitorResponse(monitor meta.IcebergMaintenanceMonitor) (mainten
 		ID: monitor.ID, Name: monitor.Name, Status: monitor.Status,
 		Catalog: catalog, Executor: executor, ResourceProfile: profile,
 		Tables: tables, TableCount: tableCount, LastInventoryAt: monitor.LastInventoryAt,
+		DiscoveredCount: monitor.DiscoveredCount, OwnedCount: monitor.OwnedCount,
+		ReservedCount: monitor.ReservedCount, ExcludedCount: monitor.ExcludedScopeCount,
+		ConflictCount: monitor.ConflictCount, RetiredCount: monitor.RetiredCount,
+		LastDiscoveryAt: monitor.LastDiscoveryAt, DiscoveryError: monitor.LastDiscoveryError,
 		LastError: monitor.LastError, CreatedAt: monitor.CreatedAt, UpdatedAt: monitor.UpdatedAt,
 	}, nil
 }
@@ -252,33 +266,4 @@ func maintenanceMonitorMutationError(w http.ResponseWriter, err error) {
 		return
 	}
 	maintenanceAPIError(w, err, http.StatusInternalServerError)
-}
-
-func ensureMaintenanceMonitorTargetsAvailable(ctx context.Context, store maintenanceMonitorRepository, cfg *config.JobConfig) error {
-	catalog, _, _, targets, err := iceberg.DescribeMaintenanceMonitorConfig(cfg)
-	if err != nil {
-		return err
-	}
-	wanted := make(map[string]struct{}, len(targets))
-	for _, target := range targets {
-		key := strings.TrimSpace(catalog) + "." + strings.TrimSpace(target.Namespace) + "." + strings.TrimSpace(target.Table)
-		wanted[key] = struct{}{}
-	}
-	existing, err := store.ListMonitors(ctx)
-	if err != nil {
-		return err
-	}
-	for _, monitor := range existing {
-		existingCatalog, _, _, existingTargets, err := iceberg.DescribeMaintenanceMonitorConfig(monitor.Config)
-		if err != nil {
-			return fmt.Errorf("validate existing monitor %s: %w", monitor.ID, err)
-		}
-		for _, target := range existingTargets {
-			key := strings.TrimSpace(existingCatalog) + "." + strings.TrimSpace(target.Namespace) + "." + strings.TrimSpace(target.Table)
-			if _, conflict := wanted[key]; conflict {
-				return fmt.Errorf("Iceberg table %s is already owned by maintenance monitor %s", key, monitor.ID)
-			}
-		}
-	}
-	return nil
 }

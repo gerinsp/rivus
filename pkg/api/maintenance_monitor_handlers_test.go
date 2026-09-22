@@ -81,7 +81,7 @@ sink:
   type: iceberg_native
   config:
     rest_uri: http://iceberg-rest:8181
-    warehouse: s3://warehouse
+    warehouse: asmat
     table_maintenance:
       enabled: true
       executor: native
@@ -90,6 +90,46 @@ sink:
         - namespace: barayax_bronze
           table: tbl_absen
 `
+}
+
+func catalogMaintenanceMonitorYAML() string {
+	return `
+id: maintenance-catalogs
+name: Iceberg Catalog Maintenance
+mode: maintenance-only
+sink:
+  type: iceberg_native
+  config:
+    rest_uri: http://iceberg-rest:8181
+    table_maintenance:
+      enabled: true
+      executor: native
+      catalog_monitoring:
+        enabled: true
+        api_uri: http://gravitino:8090
+        metalake: lakehouse
+        discovery_interval_seconds: 300
+        catalog_patterns: ["*"]
+        namespace_patterns: ["*"]
+        table_patterns: ["*"]
+        exclude:
+          - catalog: asmat
+            namespace: static_reference
+            reason: immutable schema
+`
+}
+
+func TestMaintenanceMonitorAPIAcceptsCatalogMonitoring(t *testing.T) {
+	repo := newMemoryMaintenanceMonitorRepository()
+	srv := newTestServer(t, AuthConfig{Enabled: false, CookieName: defaultAuthCookie})
+	srv.maintenanceMonitors = repo
+	req := httptest.NewRequest(http.MethodPost, "/api/iceberg/maintenance/monitors", strings.NewReader(catalogMaintenanceMonitorYAML()))
+	req.Header.Set("Content-Type", "application/x-yaml")
+	rec := httptest.NewRecorder()
+	srv.Router().ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated || !strings.Contains(rec.Body.String(), `"catalog":"auto:*"`) {
+		t.Fatalf("create catalog monitor status=%d body=%s", rec.Code, rec.Body.String())
+	}
 }
 
 func TestMaintenanceMonitorLifecycleAPI(t *testing.T) {
@@ -161,13 +201,13 @@ func TestMaintenanceMonitorAPIRejectsSourceConnector(t *testing.T) {
 	}
 }
 
-func TestMaintenanceMonitorAPIRejectsDuplicateTableOwnership(t *testing.T) {
+func TestCreateSpecificMonitorAlongsideMetalakeMonitor(t *testing.T) {
 	repo := newMemoryMaintenanceMonitorRepository()
 	srv := newTestServer(t, AuthConfig{Enabled: false, CookieName: defaultAuthCookie})
 	srv.maintenanceMonitors = repo
 	router := srv.Router()
 
-	first := httptest.NewRequest(http.MethodPost, "/api/iceberg/maintenance/monitors", strings.NewReader(maintenanceMonitorYAML()))
+	first := httptest.NewRequest(http.MethodPost, "/api/iceberg/maintenance/monitors", strings.NewReader(catalogMaintenanceMonitorYAML()))
 	first.Header.Set("Content-Type", "application/x-yaml")
 	firstRec := httptest.NewRecorder()
 	router.ServeHTTP(firstRec, first)
@@ -175,12 +215,46 @@ func TestMaintenanceMonitorAPIRejectsDuplicateTableOwnership(t *testing.T) {
 		t.Fatalf("first create status=%d body=%s", firstRec.Code, firstRec.Body.String())
 	}
 
-	duplicateBody := strings.Replace(maintenanceMonitorYAML(), "id: barayax-maintenance", "id: barayax-maintenance-2", 1)
-	duplicate := httptest.NewRequest(http.MethodPost, "/api/iceberg/maintenance/monitors", strings.NewReader(duplicateBody))
-	duplicate.Header.Set("Content-Type", "application/x-yaml")
-	duplicateRec := httptest.NewRecorder()
-	router.ServeHTTP(duplicateRec, duplicate)
-	if duplicateRec.Code != http.StatusConflict || !strings.Contains(duplicateRec.Body.String(), "already owned") {
-		t.Fatalf("duplicate create status=%d body=%s", duplicateRec.Code, duplicateRec.Body.String())
+	specific := httptest.NewRequest(http.MethodPost, "/api/iceberg/maintenance/monitors", strings.NewReader(maintenanceMonitorYAML()))
+	specific.Header.Set("Content-Type", "application/x-yaml")
+	specificRec := httptest.NewRecorder()
+	router.ServeHTTP(specificRec, specific)
+	if specificRec.Code != http.StatusCreated {
+		t.Fatalf("specific create status=%d body=%s", specificRec.Code, specificRec.Body.String())
+	}
+}
+
+func TestMonitorResponseIncludesOwnershipCounts(t *testing.T) {
+	repo := newMemoryMaintenanceMonitorRepository()
+	srv := newTestServer(t, AuthConfig{Enabled: false, CookieName: defaultAuthCookie})
+	srv.maintenanceMonitors = repo
+	router := srv.Router()
+
+	create := httptest.NewRequest(http.MethodPost, "/api/iceberg/maintenance/monitors", strings.NewReader(catalogMaintenanceMonitorYAML()))
+	create.Header.Set("Content-Type", "application/x-yaml")
+	createRec := httptest.NewRecorder()
+	router.ServeHTTP(createRec, create)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", createRec.Code, createRec.Body.String())
+	}
+	monitor := repo.monitors["maintenance-catalogs"]
+	monitor.DiscoveredCount = 12
+	monitor.OwnedCount = 7
+	monitor.ReservedCount = 3
+	monitor.ExcludedScopeCount = 1
+	monitor.ConflictCount = 2
+	monitor.RetiredCount = 4
+	repo.monitors[monitor.ID] = monitor
+
+	req := httptest.NewRequest(http.MethodGet, "/api/iceberg/maintenance/monitors/maintenance-catalogs", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	for _, want := range []string{
+		`"discovered_count":12`, `"owned_count":7`, `"reserved_count":3`,
+		`"excluded_scope_count":1`, `"conflict_count":2`, `"retired_count":4`,
+	} {
+		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), want) {
+			t.Fatalf("status=%d body=%s missing %s", rec.Code, rec.Body.String(), want)
+		}
 	}
 }
