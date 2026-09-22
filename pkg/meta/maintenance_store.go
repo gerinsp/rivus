@@ -214,6 +214,7 @@ func (s *IcebergMaintenanceStore) Init(ctx context.Context) error {
 		  monitor_name VARCHAR(255) NOT NULL,
 		  status VARCHAR(32) NOT NULL,
 		  config_json LONGTEXT NOT NULL,
+		  excluded_scope_count INT NOT NULL DEFAULT 0,
 		  last_discovery_at DATETIME(6) NULL,
 		  last_discovery_error LONGTEXT NULL,
 		  created_at DATETIME(6) NOT NULL,
@@ -353,6 +354,9 @@ func (s *IcebergMaintenanceStore) Init(ctx context.Context) error {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "iceberg_maintenance_monitors", "last_discovery_at", "DATETIME(6) NULL AFTER config_json"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "iceberg_maintenance_monitors", "excluded_scope_count", "INT NOT NULL DEFAULT 0 AFTER config_json"); err != nil {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "iceberg_maintenance_monitors", "last_discovery_error", "LONGTEXT NULL AFTER last_discovery_at"); err != nil {

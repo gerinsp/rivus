@@ -683,6 +683,21 @@ func DescribeMaintenanceMonitorConfig(cfg *config.JobConfig) (string, string, st
 	return catalogLabel, executor, profile, targets, nil
 }
 
+// MaintenanceMonitorExcludedScopeCount reports configured exclusions without
+// enumerating the tables intentionally hidden beneath a catalog or namespace.
+func MaintenanceMonitorExcludedScopeCount(cfg *config.JobConfig) (int, error) {
+	normalized, _, err := PrepareMaintenanceMonitorConfig(cfg)
+	if err != nil {
+		return 0, err
+	}
+	_, sinkCfg := jobSinkSpec(normalized)
+	iceCfg, err := decodeIcebergConfig(sinkCfg)
+	if err != nil {
+		return 0, err
+	}
+	return len(iceCfg.TableMaintenance.CatalogMonitoring.Exclude), nil
+}
+
 func configMap(value any) (map[string]any, error) {
 	payload, err := yaml.Marshal(value)
 	if err != nil {

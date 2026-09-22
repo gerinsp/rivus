@@ -33,6 +33,12 @@ type IcebergMaintenanceMonitor struct {
 	Status             MaintenanceMonitorStatus `json:"status"`
 	Config             *config.JobConfig        `json:"-"`
 	TableCount         int                      `json:"table_count"`
+	DiscoveredCount    int                      `json:"discovered_count"`
+	OwnedCount         int                      `json:"owned_count"`
+	ReservedCount      int                      `json:"reserved_count"`
+	ExcludedScopeCount int                      `json:"excluded_scope_count"`
+	ConflictCount      int                      `json:"conflict_count"`
+	RetiredCount       int                      `json:"retired_count"`
 	LastInventoryAt    *time.Time               `json:"last_inventory_at,omitempty"`
 	LastDiscoveryAt    *time.Time               `json:"last_discovery_at,omitempty"`
 	LastDiscoveryError string                   `json:"last_discovery_error,omitempty"`
@@ -68,8 +74,9 @@ func (s *IcebergMaintenanceStore) CreateMonitor(ctx context.Context, monitor Ice
 	}
 	now := time.Now().UTC()
 	_, err = s.db.ExecContext(ctx, `INSERT INTO iceberg_maintenance_monitors
-		(monitor_id, monitor_name, status, config_json, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?)`, monitor.ID, monitor.Name, string(monitor.Status), string(payload), now, now)
+		(monitor_id, monitor_name, status, config_json, excluded_scope_count, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`, monitor.ID, monitor.Name, string(monitor.Status), string(payload),
+		monitor.ExcludedScopeCount, now, now)
 	if err != nil {
 		var mysqlErr *drivermysql.MySQLError
 		if errors.As(err, &mysqlErr) && mysqlErr.Number == 1062 {
@@ -82,13 +89,27 @@ func (s *IcebergMaintenanceStore) CreateMonitor(ctx context.Context, monitor Ice
 
 func (s *IcebergMaintenanceStore) ListMonitors(ctx context.Context) ([]IcebergMaintenanceMonitor, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT m.monitor_id, m.monitor_name, m.status, m.config_json,
-		COUNT(st.table_key), MAX(st.last_inventory_at),
-		COALESCE(MAX(NULLIF(st.last_error, '')), ''), m.last_discovery_at,
-		COALESCE(m.last_discovery_error, ''), m.created_at, m.updated_at
+		COALESCE(t.discovered_count, 0), COALESCE(t.owned_count, 0), COALESCE(t.reserved_count, 0),
+		m.excluded_scope_count, COALESCE(t.conflict_count, 0), COALESCE(t.retired_count, 0),
+		COALESCE(st.table_count, 0), st.last_inventory_at, COALESCE(st.last_error, ''),
+		m.last_discovery_at, COALESCE(m.last_discovery_error, ''), m.created_at, m.updated_at
 	FROM iceberg_maintenance_monitors m
-	LEFT JOIN iceberg_maintenance_state st ON st.owner_job_id=CONCAT('monitor:', m.monitor_id)
-	GROUP BY m.monitor_id, m.monitor_name, m.status, m.config_json, m.last_discovery_at,
-		m.last_discovery_error, m.created_at, m.updated_at
+	LEFT JOIN (
+		SELECT monitor_id,
+			SUM(claim_status <> 'retired') AS discovered_count,
+			SUM(claim_status = 'owned') AS owned_count,
+			SUM(claim_status = 'reserved') AS reserved_count,
+			SUM(claim_status = 'conflicted') AS conflict_count,
+			SUM(claim_status = 'retired') AS retired_count
+		FROM iceberg_maintenance_monitor_targets GROUP BY monitor_id
+	) t ON t.monitor_id=m.monitor_id
+	LEFT JOIN (
+		SELECT SUBSTRING(owner_job_id, 9) AS monitor_id, COUNT(*) AS table_count,
+			MAX(last_inventory_at) AS last_inventory_at,
+			COALESCE(MAX(NULLIF(last_error, '')), '') AS last_error
+		FROM iceberg_maintenance_state WHERE owner_job_id LIKE 'monitor:%'
+		GROUP BY SUBSTRING(owner_job_id, 9)
+	) st ON st.monitor_id=m.monitor_id
 	ORDER BY m.monitor_name, m.monitor_id`)
 	if err != nil {
 		return nil, err
@@ -107,14 +128,28 @@ func (s *IcebergMaintenanceStore) ListMonitors(ctx context.Context) ([]IcebergMa
 
 func (s *IcebergMaintenanceStore) GetMonitor(ctx context.Context, id string) (*IcebergMaintenanceMonitor, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT m.monitor_id, m.monitor_name, m.status, m.config_json,
-		COUNT(st.table_key), MAX(st.last_inventory_at),
-		COALESCE(MAX(NULLIF(st.last_error, '')), ''), m.last_discovery_at,
-		COALESCE(m.last_discovery_error, ''), m.created_at, m.updated_at
+		COALESCE(t.discovered_count, 0), COALESCE(t.owned_count, 0), COALESCE(t.reserved_count, 0),
+		m.excluded_scope_count, COALESCE(t.conflict_count, 0), COALESCE(t.retired_count, 0),
+		COALESCE(st.table_count, 0), st.last_inventory_at, COALESCE(st.last_error, ''),
+		m.last_discovery_at, COALESCE(m.last_discovery_error, ''), m.created_at, m.updated_at
 	FROM iceberg_maintenance_monitors m
-	LEFT JOIN iceberg_maintenance_state st ON st.owner_job_id=CONCAT('monitor:', m.monitor_id)
-	WHERE m.monitor_id=?
-	GROUP BY m.monitor_id, m.monitor_name, m.status, m.config_json, m.last_discovery_at,
-		m.last_discovery_error, m.created_at, m.updated_at`, strings.TrimSpace(id))
+	LEFT JOIN (
+		SELECT monitor_id,
+			SUM(claim_status <> 'retired') AS discovered_count,
+			SUM(claim_status = 'owned') AS owned_count,
+			SUM(claim_status = 'reserved') AS reserved_count,
+			SUM(claim_status = 'conflicted') AS conflict_count,
+			SUM(claim_status = 'retired') AS retired_count
+		FROM iceberg_maintenance_monitor_targets GROUP BY monitor_id
+	) t ON t.monitor_id=m.monitor_id
+	LEFT JOIN (
+		SELECT SUBSTRING(owner_job_id, 9) AS monitor_id, COUNT(*) AS table_count,
+			MAX(last_inventory_at) AS last_inventory_at,
+			COALESCE(MAX(NULLIF(last_error, '')), '') AS last_error
+		FROM iceberg_maintenance_state WHERE owner_job_id LIKE 'monitor:%'
+		GROUP BY SUBSTRING(owner_job_id, 9)
+	) st ON st.monitor_id=m.monitor_id
+	WHERE m.monitor_id=?`, strings.TrimSpace(id))
 	monitor, err := scanMaintenanceMonitor(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -300,8 +335,10 @@ func scanMaintenanceMonitor(scanner maintenanceMonitorScanner) (IcebergMaintenan
 	var monitor IcebergMaintenanceMonitor
 	var status, configJSON string
 	var lastInventory, lastDiscovery sql.NullTime
-	if err := scanner.Scan(&monitor.ID, &monitor.Name, &status, &configJSON, &monitor.TableCount,
-		&lastInventory, &monitor.LastError, &lastDiscovery, &monitor.LastDiscoveryError,
+	if err := scanner.Scan(&monitor.ID, &monitor.Name, &status, &configJSON,
+		&monitor.DiscoveredCount, &monitor.OwnedCount, &monitor.ReservedCount,
+		&monitor.ExcludedScopeCount, &monitor.ConflictCount, &monitor.RetiredCount,
+		&monitor.TableCount, &lastInventory, &monitor.LastError, &lastDiscovery, &monitor.LastDiscoveryError,
 		&monitor.CreatedAt, &monitor.UpdatedAt); err != nil {
 		return monitor, err
 	}

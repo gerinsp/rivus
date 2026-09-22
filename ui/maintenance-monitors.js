@@ -56,20 +56,32 @@ function monitorRow(monitor) {
   const tables = Array.isArray(monitor.tables) ? monitor.tables : [];
   const sample = tables.slice(0, 3).map((table) => `${table.namespace}.${table.table}`).join(', ');
   const remaining = Math.max(0, tables.length - 3);
+  const catalogDiscovery = String(monitor.catalog || '').startsWith('auto:');
+  const selectionSummary = catalogDiscovery
+    ? 'Catalog discovery · non-streaming tables'
+    : (sample || 'Waiting for table registration');
+	const discovered = Number(monitor.discovered_count || monitor.table_count || tables.length || 0);
+	const owned = Number(monitor.owned_count || monitor.table_count || 0);
+	const reserved = Number(monitor.reserved_count || 0);
+	const conflicts = Number(monitor.conflict_count || 0);
   return `
     <tr class="align-top transition hover:bg-white/70">
       <td data-label="ID" class="px-6 py-4">${idChip(monitor.id)}</td>
       <td data-label="Monitor" class="px-6 py-4">
         <div class="font-semibold text-slate-900">${escapeHtml(monitor.name || monitor.id)}</div>
-        <div class="mono mt-1 max-w-[34rem] text-xs leading-5 text-slate-500">${escapeHtml(sample || 'Waiting for table registration')}${remaining ? ` +${remaining} more` : ''}</div>
+        <div class="mono mt-1 max-w-[34rem] text-xs leading-5 text-slate-500">${escapeHtml(selectionSummary)}${!catalogDiscovery && remaining ? ` +${remaining} more` : ''}</div>
         ${monitor.last_error ? `<div class="mt-2 text-xs text-rose-700">${escapeHtml(monitor.last_error)}</div>` : ''}
+		${monitor.last_discovery_error ? `<div class="mt-2 text-xs text-rose-700">Discovery: ${escapeHtml(monitor.last_discovery_error)}</div>` : ''}
       </td>
       <td data-label="Status" class="px-6 py-4">${statusPill(monitor.status)}</td>
       <td data-label="Catalog" class="px-6 py-4">
         <div class="mono text-xs font-semibold text-slate-800">${escapeHtml(monitor.catalog || '-')}</div>
         <div class="mt-1 text-xs text-slate-500">${escapeHtml(monitor.executor || 'hybrid')} · ${escapeHtml(monitor.resource_profile || 'small')}</div>
       </td>
-      <td data-label="Tables" class="px-6 py-4 text-sm font-semibold text-slate-800">${escapeHtml(monitor.table_count ?? tables.length)}</td>
+      <td data-label="Tables" class="px-6 py-4">
+		<div class="text-sm font-semibold text-slate-800">${escapeHtml(owned)} maintained here</div>
+		<div class="mt-1 text-xs text-slate-500">${escapeHtml(discovered)} discovered · ${escapeHtml(reserved)} streaming/snapshot · ${escapeHtml(conflicts)} another monitor</div>
+	  </td>
       <td data-label="Last inventory" class="px-6 py-4 text-xs text-slate-600">${escapeHtml(formatDateTime(monitor.last_inventory_at))}</td>
       <td data-label="Actions" class="px-6 py-4 text-right">${monitorActions(monitor)}</td>
     </tr>
@@ -194,6 +206,24 @@ export async function showMaintenanceMonitorDetails(id) {
       await showMaintenanceMonitorDetails(monitor.id);
     },
   });
+
+	const ownership = [
+		['Discovered', monitor.discovered_count || 0],
+		['Maintained here', monitor.owned_count || monitor.table_count || 0],
+		['Used by streaming/snapshot', monitor.reserved_count || 0],
+		['Excluded scopes', monitor.excluded_scope_count || 0],
+		['Owned by another monitor', monitor.conflict_count || 0],
+		['Retired', monitor.retired_count || 0],
+	];
+	panel.insertAdjacentHTML('afterbegin', `
+	  <div class="grid gap-3 border-b border-slate-200 bg-white px-5 py-4 sm:grid-cols-3 lg:grid-cols-6 sm:px-6">
+		${ownership.map(([label, value]) => `
+		  <div>
+			<div class="text-[11px] font-semibold uppercase tracking-wide text-slate-500">${escapeHtml(label)}</div>
+			<div class="mono mt-1 text-lg font-semibold text-slate-900">${escapeHtml(Number(value))}</div>
+		  </div>`).join('')}
+	  </div>
+	`);
 }
 
 export function closeMaintenanceMonitorDetails() {

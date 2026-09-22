@@ -99,12 +99,13 @@ func RunMaintenanceWorkerBounded(ctx context.Context, dsn string, opts Maintenan
 	)
 
 	var jobs map[string]maintenanceWorkerJob
+	var streamExclusions []maintenanceMonitorTarget
 	var lastStateSync time.Time
 	var lastMonitorSync time.Time
 	for {
 		now := time.Now().UTC()
-		if jobs == nil || now.Sub(lastStateSync) >= 10*time.Minute {
-			jobs, err = syncMaintenanceStates(workerCtx, store, jobStore, now)
+		if jobs == nil || now.Sub(lastStateSync) >= maintenanceJobStateSyncInterval {
+			jobs, streamExclusions, err = syncMaintenanceStates(workerCtx, store, jobStore, now)
 			if err != nil {
 				return err
 			}
@@ -117,7 +118,7 @@ func RunMaintenanceWorkerBounded(ctx context.Context, dsn string, opts Maintenan
 			}
 		}
 		if lastMonitorSync.IsZero() || now.Sub(lastMonitorSync) >= opts.PollInterval {
-			jobs, err = syncMaintenanceMonitorStates(workerCtx, store, jobs, now)
+			jobs, err = syncMaintenanceMonitorStates(workerCtx, store, jobs, streamExclusions, now)
 			if err != nil {
 				return err
 			}
