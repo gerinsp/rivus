@@ -17,7 +17,10 @@ const (
 	MaintenanceReservationSnapshot  = "snapshot"
 )
 
-var ErrMaintenanceOwnershipBusy = errors.New("maintenance ownership is busy")
+var (
+	ErrMaintenanceOwnershipBusy  = errors.New("maintenance ownership is busy")
+	ErrMaintenanceOwnershipStale = errors.New("maintenance ownership submission is stale")
+)
 
 // IcebergMaintenanceReservationSelector identifies a physical Iceberg target
 // scope. NamespacePattern and TablePattern use path.Match syntax so one
@@ -95,6 +98,11 @@ type maintenanceReservationState struct {
 	LeaseUntil sql.NullTime
 }
 
+type maintenanceOwnerSubmission struct {
+	owner, submission, kind string
+	catalogs                map[string]struct{}
+}
+
 func (s *IcebergMaintenanceStore) SyncMaintenanceReservations(
 	ctx context.Context,
 	ownerJobID, submissionID, kind string,
@@ -123,6 +131,16 @@ func (s *IcebergMaintenanceStore) SyncMaintenanceReservations(
 		return err
 	}
 	defer tx.Rollback()
+	var currentSubmission string
+	if err := tx.QueryRowContext(ctx, `SELECT submission_id FROM job_registry WHERE job_id=? FOR UPDATE`, ownerJobID).Scan(&currentSubmission); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: job %s is not registered", ErrMaintenanceOwnershipStale, ownerJobID)
+		}
+		return err
+	}
+	if currentSubmission != submissionID {
+		return fmt.Errorf("%w: job %s current submission is %s", ErrMaintenanceOwnershipStale, ownerJobID, currentSubmission)
+	}
 
 	catalogs := make(map[string]struct{}, len(normalized))
 	for _, selector := range normalized {
@@ -289,23 +307,64 @@ func (s *IcebergMaintenanceStore) ReleaseMaintenanceReservations(
 	return tx.Commit()
 }
 
-func (s *IcebergMaintenanceStore) ReleaseMaintenanceReservationsExcept(ctx context.Context, keep map[string]string, now time.Time) error {
-	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT owner_job_id, submission_id
-		FROM iceberg_maintenance_reservations WHERE active=1`)
+func (s *IcebergMaintenanceStore) ReleaseMaintenanceReservationsExcept(ctx context.Context, _ map[string]string, now time.Time) error {
+	ownerRows, err := s.db.QueryContext(ctx, `SELECT DISTINCT owner_job_id FROM iceberg_maintenance_reservations WHERE active=1`)
 	if err != nil {
 		return err
 	}
-	type ownerSubmission struct{ owner, submission string }
-	var stale []ownerSubmission
+	knownOwners := make(map[string]struct{})
+	var owners []string
+	for ownerRows.Next() {
+		var owner string
+		if err := ownerRows.Scan(&owner); err != nil {
+			ownerRows.Close()
+			return err
+		}
+		knownOwners[owner] = struct{}{}
+		owners = append(owners, owner)
+	}
+	if err := ownerRows.Close(); err != nil {
+		return err
+	}
+	if err := ownerRows.Err(); err != nil {
+		return err
+	}
+	sort.Strings(owners)
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, owner := range owners {
+		var locked string
+		err := tx.QueryRowContext(ctx, `SELECT job_id FROM job_registry WHERE job_id=? FOR UPDATE`, owner).Scan(&locked)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+	}
+
+	rows, err := tx.QueryContext(ctx, `SELECT owner_job_id, submission_id, reservation_kind, catalog
+		FROM iceberg_maintenance_reservations WHERE active=1 ORDER BY owner_job_id, submission_id, catalog`)
+	if err != nil {
+		return err
+	}
+	pairs := make(map[string]*maintenanceOwnerSubmission)
 	for rows.Next() {
-		var pair ownerSubmission
-		if err := rows.Scan(&pair.owner, &pair.submission); err != nil {
+		var owner, submission, kind, catalog string
+		if err := rows.Scan(&owner, &submission, &kind, &catalog); err != nil {
 			rows.Close()
 			return err
 		}
-		if current, exists := keep[pair.owner]; !exists || current != pair.submission {
-			stale = append(stale, pair)
+		if _, prelocked := knownOwners[owner]; !prelocked {
+			continue
 		}
+		key := owner + "\x00" + submission
+		pair := pairs[key]
+		if pair == nil {
+			pair = &maintenanceOwnerSubmission{owner: owner, submission: submission, kind: kind, catalogs: make(map[string]struct{})}
+			pairs[key] = pair
+		}
+		pair.catalogs[catalog] = struct{}{}
 	}
 	if err := rows.Close(); err != nil {
 		return err
@@ -313,12 +372,99 @@ func (s *IcebergMaintenanceStore) ReleaseMaintenanceReservationsExcept(ctx conte
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	for _, pair := range stale {
-		if err := s.ReleaseMaintenanceReservations(ctx, pair.owner, pair.submission, now); err != nil {
+
+	var stale []*maintenanceOwnerSubmission
+	allCatalogs := make(map[string]struct{})
+	for _, pair := range pairs {
+		keep, err := maintenanceReservationCurrentInRegistry(ctx, tx, *pair)
+		if err != nil {
 			return err
 		}
+		if keep {
+			continue
+		}
+		stale = append(stale, pair)
+		for catalog := range pair.catalogs {
+			allCatalogs[catalog] = struct{}{}
+		}
 	}
-	return nil
+	if len(stale) == 0 {
+		return tx.Commit()
+	}
+	if err := lockMaintenanceCatalogs(ctx, tx, sortedStringSet(allCatalogs), now); err != nil {
+		return err
+	}
+	staleOwners := make(map[string]struct{}, len(stale))
+	for _, pair := range stale {
+		if _, err := tx.ExecContext(ctx, `UPDATE iceberg_maintenance_reservations SET active=0, updated_at=?
+			WHERE owner_job_id=? AND submission_id=? AND active=1`, now.UTC(), pair.owner, pair.submission); err != nil {
+			return err
+		}
+		staleOwners[pair.owner] = struct{}{}
+	}
+	var changedKeys []string
+	for catalog := range allCatalogs {
+		states, err := loadMaintenanceReservationStates(ctx, tx, catalog)
+		if err != nil {
+			return err
+		}
+		reservations, err := loadActiveMaintenanceReservations(ctx, tx, catalog)
+		if err != nil {
+			return err
+		}
+		for _, state := range states {
+			if _, staleOwner := staleOwners[state.OwnerJobID]; !staleOwner {
+				continue
+			}
+			winner := matchingMaintenanceReservation(reservations, state)
+			if winner.OwnerJobID == state.OwnerJobID {
+				continue
+			}
+			ownerType, nextOwner := "unmanaged", "unmanaged"
+			if winner.OwnerJobID != "" {
+				ownerType, nextOwner = winner.Kind, winner.OwnerJobID
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE iceberg_maintenance_state SET owner_type=?, owner_job_id=?,
+				next_inventory_check_at=NULL, inventory_priority=0, next_compaction_check_at=NULL,
+				next_expire_check_at=NULL, next_orphan_check_at=NULL, updated_at=? WHERE table_key=? AND owner_job_id=?`,
+				ownerType, nextOwner, now.UTC(), state.TableKey, state.OwnerJobID); err != nil {
+				return err
+			}
+			changedKeys = append(changedKeys, state.TableKey)
+		}
+	}
+	if err := cancelMaintenanceTasksForTables(ctx, tx, changedKeys, now); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func maintenanceReservationCurrentInRegistry(ctx context.Context, tx *sql.Tx, pair maintenanceOwnerSubmission) (bool, error) {
+	var submission, desiredState, lastStatus, metaKey string
+	err := tx.QueryRowContext(ctx, `SELECT submission_id, desired_state, last_status, COALESCE(meta_key, '')
+		FROM job_registry WHERE job_id=? FOR UPDATE`, pair.owner).Scan(&submission, &desiredState, &lastStatus, &metaKey)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if submission != pair.submission {
+		return false, nil
+	}
+	if pair.kind == MaintenanceReservationSnapshot {
+		if metaKey == "" {
+			return true, nil
+		}
+		var done int
+		err := tx.QueryRowContext(ctx, `SELECT done FROM job_snapshots WHERE job_id=?`, metaKey).Scan(&done)
+		if errors.Is(err, sql.ErrNoRows) {
+			return true, nil
+		}
+		return done == 0, err
+	}
+	status := strings.ToUpper(strings.TrimSpace(lastStatus))
+	return strings.EqualFold(desiredState, string(DesiredStateRunning)) || status == "PAUSED" || status == "PAUSING" || status == "STOPPING", nil
 }
 
 func normalizeMaintenanceReservationSelectors(selectors []IcebergMaintenanceReservationSelector) ([]IcebergMaintenanceReservationSelector, error) {

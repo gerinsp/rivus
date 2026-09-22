@@ -62,4 +62,19 @@ func TestApplyMonitorDiscoveryDoesNotRewriteUnchangedTargetOrState(t *testing.T)
 		t.Fatalf("unchanged discovery rewrote rows: target %s -> %s, state %s -> %s",
 			firstTargetUpdate, secondTargetUpdate, firstStateUpdate, secondStateUpdate)
 	}
+
+	if _, err := store.db.ExecContext(context.Background(), `UPDATE iceberg_maintenance_state
+		SET owner_type='unmanaged', owner_job_id='unmanaged', snapshot_complete=0 WHERE table_key=?`, tableKey); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ApplyMonitorDiscovery(context.Background(), monitor, []IcebergMaintenanceMonitorTarget{target}, now.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	state, err := store.GetState(context.Background(), tableKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state == nil || state.OwnerJobID != MaintenanceMonitorOwnerID(monitor.ID) || !state.SnapshotComplete {
+		t.Fatalf("reclaimed state = %#v, want monitor ownership with snapshot inventory required", state)
+	}
 }

@@ -129,6 +129,17 @@ func (s *IcebergMaintenanceStore) ClaimTasksForOperation(
 	if operation == "" {
 		return nil, fmt.Errorf("maintenance operation is required")
 	}
+	return s.claimTasksOwnershipSafe(ctx, workerID, now, lease, operation, limit)
+}
+
+func (s *IcebergMaintenanceStore) claimTasksOwnershipSafe(
+	ctx context.Context,
+	workerID string,
+	now time.Time,
+	lease time.Duration,
+	operation string,
+	limit int,
+) ([]IcebergMaintenanceTask, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 1
 	}
@@ -147,7 +158,7 @@ func (s *IcebergMaintenanceStore) ClaimTasksForOperation(
 	 task.created_at, task.updated_at, state.catalog
 	FROM iceberg_maintenance_tasks AS task
 	JOIN iceberg_maintenance_state AS state ON state.table_key=task.table_key
-	WHERE task.status IN ('queued','retry') AND task.not_before <= ? AND task.operation=?
+	WHERE task.status IN ('queued','retry') AND task.not_before <= ? AND (?='' OR task.operation=?)
 	  AND task.owner_job_id NOT LIKE 'deleted-monitor:%'
 	  AND (state.lease_until IS NULL OR state.lease_until < ?)
 	  AND (state.inventory_lease_until IS NULL OR state.inventory_lease_until < ?)
@@ -156,7 +167,7 @@ func (s *IcebergMaintenanceStore) ClaimTasksForOperation(
 	    WHERE monitor.monitor_id=SUBSTRING(task.owner_job_id, 9) AND monitor.status='ACTIVE'
 	  ))
 	ORDER BY task.priority ASC, task.not_before ASC, task.id ASC
-	LIMIT ?`, now.UTC(), operation, now.UTC(), now.UTC(), limit)
+	LIMIT ?`, now.UTC(), operation, operation, now.UTC(), now.UTC(), limit)
 	if err != nil {
 		return nil, err
 	}

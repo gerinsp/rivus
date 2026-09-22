@@ -60,8 +60,8 @@ function monitorRow(monitor) {
   const selectionSummary = catalogDiscovery
     ? 'Catalog discovery · non-streaming tables'
     : (sample || 'Waiting for table registration');
-	const discovered = Number(monitor.discovered_count || monitor.table_count || tables.length || 0);
-	const owned = Number(monitor.owned_count || monitor.table_count || 0);
+	const discovered = Number(monitor.discovered_count ?? monitor.table_count ?? tables.length ?? 0);
+	const owned = Number(monitor.owned_count ?? monitor.table_count ?? 0);
 	const reserved = Number(monitor.reserved_count || 0);
 	const conflicts = Number(monitor.conflict_count || 0);
   return `
@@ -209,7 +209,7 @@ export async function showMaintenanceMonitorDetails(id) {
 
 	const ownership = [
 		['Discovered', monitor.discovered_count || 0],
-		['Maintained here', monitor.owned_count || monitor.table_count || 0],
+		['Maintained here', monitor.owned_count ?? monitor.table_count ?? 0],
 		['Used by streaming/snapshot', monitor.reserved_count || 0],
 		['Excluded scopes', monitor.excluded_scope_count || 0],
 		['Owned by another monitor', monitor.conflict_count || 0],

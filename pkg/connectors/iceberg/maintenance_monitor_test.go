@@ -74,6 +74,7 @@ func TestEqualSpecificityOwnershipIsStable(t *testing.T) {
 type maintenanceDiscoveryCatalogStub struct {
 	namespaces map[string][]icetable.Identifier
 	tables     map[string][]icetable.Identifier
+	tableCalls map[string]int
 }
 
 func (s maintenanceDiscoveryCatalogStub) ListNamespaces(_ context.Context, parent icetable.Identifier) ([]icetable.Identifier, error) {
@@ -82,7 +83,11 @@ func (s maintenanceDiscoveryCatalogStub) ListNamespaces(_ context.Context, paren
 
 func (s maintenanceDiscoveryCatalogStub) ListTables(_ context.Context, namespace icetable.Identifier) iter.Seq2[icetable.Identifier, error] {
 	return func(yield func(icetable.Identifier, error) bool) {
-		for _, table := range s.tables[strings.Join(namespace, ".")] {
+		key := strings.Join(namespace, ".")
+		if s.tableCalls != nil {
+			s.tableCalls[key]++
+		}
+		for _, table := range s.tables[key] {
 			if !yield(table, nil) {
 				return
 			}
@@ -99,7 +104,7 @@ func maintenanceMonitorConfigForTest() *config.JobConfig {
 			Type: "iceberg_native",
 			Config: map[string]any{
 				"rest_uri":  "http://iceberg-rest:8181",
-				"warehouse": "s3://warehouse",
+				"warehouse": "asmat",
 				"table_maintenance": map[string]any{
 					"enabled":      true,
 					"executor":     "native",
@@ -261,6 +266,29 @@ func TestExpandMaintenanceMonitorTargetsDiscoversNewNamespacesAndTables(t *testi
 		if targets[i] != want[i] {
 			t.Fatalf("targets[%d] = %#v, want %#v", i, targets[i], want[i])
 		}
+	}
+}
+
+func TestExpandMaintenanceMonitorTargetsSkipsExcludedNamespaceBeforeListingTables(t *testing.T) {
+	cat := maintenanceDiscoveryCatalogStub{
+		namespaces: map[string][]icetable.Identifier{"": {{"analytics"}, {"streaming"}}},
+		tables: map[string][]icetable.Identifier{
+			"analytics": {{"analytics", "historical"}},
+			"streaming": {{"streaming", "events"}},
+		},
+		tableCalls: make(map[string]int),
+	}
+	targets, err := expandMaintenanceMonitorTargets(context.Background(), cat, []config.IcebergTarget{{Namespace: "*", Table: "*"}}, func(namespace string) bool {
+		return namespace == "analytics"
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cat.tableCalls["analytics"] != 0 {
+		t.Fatalf("excluded namespace was listed %d time(s)", cat.tableCalls["analytics"])
+	}
+	if got, want := targets, []config.IcebergTarget{{Namespace: "streaming", Table: "events"}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("targets = %#v, want %#v", got, want)
 	}
 }
 

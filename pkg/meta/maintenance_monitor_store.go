@@ -166,11 +166,18 @@ func (s *IcebergMaintenanceStore) SetMonitorStatus(ctx context.Context, id strin
 	}
 	id = strings.TrimSpace(id)
 	ownerID := MaintenanceMonitorOwnerID(id)
+	catalogs, err := s.monitorCatalogs(ctx, id)
+	if err != nil {
+		return err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	if err := lockMaintenanceCatalogs(ctx, tx, catalogs, now); err != nil {
+		return err
+	}
 	res, err := tx.ExecContext(ctx, `UPDATE iceberg_maintenance_monitors SET status=?, updated_at=? WHERE monitor_id=?`, status, now.UTC(), id)
 	if err != nil {
 		return err
@@ -214,6 +221,10 @@ func (s *IcebergMaintenanceStore) SetMonitorStatus(ctx context.Context, id strin
 func (s *IcebergMaintenanceStore) DeleteMonitor(ctx context.Context, id string, now time.Time) error {
 	id = strings.TrimSpace(id)
 	ownerID := MaintenanceMonitorOwnerID(id)
+	catalogs, err := s.monitorCatalogs(ctx, id)
+	if err != nil {
+		return err
+	}
 	deletedOwnerSum := sha256.Sum256([]byte(fmt.Sprintf("%s|%d", ownerID, now.UTC().UnixNano())))
 	deletedOwnerID := fmt.Sprintf("deleted-monitor:%x", deletedOwnerSum[:16])
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -221,6 +232,9 @@ func (s *IcebergMaintenanceStore) DeleteMonitor(ctx context.Context, id string, 
 		return err
 	}
 	defer tx.Rollback()
+	if err := lockMaintenanceCatalogs(ctx, tx, catalogs, now); err != nil {
+		return err
+	}
 	res, err := tx.ExecContext(ctx, `DELETE FROM iceberg_maintenance_monitors WHERE monitor_id=?`, id)
 	if err != nil {
 		return err
@@ -259,6 +273,24 @@ func (s *IcebergMaintenanceStore) DeleteMonitor(ctx context.Context, id string, 
 		return err
 	}
 	return tx.Commit()
+}
+
+func (s *IcebergMaintenanceStore) monitorCatalogs(ctx context.Context, id string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT catalog FROM iceberg_maintenance_monitor_targets
+		WHERE monitor_id=? AND claim_status<>?`, strings.TrimSpace(id), MaintenanceMonitorTargetRetired)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var catalogs []string
+	for rows.Next() {
+		var catalog string
+		if err := rows.Scan(&catalog); err != nil {
+			return nil, err
+		}
+		catalogs = append(catalogs, catalog)
+	}
+	return catalogs, rows.Err()
 }
 
 // ExcludeMonitorTables removes streaming-owned tables from a catalog monitor

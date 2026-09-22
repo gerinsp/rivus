@@ -116,6 +116,9 @@ func PrepareMaintenanceMonitorConfig(cfg *config.JobConfig) (*config.JobConfig, 
 		if catalogName := maintenanceCatalogName(iceCfg); !sparkCatalogNamePattern.MatchString(catalogName) {
 			return nil, nil, fmt.Errorf("invalid Iceberg catalog name %q", catalogName)
 		}
+		if _, err := maintenanceIdentityCatalogName(iceCfg); err != nil {
+			return nil, nil, err
+		}
 	}
 	targets := dedupeTargets(rawTargets)
 	if len(targets) > maxMaintenanceTables {
@@ -161,11 +164,15 @@ func maintenanceDiscoveryInterval(cfg config.IcebergConfig) time.Duration {
 }
 
 func discoverMaintenanceMonitorTargets(ctx context.Context, iceCfg config.IcebergConfig, selectors []config.IcebergTarget) ([]config.IcebergTarget, error) {
+	return discoverMaintenanceMonitorTargetsFiltered(ctx, iceCfg, selectors, nil)
+}
+
+func discoverMaintenanceMonitorTargetsFiltered(ctx context.Context, iceCfg config.IcebergConfig, selectors []config.IcebergTarget, excludedNamespace func(string) bool) ([]config.IcebergTarget, error) {
 	cat, err := newCatalog(ctx, iceCfg)
 	if err != nil {
 		return nil, err
 	}
-	return expandMaintenanceMonitorTargets(ctx, cat, selectors)
+	return expandMaintenanceMonitorTargets(ctx, cat, selectors, excludedNamespace)
 }
 
 type maintenanceMonitorTarget struct {
@@ -362,7 +369,9 @@ func discoverCatalogMonitorTargets(ctx context.Context, cfg *config.JobConfig, i
 		if err != nil {
 			return nil, err
 		}
-		targets, err := discoverMaintenanceMonitorTargets(ctx, catalogIceCfg, selectors)
+		targets, err := discoverMaintenanceMonitorTargetsFiltered(ctx, catalogIceCfg, selectors, func(namespace string) bool {
+			return catalogMonitoringNamespaceExcluded(monitoring, catalogName, namespace)
+		})
 		if err != nil {
 			return nil, fmt.Errorf("discover catalog %s: %w", catalogName, err)
 		}
@@ -411,6 +420,20 @@ func catalogMonitoringTargetExcluded(monitoring config.IcebergCatalogMonitoringC
 		namespaceMatch, namespaceErr := path.Match(namespacePattern, target.Namespace)
 		tableMatch, tableErr := path.Match(tablePattern, target.Table)
 		if catalogErr == nil && namespaceErr == nil && tableErr == nil && catalogMatch && namespaceMatch && tableMatch {
+			return true
+		}
+	}
+	return false
+}
+
+func catalogMonitoringNamespaceExcluded(monitoring config.IcebergCatalogMonitoringConfig, catalog, namespace string) bool {
+	for _, exclusion := range monitoring.Exclude {
+		if strings.TrimSpace(exclusion.Namespace) == "" || strings.TrimSpace(exclusion.Table) != "" {
+			continue
+		}
+		catalogMatch, catalogErr := path.Match(strings.TrimSpace(exclusion.Catalog), catalog)
+		namespaceMatch, namespaceErr := path.Match(strings.TrimSpace(exclusion.Namespace), namespace)
+		if catalogErr == nil && namespaceErr == nil && catalogMatch && namespaceMatch {
 			return true
 		}
 	}
@@ -543,7 +566,11 @@ type maintenanceDiscoveryCatalog interface {
 	ListNamespaces(context.Context, icetable.Identifier) ([]icetable.Identifier, error)
 }
 
-func expandMaintenanceMonitorTargets(ctx context.Context, cat maintenanceDiscoveryCatalog, selectors []config.IcebergTarget) ([]config.IcebergTarget, error) {
+func expandMaintenanceMonitorTargets(ctx context.Context, cat maintenanceDiscoveryCatalog, selectors []config.IcebergTarget, excludedNamespaces ...func(string) bool) ([]config.IcebergTarget, error) {
+	var excludedNamespace func(string) bool
+	if len(excludedNamespaces) > 0 {
+		excludedNamespace = excludedNamespaces[0]
+	}
 	targets := make(map[string]config.IcebergTarget)
 	namespaces := make(map[string]struct{})
 	needsNamespaceListing := false
@@ -556,7 +583,7 @@ func expandMaintenanceMonitorTargets(ctx context.Context, cat maintenanceDiscove
 	}
 
 	if needsNamespaceListing {
-		discovered, err := listMaintenanceNamespaces(ctx, cat)
+		discovered, err := listMaintenanceNamespaces(ctx, cat, excludedNamespace)
 		if err != nil {
 			return nil, fmt.Errorf("list Iceberg namespaces for maintenance discovery: %w", err)
 		}
@@ -566,6 +593,9 @@ func expandMaintenanceMonitorTargets(ctx context.Context, cat maintenanceDiscove
 	}
 
 	for namespace := range namespaces {
+		if excludedNamespace != nil && excludedNamespace(namespace) {
+			continue
+		}
 		needsTableListing := false
 		for _, selector := range selectors {
 			matched, err := path.Match(selector.Namespace, namespace)
@@ -613,7 +643,11 @@ func expandMaintenanceMonitorTargets(ctx context.Context, cat maintenanceDiscove
 	return out, nil
 }
 
-func listMaintenanceNamespaces(ctx context.Context, cat maintenanceDiscoveryCatalog) ([]string, error) {
+func listMaintenanceNamespaces(ctx context.Context, cat maintenanceDiscoveryCatalog, excludedNamespaces ...func(string) bool) ([]string, error) {
+	var excludedNamespace func(string) bool
+	if len(excludedNamespaces) > 0 {
+		excludedNamespace = excludedNamespaces[0]
+	}
 	queue, err := cat.ListNamespaces(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -628,6 +662,10 @@ func listMaintenanceNamespaces(ctx context.Context, cat maintenanceDiscoveryCata
 			continue
 		}
 		if _, exists := seen[name]; exists {
+			continue
+		}
+		if excludedNamespace != nil && excludedNamespace(name) {
+			seen[name] = struct{}{}
 			continue
 		}
 		seen[name] = struct{}{}

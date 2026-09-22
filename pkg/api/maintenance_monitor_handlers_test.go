@@ -81,7 +81,7 @@ sink:
   type: iceberg_native
   config:
     rest_uri: http://iceberg-rest:8181
-    warehouse: s3://warehouse
+    warehouse: asmat
     table_maintenance:
       enabled: true
       executor: native

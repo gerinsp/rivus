@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gerinsp/rivus/pkg/config"
 )
 
 func TestMaintenanceReservationMatchesCatalogScopedPatterns(t *testing.T) {
@@ -51,7 +53,8 @@ func TestPreferredMaintenanceReservationPrioritizesStreaming(t *testing.T) {
 
 func TestReservationBeforeClaimCancelsMonitorTask(t *testing.T) {
 	store, catalog, tableKey := newMaintenanceOwnershipIntegrationStore(t)
-	seedQueuedMonitorTask(t, store, tableKey, "monitor:general", nil)
+	seedCurrentOwnershipJob(t, store, "stream-orders", "submission-1")
+	seedQueuedMonitorTask(t, store, tableKey, MaintenanceMonitorOwnerID("general-"+catalog), nil)
 	err := store.SyncMaintenanceReservations(
 		context.Background(),
 		"stream-orders",
@@ -77,8 +80,9 @@ func TestReservationBeforeClaimCancelsMonitorTask(t *testing.T) {
 
 func TestReservationDuringActiveLeaseReturnsBusy(t *testing.T) {
 	store, catalog, tableKey := newMaintenanceOwnershipIntegrationStore(t)
+	seedCurrentOwnershipJob(t, store, "stream-orders", "submission-1")
 	leaseUntil := time.Now().Add(time.Minute)
-	seedQueuedMonitorTask(t, store, tableKey, "monitor:general", &leaseUntil)
+	seedQueuedMonitorTask(t, store, tableKey, MaintenanceMonitorOwnerID("general-"+catalog), &leaseUntil)
 	err := store.SyncMaintenanceReservations(
 		context.Background(),
 		"stream-orders",
@@ -93,8 +97,8 @@ func TestReservationDuringActiveLeaseReturnsBusy(t *testing.T) {
 }
 
 func TestClaimRejectsTaskAfterOwnerTransfer(t *testing.T) {
-	store, _, tableKey := newMaintenanceOwnershipIntegrationStore(t)
-	seedQueuedMonitorTask(t, store, tableKey, "monitor:general", nil)
+	store, catalog, tableKey := newMaintenanceOwnershipIntegrationStore(t)
+	seedQueuedMonitorTask(t, store, tableKey, MaintenanceMonitorOwnerID("general-"+catalog), nil)
 	if _, err := store.db.ExecContext(context.Background(), `UPDATE iceberg_maintenance_state
 		SET owner_type='streaming', owner_job_id='stream-orders' WHERE table_key=?`, tableKey); err != nil {
 		t.Fatal(err)
@@ -114,8 +118,29 @@ func TestClaimRejectsTaskAfterOwnerTransfer(t *testing.T) {
 	}
 }
 
+func TestLegacyClaimRejectsTaskAfterOwnerTransfer(t *testing.T) {
+	store, catalog, tableKey := newMaintenanceOwnershipIntegrationStore(t)
+	seedQueuedMonitorTask(t, store, tableKey, MaintenanceMonitorOwnerID("general-"+catalog), nil)
+	if _, err := store.db.ExecContext(context.Background(), `UPDATE iceberg_maintenance_state
+		SET owner_type='streaming', owner_job_id='stream-orders' WHERE table_key=?`, tableKey); err != nil {
+		t.Fatal(err)
+	}
+
+	tasks, err := store.ClaimTasks(context.Background(), "worker-1", time.Now(), time.Minute, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 0 {
+		t.Fatalf("claimed %d stale tasks, want 0", len(tasks))
+	}
+	if got := maintenanceTaskStatus(t, store, tableKey); got != MaintenanceTaskCancelled {
+		t.Fatalf("task status = %q, want %q", got, MaintenanceTaskCancelled)
+	}
+}
+
 func TestOldSubmissionCannotReleaseNewReservation(t *testing.T) {
 	store, catalog, _ := newMaintenanceOwnershipIntegrationStore(t)
+	seedCurrentOwnershipJob(t, store, "stream-orders", "submission-2")
 	selector := []IcebergMaintenanceReservationSelector{{Catalog: catalog, NamespacePattern: "sales", TablePattern: "orders"}}
 	if err := store.SyncMaintenanceReservations(context.Background(), "stream-orders", "submission-2", MaintenanceReservationStreaming, selector, time.Now()); err != nil {
 		t.Fatal(err)
@@ -125,6 +150,18 @@ func TestOldSubmissionCannotReleaseNewReservation(t *testing.T) {
 	}
 	if got := activeMaintenanceReservationCount(t, store, "stream-orders", "submission-2"); got != 1 {
 		t.Fatalf("active reservations = %d, want 1", got)
+	}
+}
+
+func TestStaleSubmissionCannotCreateReservations(t *testing.T) {
+	store, catalog, _ := newMaintenanceOwnershipIntegrationStore(t)
+	seedCurrentOwnershipJob(t, store, "stream-orders", "submission-2")
+	selector := []IcebergMaintenanceReservationSelector{{Catalog: catalog, NamespacePattern: "sales", TablePattern: "orders"}}
+	if err := store.SyncMaintenanceReservations(context.Background(), "stream-orders", "submission-1", MaintenanceReservationStreaming, selector, time.Now()); !errors.Is(err, ErrMaintenanceOwnershipStale) {
+		t.Fatalf("error = %v, want ErrMaintenanceOwnershipStale", err)
+	}
+	if got := activeMaintenanceReservationCount(t, store, "stream-orders", "submission-2"); got != 0 {
+		t.Fatalf("active reservations = %d, want 0", got)
 	}
 }
 
@@ -142,15 +179,33 @@ func newMaintenanceOwnershipIntegrationStore(t *testing.T) (*IcebergMaintenanceS
 		store.Close()
 		t.Fatal(err)
 	}
+	jobStore, err := NewMySQLJobStore(dsn)
+	if err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := jobStore.Init(context.Background()); err != nil {
+		_ = jobStore.db.Close()
+		store.Close()
+		t.Fatal(err)
+	}
 	suffix := time.Now().UTC().UnixNano()
 	catalog := fmt.Sprintf("test_ownership_%d", suffix)
+	monitorID := "general-" + catalog
 	tableKey := strings.ToLower(catalog + ".sales.orders")
 	now := time.Now().UTC()
 	if err := store.UpsertState(context.Background(), IcebergMaintenanceState{
 		TableKey: tableKey, Catalog: catalog, Namespace: "sales", Table: "orders",
-		OwnerType: "monitor", OwnerJobID: "monitor:general", SnapshotComplete: true,
+		OwnerType: "monitor", OwnerJobID: MaintenanceMonitorOwnerID(monitorID), SnapshotComplete: true,
 		NextInventoryCheckAt: &now,
 	}, now, now, now); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.CreateMonitor(context.Background(), IcebergMaintenanceMonitor{
+		ID: monitorID, Name: "General", Status: MaintenanceMonitorActive, Config: &config.JobConfig{},
+	}); err != nil {
+		_ = jobStore.db.Close()
 		store.Close()
 		t.Fatal(err)
 	}
@@ -160,9 +215,26 @@ func newMaintenanceOwnershipIntegrationStore(t *testing.T) (*IcebergMaintenanceS
 		_, _ = store.db.ExecContext(ctx, `DELETE FROM iceberg_maintenance_state WHERE table_key=?`, tableKey)
 		_, _ = store.db.ExecContext(ctx, `DELETE FROM iceberg_maintenance_reservations WHERE catalog=?`, catalog)
 		_, _ = store.db.ExecContext(ctx, `DELETE FROM iceberg_maintenance_catalog_guards WHERE catalog=?`, catalog)
+		_, _ = store.db.ExecContext(ctx, `DELETE FROM iceberg_maintenance_monitors WHERE monitor_id=?`, monitorID)
 		_ = store.Close()
+		_ = jobStore.db.Close()
 	})
 	return store, catalog, tableKey
+}
+
+func seedCurrentOwnershipJob(t *testing.T, store *IcebergMaintenanceStore, ownerID, submissionID string) {
+	t.Helper()
+	_, err := store.db.ExecContext(context.Background(), `INSERT INTO job_registry
+		(job_id, submission_id, job_name, config_json, desired_state, execution_role, last_status, created_at, updated_at)
+		VALUES (?, ?, ?, '{}', 'RUNNING', 'STREAMING', 'RUNNING', UTC_TIMESTAMP(6), UTC_TIMESTAMP(6))
+		ON DUPLICATE KEY UPDATE submission_id=VALUES(submission_id), desired_state='RUNNING',
+		execution_role='STREAMING', last_status='RUNNING', updated_at=UTC_TIMESTAMP(6)`, ownerID, submissionID, ownerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = store.db.ExecContext(context.Background(), `DELETE FROM job_registry WHERE job_id=?`, ownerID)
+	})
 }
 
 func seedQueuedMonitorTask(t *testing.T, store *IcebergMaintenanceStore, tableKey, ownerID string, leaseUntil *time.Time) {

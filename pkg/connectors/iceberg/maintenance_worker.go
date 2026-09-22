@@ -209,9 +209,11 @@ func syncMaintenanceStates(ctx context.Context, store *meta.IcebergMaintenanceSt
 		if jobID == "" {
 			continue
 		}
-		jobs[jobID] = maintenanceWorkerJob{Job: job, Settings: settings, OwnerType: "job"}
-
 		snapshotComplete := maintenanceSnapshotComplete(ctx, store, job)
+		if !reservationMustRemain(job, snapshotComplete) {
+			continue
+		}
+		jobs[jobID] = maintenanceWorkerJob{Job: job, Settings: settings, OwnerType: "job"}
 		catalogName, err := maintenanceIdentityCatalogName(iceCfg)
 		if err != nil {
 			log.Printf("[maintenance-worker] skip job=%s unresolved physical catalog: %v", job.ID, err)
@@ -459,7 +461,7 @@ func syncMaintenanceMonitorStates(ctx context.Context, store *meta.IcebergMainte
 					log.Printf("[maintenance-worker] monitor=%s discovered %d matching Iceberg tables", monitor.ID, len(targets))
 				}
 			}
-		} else if monitor.LastDiscoveryAt == nil {
+		} else {
 			catalogName, identityErr := maintenanceIdentityCatalogName(iceCfg)
 			if identityErr != nil {
 				log.Printf("[maintenance-worker] skip monitor=%s unresolved physical catalog: %v", monitor.ID, identityErr)
@@ -775,128 +777,7 @@ func processMaintenancePage(ctx context.Context, store *meta.IcebergMaintenanceS
 	if err != nil {
 		return 0, fmt.Errorf("claim maintenance tasks: %w", err)
 	}
-	if len(tasks) == 0 {
-		return 0, nil
-	}
-	runID, err := store.CreateRunForTasks(ctx, opts.WorkerID, tasks, now)
-	if err != nil {
-		return 0, fmt.Errorf("create maintenance run: %w", err)
-	}
-
-	successes, skipped, failures := 0, 0, 0
-	for _, task := range tasks {
-		if ctx.Err() != nil {
-			break
-		}
-		state, err := store.GetState(ctx, task.TableKey)
-		if err != nil {
-			return len(tasks), err
-		}
-		if state == nil || !state.SnapshotComplete {
-			failures++
-			message := "snapshot barrier is not complete"
-			if err := store.InsertResult(ctx, maintenancePreflightFailureResult(runID, task, message)); err != nil {
-				return len(tasks), fmt.Errorf("store maintenance preflight result task=%d: %w", task.ID, err)
-			}
-			if err := store.FinishTask(ctx, task.ID, opts.WorkerID, meta.MaintenanceTaskRetry, message, timePtr(time.Now().Add(time.Minute))); err != nil {
-				return len(tasks), err
-			}
-			continue
-		}
-		job, ok, resolveErr := resolveMaintenanceWorkerJob(ctx, store, jobStore, jobs, task.OwnerJobID)
-		if resolveErr != nil {
-			return len(tasks), fmt.Errorf("load owner job configuration task=%d: %w", task.ID, resolveErr)
-		}
-		if !ok || job.Job.Config == nil {
-			failures++
-			message := "owner job configuration is unavailable"
-			if err := store.InsertResult(ctx, maintenancePreflightFailureResult(runID, task, message)); err != nil {
-				return len(tasks), fmt.Errorf("store maintenance preflight result task=%d: %w", task.ID, err)
-			}
-			if err := store.FinishTask(ctx, task.ID, opts.WorkerID, meta.MaintenanceTaskFailed, message, nil); err != nil {
-				return len(tasks), err
-			}
-			continue
-		}
-		stateConfig, configErr := maintenanceWorkerConfigForState(job.Job.Config, *state)
-		if configErr != nil {
-			failures++
-			message := fmt.Sprintf("resolve catalog configuration: %v", configErr)
-			if err := store.InsertResult(ctx, maintenancePreflightFailureResult(runID, task, message)); err != nil {
-				return len(tasks), err
-			}
-			if err := store.FinishTask(ctx, task.ID, opts.WorkerID, meta.MaintenanceTaskRetry, message, timePtr(time.Now().Add(time.Minute))); err != nil {
-				return len(tasks), err
-			}
-			continue
-		}
-
-		leaseCtx, leaseCancel := context.WithCancel(ctx)
-		var leaseWG sync.WaitGroup
-		leaseWG.Add(1)
-		go func(taskID int64) {
-			defer leaseWG.Done()
-			renewEvery := opts.LeaseDuration / 3
-			if renewEvery < 10*time.Second {
-				renewEvery = 10 * time.Second
-			}
-			ticker := time.NewTicker(renewEvery)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-leaseCtx.Done():
-					return
-				case <-ticker.C:
-					if err := store.RenewLease(leaseCtx, taskID, opts.WorkerID, time.Now().Add(opts.LeaseDuration)); err != nil {
-						log.Printf("[maintenance-worker %s] lease renewal task=%d error=%v", opts.WorkerID, taskID, err)
-						return
-					}
-				}
-			}
-		}(task.ID)
-
-		outcome := executeNativeMaintenanceTask(ctx, store, task.OwnerJobID, stateConfig, *state, task, job.Settings)
-		leaseCancel()
-		leaseWG.Wait()
-		outcome.Result.RunID = runID
-		if err := store.InsertResult(ctx, outcome.Result); err != nil {
-			return len(tasks), fmt.Errorf("store maintenance result task=%d: %w", task.ID, err)
-		}
-
-		switch outcome.Result.Status {
-		case "succeeded":
-			successes++
-			_ = store.RecordStateSuccess(ctx, state.TableKey, task.Operation, time.Now().UTC(), task.Operation == "compact")
-			if err := store.FinishTask(ctx, task.ID, opts.WorkerID, meta.MaintenanceTaskSucceeded, "", nil); err != nil {
-				return len(tasks), err
-			}
-		case "skipped":
-			skipped++
-			_ = store.RecordStateSuccess(ctx, state.TableKey, task.Operation, time.Now().UTC(), false)
-			if err := store.FinishTask(ctx, task.ID, opts.WorkerID, meta.MaintenanceTaskSkipped, "", nil); err != nil {
-				return len(tasks), err
-			}
-		default:
-			failures++
-			_ = store.RecordStateError(ctx, state.TableKey, outcome.Result.Error)
-			retryLimit := retryLimitFromRaw(job.Job.Config)
-			if retryLimit <= 0 {
-				retryLimit = defaultMaintenanceRetryLimit
-			}
-			if outcome.Retryable && task.AttemptCount < retryLimit {
-				retryAt := time.Now().Add(maintenanceRetryBackoff(task.AttemptCount, retryBackoffFromRaw(job.Job.Config)))
-				if err := store.FinishTask(ctx, task.ID, opts.WorkerID, meta.MaintenanceTaskRetry, outcome.Result.Error, &retryAt); err != nil {
-					return len(tasks), err
-				}
-			} else if err := store.FinishTask(ctx, task.ID, opts.WorkerID, meta.MaintenanceTaskFailed, outcome.Result.Error, nil); err != nil {
-				return len(tasks), err
-			}
-		}
-	}
-	if err := store.FinishRun(ctx, runID, successes, skipped, failures, time.Now().UTC()); err != nil {
-		return len(tasks), err
-	}
-	return len(tasks), nil
+	return processClaimedMaintenanceTasks(ctx, store, jobStore, jobs, opts, opts.WorkerID, tasks, now)
 }
 
 func maintenancePreflightFailureResult(runID int64, task meta.IcebergMaintenanceTask, message string) meta.IcebergMaintenanceResult {

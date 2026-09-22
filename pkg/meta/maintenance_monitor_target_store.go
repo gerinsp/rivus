@@ -106,12 +106,42 @@ func (s *IcebergMaintenanceStore) ApplyMonitorDiscovery(
 		}
 		normalized[target.TableKey] = target
 	}
+	catalogSet := make(map[string]struct{})
+	for _, target := range normalized {
+		catalogSet[target.Catalog] = struct{}{}
+	}
+	knownRows, err := s.db.QueryContext(ctx, `SELECT DISTINCT catalog FROM iceberg_maintenance_monitor_targets
+		WHERE monitor_id=? AND claim_status<>?`, monitor.ID, MaintenanceMonitorTargetRetired)
+	if err != nil {
+		return delta, err
+	}
+	for knownRows.Next() {
+		var catalog string
+		if err := knownRows.Scan(&catalog); err != nil {
+			knownRows.Close()
+			return delta, err
+		}
+		catalogSet[catalog] = struct{}{}
+	}
+	if err := knownRows.Close(); err != nil {
+		return delta, err
+	}
+	if err := knownRows.Err(); err != nil {
+		return delta, err
+	}
+	catalogs := make([]string, 0, len(catalogSet))
+	for catalog := range catalogSet {
+		catalogs = append(catalogs, catalog)
+	}
 
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return delta, err
 	}
 	defer tx.Rollback()
+	if err := lockMaintenanceCatalogs(ctx, tx, catalogs, now); err != nil {
+		return delta, err
+	}
 	var status string
 	if err := tx.QueryRowContext(ctx, `SELECT status FROM iceberg_maintenance_monitors
 		WHERE monitor_id=? FOR UPDATE`, monitor.ID).Scan(&status); err != nil {
@@ -157,16 +187,10 @@ func (s *IcebergMaintenanceStore) ApplyMonitorDiscovery(
 			affected[key] = target
 		}
 	}
-	catalogs := make([]string, 0, len(affected))
-	seenCatalogs := make(map[string]struct{})
 	for _, target := range affected {
-		if _, ok := seenCatalogs[target.Catalog]; !ok {
-			seenCatalogs[target.Catalog] = struct{}{}
-			catalogs = append(catalogs, target.Catalog)
+		if _, locked := catalogSet[target.Catalog]; !locked {
+			return delta, fmt.Errorf("maintenance monitor %s target catalog changed during reconciliation; retry", monitor.ID)
 		}
-	}
-	if err := lockMaintenanceCatalogs(ctx, tx, catalogs, now); err != nil {
-		return delta, err
 	}
 
 	for key, target := range normalized {
@@ -270,6 +294,9 @@ func (s *IcebergMaintenanceStore) reconcileMonitorTargetOwnership(
 		return stateErr
 	}
 	if len(candidates) == 0 {
+		if stateErr == nil && state.LeaseUntil.Valid && state.LeaseUntil.Time.After(now) && strings.HasPrefix(state.OwnerJobID, "monitor:") {
+			return nil
+		}
 		if stateErr == nil && strings.HasPrefix(state.OwnerJobID, "monitor:") {
 			if _, err := tx.ExecContext(ctx, `UPDATE iceberg_maintenance_state SET owner_type='unmanaged', owner_job_id='unmanaged',
 				next_inventory_check_at=NULL, next_compaction_check_at=NULL, next_expire_check_at=NULL,
@@ -277,6 +304,18 @@ func (s *IcebergMaintenanceStore) reconcileMonitorTargetOwnership(
 				return err
 			}
 			return cancelQueuedMaintenanceTasksForOwner(ctx, tx, tableKey, state.OwnerJobID, now)
+		}
+		return nil
+	}
+	if stateErr == nil && state.LeaseUntil.Valid && state.LeaseUntil.Time.After(now) && strings.HasPrefix(state.OwnerJobID, "monitor:") {
+		for _, candidate := range candidates {
+			desired := MaintenanceMonitorTargetConflicted
+			if MaintenanceMonitorOwnerID(candidate.MonitorID) == state.OwnerJobID {
+				desired = MaintenanceMonitorTargetOwned
+			}
+			if err := updateMonitorTargetClaimStatus(ctx, tx, candidate, desired, now); err != nil {
+				return err
+			}
 		}
 		return nil
 	}
@@ -367,7 +406,7 @@ func (s *IcebergMaintenanceStore) reconcileMonitorTargetOwnership(
 		return err
 	}
 	oldOwner := state.OwnerJobID
-	if _, err := tx.ExecContext(ctx, `UPDATE iceberg_maintenance_state SET owner_type='monitor', owner_job_id=?,
+	if _, err := tx.ExecContext(ctx, `UPDATE iceberg_maintenance_state SET owner_type='monitor', owner_job_id=?, snapshot_complete=1,
 		next_inventory_check_at=COALESCE(next_inventory_check_at, ?), inventory_priority=0,
 		next_compaction_check_at=COALESCE(next_compaction_check_at, ?),
 		next_expire_check_at=COALESCE(next_expire_check_at, ?), next_orphan_check_at=COALESCE(next_orphan_check_at, ?),

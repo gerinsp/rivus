@@ -814,84 +814,10 @@ func (s *IcebergMaintenanceStore) AdvanceSchedule(ctx context.Context, tableKey,
 }
 
 func (s *IcebergMaintenanceStore) ClaimTasks(ctx context.Context, workerID string, now time.Time, lease time.Duration, limit int) ([]IcebergMaintenanceTask, error) {
-	if limit <= 0 || limit > 100 {
-		limit = 50
-	}
-	if lease <= 0 {
-		lease = 15 * time.Minute
-	}
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
-	if err != nil {
+	if err := s.RecoverExpiredMaintenanceLeases(ctx, now); err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
-
-	if _, err := tx.ExecContext(ctx, `UPDATE iceberg_maintenance_tasks
-	SET status = 'retry', lease_owner = NULL, lease_until = NULL, not_before = ?, updated_at = UTC_TIMESTAMP(6)
-	WHERE status = 'leased' AND lease_until IS NOT NULL AND lease_until < ?`, now.UTC(), now.UTC()); err != nil {
-		return nil, err
-	}
-
-	rows, err := tx.QueryContext(ctx, `SELECT id, idempotency_key, table_key, owner_job_id, operation,
-	 priority, status, attempt_count, not_before, schedule_window, payload_json, last_error,
-	 created_at, updated_at
-	FROM iceberg_maintenance_tasks
-	WHERE status IN ('queued','retry') AND not_before <= ?
-	  AND owner_job_id NOT LIKE 'deleted-monitor:%'
-	  AND (owner_job_id NOT LIKE 'monitor:%' OR EXISTS (
-	    SELECT 1 FROM iceberg_maintenance_monitors AS monitor
-	    WHERE monitor.monitor_id=SUBSTRING(iceberg_maintenance_tasks.owner_job_id, 9) AND monitor.status='ACTIVE'
-	  ))
-	ORDER BY priority ASC, not_before ASC, id ASC
-	LIMIT ? FOR UPDATE SKIP LOCKED`, now.UTC(), limit)
-	if err != nil {
-		return nil, err
-	}
-	var tasks []IcebergMaintenanceTask
-	for rows.Next() {
-		var task IcebergMaintenanceTask
-		var payloadJSON, lastError sql.NullString
-		if err := rows.Scan(&task.ID, &task.IdempotencyKey, &task.TableKey, &task.OwnerJobID, &task.Operation,
-			&task.Priority, &task.Status, &task.AttemptCount, &task.NotBefore, &task.ScheduleWindow,
-			&payloadJSON, &lastError, &task.CreatedAt, &task.UpdatedAt); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		if payloadJSON.Valid && strings.TrimSpace(payloadJSON.String) != "" {
-			_ = json.Unmarshal([]byte(payloadJSON.String), &task.Payload)
-		}
-		if lastError.Valid {
-			task.LastError = lastError.String
-		}
-		tasks = append(tasks, task)
-	}
-	if err := rows.Close(); err != nil {
-		return nil, err
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	until := now.Add(lease).UTC()
-	for i := range tasks {
-		res, err := tx.ExecContext(ctx, `UPDATE iceberg_maintenance_tasks
-		SET status='leased', lease_owner=?, lease_until=?, attempt_count=attempt_count+1, updated_at=UTC_TIMESTAMP(6)
-		WHERE id=? AND status IN ('queued','retry')`, workerID, until, tasks[i].ID)
-		if err != nil {
-			return nil, err
-		}
-		n, _ := res.RowsAffected()
-		if n != 1 {
-			return nil, fmt.Errorf("maintenance task %d lost while claiming", tasks[i].ID)
-		}
-		tasks[i].Status = MaintenanceTaskLeased
-		tasks[i].LeaseOwner = workerID
-		tasks[i].LeaseUntil = &until
-		tasks[i].AttemptCount++
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	return tasks, nil
+	return s.claimTasksOwnershipSafe(ctx, workerID, now, lease, "", limit)
 }
 
 func (s *IcebergMaintenanceStore) RenewLease(ctx context.Context, taskID int64, workerID string, until time.Time) error {
