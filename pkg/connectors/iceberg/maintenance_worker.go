@@ -398,39 +398,13 @@ func (m streamingExclusionMatcher) Excludes(target maintenanceMonitorTarget) boo
 // poll, independently of the ten-minute ingestion-job rescan. This makes a
 // newly created, paused, or resumed monitor take effect promptly without
 // repeatedly walking thousands of ingestion jobs.
-func syncMaintenanceMonitorStates(ctx context.Context, store *meta.IcebergMaintenanceStore, jobs map[string]maintenanceWorkerJob, streamExclusions []maintenanceMonitorTarget, now time.Time) (map[string]maintenanceWorkerJob, error) {
+func syncMaintenanceMonitorStates(ctx context.Context, store *meta.IcebergMaintenanceStore, jobs map[string]maintenanceWorkerJob, _ []maintenanceMonitorTarget, now time.Time) (map[string]maintenanceWorkerJob, error) {
 	if jobs == nil {
 		jobs = make(map[string]maintenanceWorkerJob)
 	}
-	claimedTables := make(map[string]string)
-	streamMatcher := newStreamingExclusionMatcher(streamExclusions)
-	previouslyActive := make(map[string]struct{})
-	previousMonitors := make(map[string]maintenanceWorkerJob)
-	for ownerID, job := range jobs {
+	for ownerID := range jobs {
 		if strings.HasPrefix(ownerID, "monitor:") {
-			previouslyActive[ownerID] = struct{}{}
-			previousMonitors[ownerID] = job
 			delete(jobs, ownerID)
-			continue
-		}
-		if job.Job.Config == nil {
-			continue
-		}
-		_, sinkCfg := jobSinkSpec(job.Job.Config)
-		iceCfg, err := decodeIcebergConfig(sinkCfg)
-		if err != nil {
-			continue
-		}
-		targets, err := orphanCleanupTargets(job.Job.Config, &Sink{cfg: iceCfg}, nil)
-		if err != nil {
-			continue
-		}
-		catalogName, err := maintenanceIdentityCatalogName(iceCfg)
-		if err != nil {
-			continue
-		}
-		for _, target := range targets {
-			claimedTables[canonicalMaintenanceTableKey(catalogName, target.Namespace, target.Table)] = ownerID
 		}
 	}
 
@@ -459,91 +433,95 @@ func syncMaintenanceMonitorStates(ctx context.Context, store *meta.IcebergMainte
 			continue
 		}
 		ownerID := meta.MaintenanceMonitorOwnerID(monitor.ID)
-		_, wasActive := previouslyActive[ownerID]
-		reconcileStreamExclusions := !wasActive
-		catalogName, err := maintenanceIdentityCatalogName(iceCfg)
+		persistedTargets, err := store.ListMonitorTargets(ctx, monitor.ID)
 		if err != nil {
-			log.Printf("[maintenance-worker] skip monitor=%s unresolved physical catalog: %v", monitor.ID, err)
-			continue
+			return nil, fmt.Errorf("load maintenance monitor %s targets: %w", monitor.ID, err)
 		}
-		targets := make([]maintenanceMonitorTarget, 0, len(explicitTargets))
-		for _, target := range explicitTargets {
-			targets = append(targets, maintenanceMonitorTarget{Catalog: catalogName, Namespace: target.Namespace, Table: target.Table})
-		}
-		discoveryAt := time.Time{}
+		targets := activeMaintenanceMonitorTargets(persistedTargets)
+		applyDiscovery := false
 		if catalogMonitoringEnabled(iceCfg) {
-			previous := previousMonitors[ownerID]
-			interval := maintenanceDiscoveryInterval(iceCfg)
-			if !previous.MonitorDiscoveryAt.IsZero() && now.Sub(previous.MonitorDiscoveryAt) < interval {
-				targets = previous.MonitorTargets
-				discoveryAt = previous.MonitorDiscoveryAt
-			} else {
+			lastDiscovery := time.Time{}
+			if monitor.LastDiscoveryAt != nil {
+				lastDiscovery = monitor.LastDiscoveryAt.UTC()
+			}
+			if lastDiscovery.IsZero() || now.Sub(lastDiscovery) >= maintenanceDiscoveryInterval(iceCfg) {
 				discoveryCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 				discovered, discoveryErr := discoverCatalogMonitorTargets(discoveryCtx, cfg, iceCfg)
 				cancel()
 				if discoveryErr != nil {
-					if previous.MonitorDiscoveryAt.IsZero() {
-						log.Printf("[maintenance-worker] skip monitor=%s catalog discovery failed: %v", monitor.ID, discoveryErr)
-						continue
+					if recordErr := store.RecordMonitorDiscoveryFailure(ctx, monitor.ID, discoveryErr.Error(), now); recordErr != nil {
+						return nil, fmt.Errorf("record maintenance monitor %s discovery failure: %w", monitor.ID, recordErr)
 					}
-					log.Printf("[maintenance-worker] monitor=%s catalog discovery failed; using %d cached targets: %v", monitor.ID, len(previous.MonitorTargets), discoveryErr)
-					targets = previous.MonitorTargets
-					discoveryAt = previous.MonitorDiscoveryAt
+					log.Printf("[maintenance-worker] monitor=%s catalog discovery failed; retaining %d persisted targets: %v", monitor.ID, len(targets), discoveryErr)
 				} else {
 					targets = discovered
-					discoveryAt = now
-					reconcileStreamExclusions = true
+					applyDiscovery = true
 					log.Printf("[maintenance-worker] monitor=%s discovered %d matching Iceberg tables", monitor.ID, len(targets))
 				}
 			}
+		} else if monitor.LastDiscoveryAt == nil {
+			catalogName, identityErr := maintenanceIdentityCatalogName(iceCfg)
+			if identityErr != nil {
+				log.Printf("[maintenance-worker] skip monitor=%s unresolved physical catalog: %v", monitor.ID, identityErr)
+				continue
+			}
+			targets = make([]maintenanceMonitorTarget, 0, len(explicitTargets))
+			for _, target := range explicitTargets {
+				targets = append(targets, maintenanceMonitorTarget{Catalog: catalogName, Namespace: target.Namespace, Table: target.Table})
+			}
+			applyDiscovery = true
+		}
+		if applyDiscovery {
+			membership := make([]meta.IcebergMaintenanceMonitorTarget, 0, len(targets))
+			for _, target := range targets {
+				tableIdentity := canonicalMaintenanceTableKey(target.Catalog, target.Namespace, target.Table)
+				inventoryDue := now.Add(deterministicJitter(tableIdentity+"|initial-inventory", 24*time.Hour))
+				membership = append(membership, meta.IcebergMaintenanceMonitorTarget{
+					MonitorID: monitor.ID, TableKey: tableIdentity, Catalog: target.Catalog,
+					Namespace: target.Namespace, Table: target.Table, Specificity: monitorSpecificity(iceCfg, target),
+					NextInventoryAt:  &inventoryDue,
+					NextCompactionAt: now.Add(deterministicJitter(tableIdentity+"|compact", settings.IdleCompactionInterval)),
+					NextExpireAt:     now.Add(deterministicJitter(tableIdentity+"|expire", settings.ExpireInterval)),
+					NextOrphanAt:     now.Add(deterministicJitter(tableIdentity+"|orphan", settings.OrphanInactiveInterval)),
+				})
+			}
+			if _, err := store.ApplyMonitorDiscovery(ctx, monitor, membership, now); err != nil {
+				return nil, fmt.Errorf("apply maintenance monitor %s discovery: %w", monitor.ID, err)
+			}
+			persistedTargets, err = store.ListMonitorTargets(ctx, monitor.ID)
+			if err != nil {
+				return nil, fmt.Errorf("reload maintenance monitor %s targets: %w", monitor.ID, err)
+			}
+			targets = activeMaintenanceMonitorTargets(persistedTargets)
 		}
 		persisted := meta.PersistedJob{
 			ID: ownerID, Name: monitor.Name, Config: cfg,
 			DesiredState: meta.DesiredStateRunning, LastStatus: "RUNNING",
 		}
+		discoveryAt := time.Time{}
+		if monitor.LastDiscoveryAt != nil {
+			discoveryAt = monitor.LastDiscoveryAt.UTC()
+		}
+		if applyDiscovery {
+			discoveryAt = now
+		}
 		jobs[ownerID] = maintenanceWorkerJob{
 			Job: persisted, Settings: settings, OwnerType: "monitor",
 			MonitorTargets: targets, MonitorDiscoveryAt: discoveryAt,
 		}
-		excludedTableKeys := make([]string, 0)
-		for _, target := range targets {
-			tableIdentity := canonicalMaintenanceTableKey(target.Catalog, target.Namespace, target.Table)
-			if streamMatcher.Excludes(target) {
-				if reconcileStreamExclusions {
-					excludedTableKeys = append(excludedTableKeys, tableIdentity)
-				}
-				continue
-			}
-			if owner, exists := claimedTables[tableIdentity]; exists && owner != ownerID {
-				log.Printf("[maintenance-worker] skip monitor table already owned table=%s owner=%s monitor=%s", tableIdentity, owner, monitor.ID)
-				continue
-			}
-			claimedTables[tableIdentity] = ownerID
-			inventoryDue := now
-			compactionDue := now.Add(deterministicJitter(tableIdentity+"|compact", settings.IdleCompactionInterval))
-			expireDue := now.Add(deterministicJitter(tableIdentity+"|expire", settings.ExpireInterval))
-			orphanDue := now.Add(deterministicJitter(tableIdentity+"|orphan", settings.OrphanInactiveInterval))
-			if err := store.UpsertState(ctx, meta.IcebergMaintenanceState{
-				TableKey: tableIdentity, Catalog: target.Catalog, Namespace: target.Namespace, Table: target.Table,
-				OwnerType: "monitor", OwnerJobID: ownerID, SnapshotComplete: true,
-				NextInventoryCheckAt: &inventoryDue,
-			}, compactionDue, expireDue, orphanDue); err != nil {
-				return nil, fmt.Errorf("upsert maintenance monitor state %s: %w", tableIdentity, err)
-			}
-			if !wasActive {
-				if _, err := store.RequestTableInventoryRefresh(ctx, tableIdentity, ownerID, now); err != nil {
-					return nil, fmt.Errorf("schedule initial inventory for maintenance monitor %s table %s: %w", monitor.ID, tableIdentity, err)
-				}
-			}
-		}
-		if reconcileStreamExclusions && len(excludedTableKeys) > 0 {
-			if err := store.ExcludeMonitorTables(ctx, ownerID, excludedTableKeys, now); err != nil {
-				return nil, fmt.Errorf("exclude streaming tables from maintenance monitor %s: %w", monitor.ID, err)
-			}
-			log.Printf("[maintenance-worker] monitor=%s excluded %d streaming-owned tables", monitor.ID, len(excludedTableKeys))
-		}
 	}
 	return jobs, nil
+}
+
+func activeMaintenanceMonitorTargets(targets []meta.IcebergMaintenanceMonitorTarget) []maintenanceMonitorTarget {
+	out := make([]maintenanceMonitorTarget, 0, len(targets))
+	for _, target := range targets {
+		if target.ClaimStatus == meta.MaintenanceMonitorTargetRetired {
+			continue
+		}
+		out = append(out, maintenanceMonitorTarget{Catalog: target.Catalog, Namespace: target.Namespace, Table: target.Table})
+	}
+	return out
 }
 
 // scanOnePendingInventory performs one background metadata scan per poll. It

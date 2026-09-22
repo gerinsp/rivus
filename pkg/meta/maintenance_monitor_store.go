@@ -28,15 +28,17 @@ var (
 )
 
 type IcebergMaintenanceMonitor struct {
-	ID              string                   `json:"id"`
-	Name            string                   `json:"name"`
-	Status          MaintenanceMonitorStatus `json:"status"`
-	Config          *config.JobConfig        `json:"-"`
-	TableCount      int                      `json:"table_count"`
-	LastInventoryAt *time.Time               `json:"last_inventory_at,omitempty"`
-	LastError       string                   `json:"last_error,omitempty"`
-	CreatedAt       time.Time                `json:"created_at"`
-	UpdatedAt       time.Time                `json:"updated_at"`
+	ID                 string                   `json:"id"`
+	Name               string                   `json:"name"`
+	Status             MaintenanceMonitorStatus `json:"status"`
+	Config             *config.JobConfig        `json:"-"`
+	TableCount         int                      `json:"table_count"`
+	LastInventoryAt    *time.Time               `json:"last_inventory_at,omitempty"`
+	LastDiscoveryAt    *time.Time               `json:"last_discovery_at,omitempty"`
+	LastDiscoveryError string                   `json:"last_discovery_error,omitempty"`
+	LastError          string                   `json:"last_error,omitempty"`
+	CreatedAt          time.Time                `json:"created_at"`
+	UpdatedAt          time.Time                `json:"updated_at"`
 }
 
 // MaintenanceMonitorOwnerID namespaces monitor ownership away from ingestion
@@ -81,10 +83,12 @@ func (s *IcebergMaintenanceStore) CreateMonitor(ctx context.Context, monitor Ice
 func (s *IcebergMaintenanceStore) ListMonitors(ctx context.Context) ([]IcebergMaintenanceMonitor, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT m.monitor_id, m.monitor_name, m.status, m.config_json,
 		COUNT(st.table_key), MAX(st.last_inventory_at),
-		COALESCE(MAX(NULLIF(st.last_error, '')), ''), m.created_at, m.updated_at
+		COALESCE(MAX(NULLIF(st.last_error, '')), ''), m.last_discovery_at,
+		COALESCE(m.last_discovery_error, ''), m.created_at, m.updated_at
 	FROM iceberg_maintenance_monitors m
 	LEFT JOIN iceberg_maintenance_state st ON st.owner_job_id=CONCAT('monitor:', m.monitor_id)
-	GROUP BY m.monitor_id, m.monitor_name, m.status, m.config_json, m.created_at, m.updated_at
+	GROUP BY m.monitor_id, m.monitor_name, m.status, m.config_json, m.last_discovery_at,
+		m.last_discovery_error, m.created_at, m.updated_at
 	ORDER BY m.monitor_name, m.monitor_id`)
 	if err != nil {
 		return nil, err
@@ -104,11 +108,13 @@ func (s *IcebergMaintenanceStore) ListMonitors(ctx context.Context) ([]IcebergMa
 func (s *IcebergMaintenanceStore) GetMonitor(ctx context.Context, id string) (*IcebergMaintenanceMonitor, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT m.monitor_id, m.monitor_name, m.status, m.config_json,
 		COUNT(st.table_key), MAX(st.last_inventory_at),
-		COALESCE(MAX(NULLIF(st.last_error, '')), ''), m.created_at, m.updated_at
+		COALESCE(MAX(NULLIF(st.last_error, '')), ''), m.last_discovery_at,
+		COALESCE(m.last_discovery_error, ''), m.created_at, m.updated_at
 	FROM iceberg_maintenance_monitors m
 	LEFT JOIN iceberg_maintenance_state st ON st.owner_job_id=CONCAT('monitor:', m.monitor_id)
 	WHERE m.monitor_id=?
-	GROUP BY m.monitor_id, m.monitor_name, m.status, m.config_json, m.created_at, m.updated_at`, strings.TrimSpace(id))
+	GROUP BY m.monitor_id, m.monitor_name, m.status, m.config_json, m.last_discovery_at,
+		m.last_discovery_error, m.created_at, m.updated_at`, strings.TrimSpace(id))
 	monitor, err := scanMaintenanceMonitor(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -141,6 +147,11 @@ func (s *IcebergMaintenanceStore) SetMonitorStatus(ctx context.Context, id strin
 	if n == 0 {
 		return ErrMaintenanceMonitorNotFound
 	}
+	// Ownership may fall through to, or be reclaimed from, an overlapping
+	// monitor. Mark active monitors due for one fresh reconciliation.
+	if _, err := tx.ExecContext(ctx, `UPDATE iceberg_maintenance_monitors SET last_discovery_at=NULL WHERE status=?`, MaintenanceMonitorActive); err != nil {
+		return err
+	}
 	if status == MaintenanceMonitorPaused {
 		if _, err := tx.ExecContext(ctx, `UPDATE iceberg_maintenance_state
 			SET next_inventory_check_at=NULL, next_compaction_check_at=NULL,
@@ -155,7 +166,7 @@ func (s *IcebergMaintenanceStore) SetMonitorStatus(ctx context.Context, id strin
 		}
 	} else {
 		if _, err := tx.ExecContext(ctx, `UPDATE iceberg_maintenance_state
-			SET next_inventory_check_at=?, inventory_priority=100,
+			SET next_inventory_check_at=COALESCE(next_inventory_check_at, ?), inventory_priority=0,
 			    next_compaction_check_at=?, next_expire_check_at=?, next_orphan_check_at=?,
 			    last_error=NULL, updated_at=?
 			WHERE owner_job_id=?`, now.UTC(), now.UTC(), now.UTC(), now.UTC(), now.UTC(), ownerID); err != nil {
@@ -186,6 +197,12 @@ func (s *IcebergMaintenanceStore) DeleteMonitor(ctx context.Context, id string, 
 	if n == 0 {
 		return ErrMaintenanceMonitorNotFound
 	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM iceberg_maintenance_monitor_targets WHERE monitor_id=?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE iceberg_maintenance_monitors SET last_discovery_at=NULL WHERE status=?`, MaintenanceMonitorActive); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE iceberg_maintenance_state
 		SET owner_type='deleted-monitor', owner_job_id=?,
 		    next_inventory_check_at=NULL, next_compaction_check_at=NULL,
@@ -209,6 +226,72 @@ func (s *IcebergMaintenanceStore) DeleteMonitor(ctx context.Context, id string, 
 	return tx.Commit()
 }
 
+// ExcludeMonitorTables removes streaming-owned tables from a catalog monitor
+// without deleting their historical state or results. If the streaming
+// selection is later removed, a monitor upsert can claim and schedule the same
+// table again.
+func (s *IcebergMaintenanceStore) ExcludeMonitorTables(ctx context.Context, ownerID string, tableKeys []string, now time.Time) error {
+	ownerID = strings.TrimSpace(ownerID)
+	if ownerID == "" || len(tableKeys) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(tableKeys))
+	keys := make([]string, 0, len(tableKeys))
+	for _, key := range tableKeys {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		keys = append(keys, key)
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	const chunkSize = 200
+	for start := 0; start < len(keys); start += chunkSize {
+		end := min(start+chunkSize, len(keys))
+		chunk := keys[start:end]
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(chunk)), ",")
+		stateArgs := make([]any, 0, len(chunk)+2)
+		stateArgs = append(stateArgs, now.UTC(), ownerID)
+		for _, key := range chunk {
+			stateArgs = append(stateArgs, key)
+		}
+		stateQuery := `UPDATE iceberg_maintenance_state
+			SET owner_type='stream-excluded', owner_job_id='stream-excluded',
+			    last_inventory_at=NULL, next_inventory_check_at=NULL, inventory_priority=0,
+			    next_compaction_check_at=NULL, next_expire_check_at=NULL, next_orphan_check_at=NULL,
+			    updated_at=?
+			WHERE owner_job_id=? AND table_key IN (` + placeholders + `)`
+		if _, err := tx.ExecContext(ctx, stateQuery, stateArgs...); err != nil {
+			return err
+		}
+
+		taskArgs := make([]any, 0, len(chunk)+5)
+		taskArgs = append(taskArgs, MaintenanceTaskCancelled, now.UTC(), ownerID, MaintenanceTaskQueued, MaintenanceTaskRetry)
+		for _, key := range chunk {
+			taskArgs = append(taskArgs, key)
+		}
+		taskQuery := `UPDATE iceberg_maintenance_tasks
+			SET status=?, lease_owner=NULL, lease_until=NULL, updated_at=?
+			WHERE owner_job_id=? AND status IN (?, ?) AND table_key IN (` + placeholders + `)`
+		if _, err := tx.ExecContext(ctx, taskQuery, taskArgs...); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 type maintenanceMonitorScanner interface {
 	Scan(dest ...any) error
 }
@@ -216,15 +299,20 @@ type maintenanceMonitorScanner interface {
 func scanMaintenanceMonitor(scanner maintenanceMonitorScanner) (IcebergMaintenanceMonitor, error) {
 	var monitor IcebergMaintenanceMonitor
 	var status, configJSON string
-	var lastInventory sql.NullTime
+	var lastInventory, lastDiscovery sql.NullTime
 	if err := scanner.Scan(&monitor.ID, &monitor.Name, &status, &configJSON, &monitor.TableCount,
-		&lastInventory, &monitor.LastError, &monitor.CreatedAt, &monitor.UpdatedAt); err != nil {
+		&lastInventory, &monitor.LastError, &lastDiscovery, &monitor.LastDiscoveryError,
+		&monitor.CreatedAt, &monitor.UpdatedAt); err != nil {
 		return monitor, err
 	}
 	monitor.Status = MaintenanceMonitorStatus(status)
 	if lastInventory.Valid {
 		value := lastInventory.Time.UTC()
 		monitor.LastInventoryAt = &value
+	}
+	if lastDiscovery.Valid {
+		value := lastDiscovery.Time.UTC()
+		monitor.LastDiscoveryAt = &value
 	}
 	var cfg config.JobConfig
 	if err := json.Unmarshal([]byte(configJSON), &cfg); err != nil {

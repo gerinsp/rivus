@@ -214,9 +214,25 @@ func (s *IcebergMaintenanceStore) Init(ctx context.Context) error {
 		  monitor_name VARCHAR(255) NOT NULL,
 		  status VARCHAR(32) NOT NULL,
 		  config_json LONGTEXT NOT NULL,
+		  last_discovery_at DATETIME(6) NULL,
+		  last_discovery_error LONGTEXT NULL,
 		  created_at DATETIME(6) NOT NULL,
 		  updated_at DATETIME(6) NOT NULL,
 		  INDEX idx_maintenance_monitors_status (status, updated_at)
+		)`,
+		`CREATE TABLE IF NOT EXISTS iceberg_maintenance_monitor_targets (
+		  monitor_id VARCHAR(255) NOT NULL,
+		  table_key VARCHAR(512) NOT NULL,
+		  catalog VARCHAR(255) NOT NULL,
+		  namespace_name VARCHAR(512) NOT NULL,
+		  table_name VARCHAR(255) NOT NULL,
+		  specificity INT NOT NULL,
+		  claim_status VARCHAR(32) NOT NULL,
+		  last_error LONGTEXT NULL,
+		  created_at DATETIME(6) NOT NULL,
+		  updated_at DATETIME(6) NOT NULL,
+		  PRIMARY KEY (monitor_id, table_key),
+		  INDEX idx_monitor_target_table (table_key, specificity, claim_status)
 		)`,
 		`CREATE TABLE IF NOT EXISTS iceberg_maintenance_state (
 		  table_key VARCHAR(512) NOT NULL PRIMARY KEY,
@@ -334,6 +350,12 @@ func (s *IcebergMaintenanceStore) Init(ctx context.Context) error {
 		}
 	}
 	if err := s.ensureColumn(ctx, "iceberg_maintenance_state", "last_write_at", "DATETIME(6) NULL AFTER last_snapshot_id"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "iceberg_maintenance_monitors", "last_discovery_at", "DATETIME(6) NULL AFTER config_json"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "iceberg_maintenance_monitors", "last_discovery_error", "LONGTEXT NULL AFTER last_discovery_at"); err != nil {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "iceberg_maintenance_state", "inventory_snapshot_id", "BIGINT NOT NULL DEFAULT 0 AFTER last_snapshot_id"); err != nil {

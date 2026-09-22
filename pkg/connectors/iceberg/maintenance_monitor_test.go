@@ -1,11 +1,94 @@
 package iceberg
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"iter"
+	"net/http"
+	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
+	icetable "github.com/apache/iceberg-go/table"
 	"github.com/gerinsp/rivus/pkg/config"
 )
+
+func TestMonitorSpecificityOrder(t *testing.T) {
+	if !(specificityTable > specificityNamespace &&
+		specificityNamespace > specificityCatalog &&
+		specificityCatalog > specificityMetalake) {
+		t.Fatal("monitor specificity order is invalid")
+	}
+}
+
+func TestMonitorDiscoveryDeltaLeavesUnchangedTargetsUntouched(t *testing.T) {
+	previous := []maintenanceMonitorTarget{{Catalog: "asmat", Namespace: "sales", Table: "orders"}}
+	delta := maintenanceDiscoveryDelta(previous, previous)
+	if len(delta.Added) != 0 || len(delta.Removed) != 0 {
+		t.Fatalf("unexpected delta: %#v", delta)
+	}
+}
+
+func TestRepeatedLargeDiscoveryProducesNoTargetChanges(t *testing.T) {
+	targets := make([]maintenanceMonitorTarget, 6700)
+	for i := range targets {
+		targets[i] = maintenanceMonitorTarget{
+			Catalog: "asmat", Namespace: "warehouse", Table: fmt.Sprintf("table_%04d", i),
+		}
+	}
+	delta := maintenanceDiscoveryDelta(targets, append([]maintenanceMonitorTarget(nil), targets...))
+	if len(delta.Added) != 0 || len(delta.Removed) != 0 {
+		t.Fatalf("unchanged 6,700-table discovery produced delta: added=%d removed=%d", len(delta.Added), len(delta.Removed))
+	}
+}
+
+func TestFailedDiscoveryDoesNotRetireTargets(t *testing.T) {
+	previous := []maintenanceMonitorTarget{{Catalog: "asmat", Namespace: "sales", Table: "orders"}}
+	got := targetsAfterDiscovery(previous, nil, errors.New("gravitino timeout"))
+	if !reflect.DeepEqual(got, previous) {
+		t.Fatalf("targets = %#v, want previous %#v", got, previous)
+	}
+}
+
+func TestSuccessfulEmptyDiscoveryRetiresTargets(t *testing.T) {
+	previous := []maintenanceMonitorTarget{{Catalog: "asmat", Namespace: "sales", Table: "orders"}}
+	delta := maintenanceDiscoveryDelta(previous, []maintenanceMonitorTarget{})
+	if len(delta.Removed) != 1 || delta.Removed[0] != previous[0] {
+		t.Fatalf("removed = %#v, want %#v", delta.Removed, previous)
+	}
+}
+
+func TestEqualSpecificityOwnershipIsStable(t *testing.T) {
+	current := monitorOwnershipCandidate{OwnerID: "monitor:first", Specificity: specificityNamespace}
+	candidate := monitorOwnershipCandidate{OwnerID: "monitor:second", Specificity: specificityNamespace}
+	if got := preferMonitorOwner(current, candidate); got != current {
+		t.Fatalf("winner = %#v, want stable current owner %#v", got, current)
+	}
+	if got := preferMonitorOwner(candidate, current); got != candidate {
+		t.Fatalf("winner = %#v, want stable current owner %#v", got, candidate)
+	}
+}
+
+type maintenanceDiscoveryCatalogStub struct {
+	namespaces map[string][]icetable.Identifier
+	tables     map[string][]icetable.Identifier
+}
+
+func (s maintenanceDiscoveryCatalogStub) ListNamespaces(_ context.Context, parent icetable.Identifier) ([]icetable.Identifier, error) {
+	return s.namespaces[strings.Join(parent, ".")], nil
+}
+
+func (s maintenanceDiscoveryCatalogStub) ListTables(_ context.Context, namespace icetable.Identifier) iter.Seq2[icetable.Identifier, error] {
+	return func(yield func(icetable.Identifier, error) bool) {
+		for _, table := range s.tables[strings.Join(namespace, ".")] {
+			if !yield(table, nil) {
+				return
+			}
+		}
+	}
+}
 
 func maintenanceMonitorConfigForTest() *config.JobConfig {
 	return &config.JobConfig{
@@ -57,7 +140,7 @@ func TestPrepareMaintenanceMonitorConfigNormalizesExplicitTables(t *testing.T) {
 	}
 }
 
-func TestPrepareMaintenanceMonitorConfigRejectsIngestionAndWildcards(t *testing.T) {
+func TestPrepareMaintenanceMonitorConfigRejectsIngestionAndTableWildcards(t *testing.T) {
 	cfg := maintenanceMonitorConfigForTest()
 	cfg.Source = &config.ConnectorSpec{Type: "mysql", Config: map[string]any{}}
 	if _, _, err := PrepareMaintenanceMonitorConfig(cfg); err == nil || !strings.Contains(err.Error(), "must not define a source") {
@@ -67,8 +150,164 @@ func TestPrepareMaintenanceMonitorConfigRejectsIngestionAndWildcards(t *testing.
 	cfg = maintenanceMonitorConfigForTest()
 	maintenance := cfg.Sink.Config["table_maintenance"].(map[string]any)
 	maintenance["tables"] = []any{map[string]any{"namespace": "barayax_bronze", "table": "*"}}
-	if _, _, err := PrepareMaintenanceMonitorConfig(cfg); err == nil || !strings.Contains(err.Error(), "wildcards") {
+	if _, _, err := PrepareMaintenanceMonitorConfig(cfg); err == nil || !strings.Contains(err.Error(), "catalog_monitoring") {
 		t.Fatalf("wildcard validation error = %v", err)
+	}
+}
+
+func TestPrepareMaintenanceMonitorConfigAcceptsCatalogMonitoring(t *testing.T) {
+	cfg := maintenanceMonitorConfigForTest()
+	maintenance := cfg.Sink.Config["table_maintenance"].(map[string]any)
+	delete(maintenance, "tables")
+	maintenance["catalog_monitoring"] = map[string]any{
+		"enabled": true, "api_uri": "http://gravitino:8090", "metalake": "lakehouse",
+		"catalog_patterns": []any{"*"}, "namespace_patterns": []any{"tenant_*"}, "table_patterns": []any{"*"},
+	}
+	normalized, targets, err := PrepareMaintenanceMonitorConfig(cfg)
+	if err != nil {
+		t.Fatalf("catalog monitoring config returned error: %v", err)
+	}
+	if len(targets) != 0 {
+		t.Fatalf("static targets = %#v, want none", targets)
+	}
+	catalog, _, _, _, err := DescribeMaintenanceMonitorConfig(normalized)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if catalog != "auto:*" {
+		t.Fatalf("catalog label = %q, want auto:*", catalog)
+	}
+}
+
+func TestCatalogMonitoringExclusionsAreScopedByCatalogNamespaceAndTable(t *testing.T) {
+	monitoring := config.IcebergCatalogMonitoringConfig{Exclude: []config.IcebergCatalogMonitoringExclusion{
+		{Catalog: "archive"},
+		{Catalog: "asmat", Namespace: "analytics"},
+		{Catalog: "asmat", Namespace: "reporting", Table: "temporary_*"},
+	}}
+	for _, target := range []maintenanceMonitorTarget{
+		{Catalog: "archive", Namespace: "anything", Table: "orders"},
+		{Catalog: "asmat", Namespace: "analytics", Table: "daily_summary"},
+		{Catalog: "asmat", Namespace: "reporting", Table: "temporary_2026"},
+	} {
+		if !catalogMonitoringTargetExcluded(monitoring, target) {
+			t.Fatalf("target %#v was not excluded", target)
+		}
+	}
+	for _, target := range []maintenanceMonitorTarget{
+		{Catalog: "ds", Namespace: "analytics", Table: "daily_summary"},
+		{Catalog: "asmat", Namespace: "reporting", Table: "daily_summary"},
+	} {
+		if catalogMonitoringTargetExcluded(monitoring, target) {
+			t.Fatalf("target %#v was unexpectedly excluded", target)
+		}
+	}
+	if !catalogMonitoringCatalogExcluded(monitoring, "archive") || catalogMonitoringCatalogExcluded(monitoring, "asmat") {
+		t.Fatal("whole-catalog exclusion did not distinguish archive from scoped asmat exclusions")
+	}
+}
+
+func TestPrepareMaintenanceMonitorConfigValidatesCatalogMonitoringExclusions(t *testing.T) {
+	cfg := maintenanceMonitorConfigForTest()
+	maintenance := cfg.Sink.Config["table_maintenance"].(map[string]any)
+	delete(maintenance, "tables")
+	maintenance["catalog_monitoring"] = map[string]any{
+		"enabled": true, "api_uri": "http://gravitino:8090", "metalake": "lakehouse",
+		"exclude": []any{map[string]any{"catalog": "asmat", "table": "temporary_*"}},
+	}
+	if _, _, err := PrepareMaintenanceMonitorConfig(cfg); err == nil || !strings.Contains(err.Error(), "namespace is required") {
+		t.Fatalf("exclusion validation error = %v", err)
+	}
+}
+
+func TestMaintenanceTargetMatchesGlobSelectors(t *testing.T) {
+	selectors := []config.IcebergTarget{{Namespace: "ga4_*", Table: "daily_*"}}
+	if !maintenanceTargetMatches(selectors, "ga4_bronze", "daily_overview") {
+		t.Fatal("expected namespace and table glob to match")
+	}
+	if maintenanceTargetMatches(selectors, "analytics", "daily_overview") {
+		t.Fatal("unexpected namespace match")
+	}
+}
+
+func TestExpandMaintenanceMonitorTargetsDiscoversNewNamespacesAndTables(t *testing.T) {
+	cat := maintenanceDiscoveryCatalogStub{
+		namespaces: map[string][]icetable.Identifier{
+			"":          {{"analytics"}, {"ga4_bronze"}},
+			"analytics": {{"analytics", "daily"}},
+		},
+		tables: map[string][]icetable.Identifier{
+			"analytics":       {{"analytics", "summary"}},
+			"analytics.daily": {{"analytics", "daily", "overview"}},
+			"ga4_bronze":      {{"ga4_bronze", "daily_overview"}, {"ga4_bronze", "users"}},
+		},
+	}
+	targets, err := expandMaintenanceMonitorTargets(context.Background(), cat, []config.IcebergTarget{
+		{Namespace: "ga4_*", Table: "daily_*"},
+		{Namespace: "analytics*", Table: "*"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []config.IcebergTarget{
+		{Namespace: "analytics", Table: "summary"},
+		{Namespace: "analytics.daily", Table: "overview"},
+		{Namespace: "ga4_bronze", Table: "daily_overview"},
+	}
+	if len(targets) != len(want) {
+		t.Fatalf("targets = %#v, want %#v", targets, want)
+	}
+	for i := range want {
+		if targets[i] != want[i] {
+			t.Fatalf("targets[%d] = %#v, want %#v", i, targets[i], want[i])
+		}
+	}
+}
+
+func TestListGravitinoCatalogsFiltersPatternsAndProviders(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/metalakes/lakehouse/catalogs":
+			_, _ = w.Write([]byte(`{"code":0,"identifiers":[{"name":"asmat"},{"name":"mysql"},{"name":"other"}]}`))
+		case "/api/metalakes/lakehouse/catalogs/asmat":
+			_, _ = w.Write([]byte(`{"code":0,"catalog":{"type":"relational","provider":"lakehouse-iceberg"}}`))
+		case "/api/metalakes/lakehouse/catalogs/mysql":
+			_, _ = w.Write([]byte(`{"code":0,"catalog":{"type":"relational","provider":"jdbc-mysql"}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	catalogs, err := listGravitinoCatalogs(context.Background(), config.IcebergCatalogMonitoringConfig{
+		APIURI: server.URL, Metalake: "lakehouse", CatalogPatterns: []string{"as*", "mysql"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(catalogs) != 1 || catalogs[0] != "asmat" {
+		t.Fatalf("catalogs = %#v, want [asmat]", catalogs)
+	}
+}
+
+func TestMaintenanceWorkerConfigForCatalogUsesStateCatalog(t *testing.T) {
+	cfg := maintenanceMonitorConfigForTest()
+	maintenance := cfg.Sink.Config["table_maintenance"].(map[string]any)
+	delete(maintenance, "tables")
+	maintenance["catalog_monitoring"] = map[string]any{
+		"enabled": true, "api_uri": "http://gravitino:8090", "metalake": "lakehouse",
+	}
+	catalogCfg, err := maintenanceMonitorConfigForCatalog(cfg, "new_catalog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, sinkCfg := jobSinkSpec(catalogCfg)
+	iceCfg, err := decodeIcebergConfig(sinkCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if iceCfg.Warehouse != "new_catalog" || iceCfg.CatalogName != "new_catalog" || iceCfg.TableMaintenance.CatalogName != "new_catalog" {
+		t.Fatalf("catalog config = warehouse:%q catalog:%q maintenance:%q", iceCfg.Warehouse, iceCfg.CatalogName, iceCfg.TableMaintenance.CatalogName)
 	}
 }
 
