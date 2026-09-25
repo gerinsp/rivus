@@ -138,6 +138,11 @@ export function switchTab(tab, options = {}) {
   if (maintenanceActive && options.load !== false) loadMaintenanceMonitors();
 }
 
+function openMaintenanceMonitors() {
+  closeMaintenanceMonitorDetails();
+  switchTab('maintenance');
+}
+
 export async function refreshDashboard(options = {}) {
   if (options.auto && isAnyModalOpen()) return;
   if (options.auto && isBulkBusy()) return;
@@ -169,6 +174,7 @@ function installCompatibilityGlobals() {
   // while feature implementation lives in ES modules.
   Object.assign(window, {
     switchTab,
+    openMaintenanceMonitors,
     refreshDashboard,
     toggleProfileMenu,
     logout,

@@ -233,19 +233,10 @@ after Spark finishes. Timeouts, resource failures, and other errors do not
 pause writers. Direct/manual Spark compaction remains coordinated by default.
 Snapshot expiration and orphan cleanup remain online and do not pause writers.
 
-Compaction ordering is pressure-aware within the compaction pool. A table far
-above its configured small-file or delete-file threshold is claimed before a
-table that has only just crossed the threshold. Rivus also estimates the time
-to threshold from CDC file growth after the last successful compaction; when a
-table is projected to cross within one hour and already has a useful rewrite
-group, it is scheduled proactively. A newer inventory can promote an existing
-queued or retrying compaction without creating a duplicate task.
-
-After a successful compaction, Rivus reloads the table inventory. If the table
-is still above a compaction threshold, it immediately schedules another pass
-at the newly calculated priority instead of waiting for the normal idle
-interval. The table-level lease still guarantees that only one inventory or
-maintenance operation runs against the table at a time.
+Compaction priority follows file pressure and projected CDC growth. Rivus can
+promote queued work, start before a threshold is crossed, and schedule another
+pass when the refreshed inventory is still above threshold. Table leases keep
+operations on the same table sequential.
 
 Initial snapshots remain protected by a snapshot-complete barrier. Native compaction verifies its starting snapshot before staging work. Iceberg commit conflicts are retryable maintenance failures, so CDC wins concurrent writes.
 

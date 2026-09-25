@@ -354,10 +354,7 @@ func processClaimedMaintenanceTask(
 		}
 		return "succeeded", nil
 	case "skipped":
-		// A skipped compaction did not establish a new growth baseline. Keeping
-		// last_compaction_at and the CDC counters unchanged prevents a no-op from
-		// making old file growth look like a sudden new burst. Periodic cleanup
-		// checks still record their successful check time when they are no-ops.
+		// Skipped compactions do not establish a new growth baseline.
 		if task.Operation != maintenanceOperationCompact {
 			_ = store.RecordStateSuccess(finalizeCtx, state.TableKey, task.Operation, time.Now().UTC(), false)
 		}

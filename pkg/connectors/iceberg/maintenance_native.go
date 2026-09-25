@@ -270,11 +270,7 @@ func executeNativeMaintenanceTask(
 	return outcome
 }
 
-// executeAfterMaintenanceSetup releases the context used for the inventory
-// scan before starting the independently bounded maintenance operation.
-// Compaction must load a fresh table under its execution context; reusing the
-// setup table would also reuse an S3 filesystem bound to this cancelled
-// context when the REST catalog provides vended credentials.
+// Compaction reloads the table after this setup context is released.
 func executeAfterMaintenanceSetup(setupCancel context.CancelFunc, execute func() nativeTaskOutcome) nativeTaskOutcome {
 	setupCancel()
 	return execute()

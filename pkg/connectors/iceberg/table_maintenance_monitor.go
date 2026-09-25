@@ -310,9 +310,7 @@ func durableMaintenanceTableState(state meta.IcebergMaintenanceState, cfg config
 	return DurableMaintenanceTableStateAt(state, cfg, time.Now().UTC())
 }
 
-// DurableMaintenanceTableStateAt returns the user-visible state for one table
-// from its durable inventory record. Keep every API and runtime view routed
-// through this function so freshness and eligibility cannot drift apart.
+// DurableMaintenanceTableStateAt returns a table's durable maintenance state.
 func DurableMaintenanceTableStateAt(state meta.IcebergMaintenanceState, cfg config.IcebergTableMaintenanceConfig, now time.Time) string {
 	if !state.SnapshotComplete {
 		return "waiting_for_snapshot"

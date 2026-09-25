@@ -23,10 +23,7 @@ const (
 	MaintenanceTaskRetry     = "retry"
 	MaintenanceTaskCancelled = "cancelled"
 
-	// MaintenanceInventoryMaxAge is the longest an inventory can be treated as
-	// current without verifying the table's active Iceberg snapshot again. This
-	// matters for tables that can also be written by systems outside Rivus,
-	// because those writes do not emit Rivus maintenance signals.
+	// MaintenanceInventoryMaxAge bounds cached inventory freshness.
 	MaintenanceInventoryMaxAge = time.Hour
 )
 
@@ -713,11 +710,7 @@ func (s *IcebergMaintenanceStore) FinishInventoryClaim(ctx context.Context, tabl
 	return nil
 }
 
-// RequestInventoryRefresh schedules a metadata-only inventory scan for a
-// single job. It never reads Parquet data and it never scans every configured
-// table. A normal request only scans tables that have never been inventoried,
-// whose successful Rivus commit is newer than their saved inventory, or whose
-// inventory is old enough that external Iceberg commits may have made it stale.
+// RequestInventoryRefresh schedules stale or changed tables for inventory.
 func (s *IcebergMaintenanceStore) RequestInventoryRefresh(ctx context.Context, ownerJobID string, now time.Time, force bool) (int64, error) {
 	ownerJobID = strings.TrimSpace(ownerJobID)
 	if ownerJobID == "" {
@@ -877,10 +870,7 @@ func (s *IcebergMaintenanceStore) UpdateInventory(ctx context.Context, tableKey 
 	return err
 }
 
-// ScheduleCompactionCheck makes a compaction check due after a fresh manifest
-// inventory has observed current or projected maintenance pressure. If a task
-// is already queued, a more urgent priority promotes it in place; leased work
-// is left untouched and its completion path schedules any required follow-up.
+// ScheduleCompactionCheck schedules work or promotes an existing queued task.
 func (s *IcebergMaintenanceStore) ScheduleCompactionCheck(ctx context.Context, tableKey string, due time.Time, priority int) error {
 	if priority <= 0 {
 		priority = 10

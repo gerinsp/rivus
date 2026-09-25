@@ -1715,9 +1715,7 @@ func (m *JobManager) startClaimedWorkerJob(record meta.PersistedJob) error {
 
 	mode := config.JobModeResume
 	if m.workerRole == WorkerRoleSnapshot {
-		// QUEUED is shared by new submissions and lifecycle resubmissions. The
-		// durable resume marker prevents a resubmitted initial job from being
-		// mistaken for a first attempt and taking another full snapshot.
+		// The resume marker distinguishes resubmits from new queued jobs.
 		firstAttempt := !record.ResumeRequested && snapshotFirstAttempt(record.LastStatus, true)
 		// A job can be paused while it is waiting in the snapshot queue, before
 		// MySQL has written its first snapshot checkpoint. In that case PAUSED

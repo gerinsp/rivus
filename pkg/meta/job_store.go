@@ -36,9 +36,7 @@ type PersistedJob struct {
 	Config        *config.JobConfig
 	DesiredState  DesiredState
 	ExecutionRole JobExecutionRole
-	// ResumeRequested distinguishes a lifecycle resubmit from a brand-new
-	// queued submission. Both are QUEUED while waiting for a worker, but only a
-	// resubmit must ignore the configured start mode and use the checkpoint.
+	// ResumeRequested distinguishes a resubmit from a new queued job.
 	ResumeRequested bool
 	LeaseOwner      string
 	LeaseUntil      time.Time

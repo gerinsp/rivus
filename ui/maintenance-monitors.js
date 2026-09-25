@@ -134,15 +134,15 @@ async function handleMonitorAction(event) {
     }
     return;
   }
-  if (action === 'delete' && !confirm(`Delete maintenance monitor ${id}? Iceberg table data and run history will be preserved.`)) return;
+  if (action === 'delete' && !confirm(`Delete maintenance monitor ${id}?`)) return;
   button.disabled = true;
   try {
     const data = await mutateMonitor(id, action === 'delete' ? '' : action, action === 'delete' ? 'DELETE' : 'POST');
     if (action === 'run') {
       const count = Number(data.requested || 0);
       setNotice(count > 0
-        ? `Inventory refresh queued for ${count} table(s).`
-        : 'Monitor is registered; its tables will be available after the maintenance worker’s next poll.', 'success');
+        ? `Queued ${count} table(s).`
+        : 'No tables queued.', 'success');
     } else {
       setNotice(`Maintenance monitor ${id} ${action === 'delete' ? 'deleted' : `${action}d`}.`, 'success');
     }
@@ -198,8 +198,8 @@ export async function showMaintenanceMonitorDetails(id) {
   renderIcebergMaintenance(job, {
     panel,
     historyOwnerID: `monitor:${monitor.id}`,
-    historyLabel: "View this monitor's maintenance runs",
-    refreshLabel: 'Scan & maintain now',
+    historyLabel: 'Maintenance runs',
+    refreshLabel: 'Run now',
     refreshDisabled: String(monitor.status || '').toUpperCase() !== 'ACTIVE',
     onRefreshInventory: async () => {
       await mutateMonitor(monitor.id, 'run');

@@ -101,9 +101,8 @@ func (m *JobManager) RequestPause(id string) error {
 	return m.pauseDurableJob(job)
 }
 
-// RequestResubmit makes a remote job claimable again. It preserves the durable
-// execution role for a normal resume, or reroutes to a snapshot worker when a
-// live MySQL check confirms that the saved binlog has been purged.
+// RequestResubmit resumes a remote job or starts a fresh snapshot when its
+// saved binlog has been purged.
 func (m *JobManager) RequestResubmit(id string) (*Job, error) {
 	m.mu.RLock()
 	job := m.jobs[id]
@@ -151,7 +150,7 @@ func setObservedFreshSnapshotProgress(job *Job) {
 	job.progress = &JobProgress{
 		Phase:   "queued",
 		Summary: "Waiting for snapshot worker",
-		Detail:  "The saved binlog was purged; a fresh snapshot will replace the unusable checkpoint",
+		Detail:  "Checkpoint unavailable; restarting the snapshot",
 	}
 	job.Updated = time.Now()
 	job.mu.Unlock()

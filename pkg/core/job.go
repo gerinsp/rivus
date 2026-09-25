@@ -502,9 +502,7 @@ func checkpointBinlogStatus(checkpointFile, first, last string, count int) strin
 	}
 }
 
-// durableCheckpointBinlogStatus performs the small live check needed by a
-// resubmit decision. Unlike the detailed checkpoint view, it does not inspect
-// event timestamps from individual binlog files.
+// durableCheckpointBinlogStatus checks whether the saved binlog still exists.
 func (j *Job) durableCheckpointBinlogStatus(ctx context.Context) (string, error) {
 	store, key, err := j.checkpointReader()
 	if err != nil {

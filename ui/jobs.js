@@ -326,7 +326,7 @@ async function bulkResumeArchive(scope) {
   const ids = jobs.filter((job) => RESUMABLE.has(job?.status)).map((job) => job?.id).filter(Boolean);
   const label = scope === 'iceberg' ? 'Iceberg' : 'Doris';
   if (ids.length === 0) return;
-  if (!confirm(`Resume ${ids.length} archived ${label} job(s) from their latest saved checkpoints? If MySQL has purged a required binlog, Rivus will run a fresh snapshot for that job.`)) return;
+  if (!confirm(`Resume ${ids.length} archived ${label} job(s)?`)) return;
 
   bulkResumeInFlight = true;
   updateArchiveBulkButtons('doris', latestDorisArchiveJobs);
@@ -380,7 +380,7 @@ async function bulkDeleteArchive(scope) {
 }
 
 async function resubmitJob(id) {
-  if (!confirm('Resubmit job ' + id + ' from the latest saved checkpoint? If MySQL has purged that binlog, Rivus will run a fresh snapshot.')) return;
+  if (!confirm('Resubmit job ' + id + '?')) return;
   const res = await apiFetch('/api/jobs/' + encodeURIComponent(id) + '/resubmit', { method: 'POST' });
   if (!res.ok) {
     alert(await operationErrorMessage(res, 'Resubmit'));

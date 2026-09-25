@@ -13,10 +13,7 @@ const (
 	minimumGrowthWindow           = 5 * time.Minute
 )
 
-// compactionTaskPriority ranks compactions within the dedicated compaction
-// pool. Lower numbers are claimed first. Severity wins immediately, while a
-// table projected to cross a threshold soon is promoted before it becomes a
-// query-planning problem.
+// Lower priority values are claimed first.
 func compactionTaskPriority(state meta.IcebergMaintenanceState, settings nativeMaintenanceSettings, now time.Time) int {
 	pressure := compactionPressure(state, settings)
 	switch {
@@ -61,9 +58,7 @@ func ratio(value, threshold int) float64 {
 	return float64(value) / float64(threshold)
 }
 
-// proactiveCompactionDue starts work before the hard threshold only when the
-// table already contains enough files to produce a useful rewrite and recent
-// CDC growth predicts that the threshold will be crossed within the lookahead.
+// Start early only when growth will cross the threshold within the lookahead.
 func proactiveCompactionDue(inventory activeFileInventory, state meta.IcebergMaintenanceState, settings nativeMaintenanceSettings, now time.Time) bool {
 	observed := stateWithActiveInventory(state, inventory)
 	return proactiveCompactionStateDue(observed, settings, now)

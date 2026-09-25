@@ -161,10 +161,7 @@ func (s *MySQLJobStore) RequestJobResume(ctx context.Context, jobID string, role
 	return rows > 0, err
 }
 
-// RequestJobFreshSnapshot makes a terminal job claimable by a snapshot worker
-// without the resume marker. It is used only when the saved CDC binlog has
-// been confirmed as purged, so the snapshot worker deliberately replaces the
-// unusable checkpoint with a new snapshot start position.
+// RequestJobFreshSnapshot routes a terminal job through a new snapshot.
 func (s *MySQLJobStore) RequestJobFreshSnapshot(ctx context.Context, jobID string) (bool, error) {
 	jobID = strings.TrimSpace(jobID)
 	if jobID == "" {
