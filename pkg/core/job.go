@@ -127,6 +127,7 @@ type Job struct {
 	cancelFunc           context.CancelFunc
 	sourceCancelFunc     context.CancelFunc
 	runDone              chan struct{}
+	runMode              config.JobMode
 	pauseRequested       bool
 
 	statusListener     func(JobStatus)
@@ -171,6 +172,12 @@ func (j *Job) MetaKey() string {
 	j.mu.RLock()
 	defer j.mu.RUnlock()
 	return j.metaKey
+}
+
+func (j *Job) currentRunMode() config.JobMode {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	return j.runMode
 }
 
 // ensureMetaKey resolves the durable checkpoint identity once and then keeps
@@ -472,17 +479,95 @@ func (j *Job) checkpointBinlogDiagnostics(ctx context.Context, off *meta.Offset)
 		}
 	}
 	diag.CheckpointAvailable = binlogFileInRange(off.BinlogFile, first, last)
+	diag.Status = checkpointBinlogStatus(off.BinlogFile, first, last, count)
+	return diag
+}
+
+func checkpointBinlogStatus(checkpointFile, first, last string, count int) string {
+	checkpointFile = strings.TrimSpace(checkpointFile)
+	first = strings.TrimSpace(first)
+	last = strings.TrimSpace(last)
 	switch {
 	case first == "" || last == "" || count == 0:
-		diag.Status = "no_binlogs"
-	case diag.CheckpointAvailable:
-		diag.Status = "available"
-	case strings.TrimSpace(off.BinlogFile) != "" && strings.TrimSpace(first) != "" && strings.Compare(off.BinlogFile, first) < 0:
-		diag.Status = "purged"
+		return "no_binlogs"
+	case binlogFileInRange(checkpointFile, first, last):
+		return "available"
 	default:
-		diag.Status = "missing"
+		checkpointPrefix, checkpointNumber, checkpointOK := splitBinlogFile(checkpointFile)
+		firstPrefix, firstNumber, firstOK := splitBinlogFile(first)
+		if checkpointOK && firstOK && checkpointPrefix == firstPrefix && checkpointNumber < firstNumber {
+			return "purged"
+		}
+		return "missing"
 	}
-	return diag
+}
+
+// durableCheckpointBinlogStatus performs the small live check needed by a
+// resubmit decision. Unlike the detailed checkpoint view, it does not inspect
+// event timestamps from individual binlog files.
+func (j *Job) durableCheckpointBinlogStatus(ctx context.Context) (string, error) {
+	store, key, err := j.checkpointReader()
+	if err != nil {
+		return "", err
+	}
+	if store == nil || strings.TrimSpace(key) == "" {
+		return "", nil
+	}
+	off, err := store.GetOffset(ctx, key)
+	if err != nil {
+		return "", err
+	}
+	checkpointFile := ""
+	var checkpointPos uint32
+	if off != nil {
+		checkpointFile = strings.TrimSpace(off.BinlogFile)
+		checkpointPos = off.BinlogPos
+	}
+	if checkpointFile == "" || checkpointPos == 0 {
+		state, stateErr := store.GetSnapshotState(ctx, key)
+		if stateErr != nil {
+			return "", stateErr
+		}
+		if state != nil {
+			checkpointFile = strings.TrimSpace(state.StartFile)
+			checkpointPos = state.StartPos
+		}
+	}
+	if checkpointFile == "" || checkpointPos == 0 {
+		return "", nil
+	}
+
+	cfg, ok := j.mysqlSourceConfig()
+	if !ok {
+		return "", nil
+	}
+	dbName := strings.TrimSpace(cfg.Database)
+	if dbName == "" {
+		dbName = "information_schema"
+	}
+	dsn := drivermysql.NewConfig()
+	dsn.User = cfg.User
+	dsn.Passwd = cfg.Password
+	dsn.Net = "tcp"
+	dsn.Addr = cfg.Addr
+	dsn.DBName = dbName
+	dsn.ParseTime = true
+	dsn.InterpolateParams = true
+	dsn.Timeout = 3 * time.Second
+	dsn.ReadTimeout = 3 * time.Second
+	dsn.WriteTimeout = 3 * time.Second
+	dsn.Params = map[string]string{"charset": "utf8mb4"}
+
+	db, err := sql.Open("mysql", dsn.FormatDSN())
+	if err != nil {
+		return "", err
+	}
+	defer db.Close()
+	first, last, count, err := showBinaryLogs(ctx, db)
+	if err != nil {
+		return "", err
+	}
+	return checkpointBinlogStatus(checkpointFile, first, last, count), nil
 }
 
 func firstBinlogEventTime(ctx context.Context, cfg config.MySQLConfig, file string) (time.Time, string, error) {
@@ -651,7 +736,26 @@ func binlogFileInRange(file, first, last string) bool {
 	if file == "" || first == "" || last == "" {
 		return false
 	}
-	return strings.Compare(file, first) >= 0 && strings.Compare(file, last) <= 0
+	filePrefix, fileNumber, fileOK := splitBinlogFile(file)
+	firstPrefix, firstNumber, firstOK := splitBinlogFile(first)
+	lastPrefix, lastNumber, lastOK := splitBinlogFile(last)
+	if fileOK && firstOK && lastOK && filePrefix == firstPrefix && filePrefix == lastPrefix {
+		return fileNumber >= firstNumber && fileNumber <= lastNumber
+	}
+	return file == first || file == last
+}
+
+func splitBinlogFile(file string) (string, uint64, bool) {
+	file = strings.TrimSpace(file)
+	dot := strings.LastIndexByte(file, '.')
+	if dot <= 0 || dot == len(file)-1 {
+		return "", 0, false
+	}
+	number, err := strconv.ParseUint(file[dot+1:], 10, 64)
+	if err != nil {
+		return "", 0, false
+	}
+	return file[:dot], number, true
 }
 
 func formatCheckpointTime(t time.Time) string {
@@ -1265,6 +1369,7 @@ func (j *Job) Resume() error {
 }
 
 func (j *Job) startWithMode(mode config.JobMode) (err error) {
+	effectiveMode := normalizeMode(mode)
 	defer func() {
 		recovered := recover()
 		if recovered == nil {
@@ -1299,6 +1404,10 @@ func (j *Job) startWithMode(mode config.JobMode) (err error) {
 		return err
 	}
 
+	j.mu.Lock()
+	j.runMode = effectiveMode
+	j.mu.Unlock()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	j.setCancel(cancel)
 	j.setPauseRequested(false)
@@ -1332,7 +1441,6 @@ func (j *Job) startWithMode(mode config.JobMode) (err error) {
 	sinkType, sinkCfg := j.pickSink()
 
 	// build new metaKey (allowed to change)
-	effectiveMode := normalizeMode(mode)
 	storedMode := normalizeMode(j.Config.Mode)
 	log.Printf("[job %s] start mode=%s source=%s sink=%s", j.Config.ID, effectiveMode, srcType, sinkType)
 	metaKey := j.ensureMetaKey()

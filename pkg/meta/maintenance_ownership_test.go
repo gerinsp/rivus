@@ -27,6 +27,23 @@ func TestMaintenanceReservationMatchesCatalogScopedPatterns(t *testing.T) {
 	}
 }
 
+func TestScheduleCompactionCheckPromotesQueuedTask(t *testing.T) {
+	store, catalog, tableKey := newMaintenanceOwnershipIntegrationStore(t)
+	seedQueuedMonitorTask(t, store, tableKey, MaintenanceMonitorOwnerID("general-"+catalog), nil)
+
+	if err := store.ScheduleCompactionCheck(context.Background(), tableKey, time.Now(), 1); err != nil {
+		t.Fatal(err)
+	}
+	var priority int
+	if err := store.db.QueryRowContext(context.Background(), `SELECT priority FROM iceberg_maintenance_tasks
+		WHERE table_key=? AND status='queued' ORDER BY id DESC LIMIT 1`, tableKey).Scan(&priority); err != nil {
+		t.Fatal(err)
+	}
+	if priority != 1 {
+		t.Fatalf("queued compaction priority = %d, want 1", priority)
+	}
+}
+
 func TestValidateReservationSelectorRejectsTableWithoutNamespace(t *testing.T) {
 	selector := IcebergMaintenanceReservationSelector{Catalog: "asmat", TablePattern: "orders"}
 	if err := selector.Validate(); err == nil {

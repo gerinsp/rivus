@@ -54,7 +54,7 @@ Before production use, verify:
 - source timeouts allow long-lived replication connections;
 - binlog retention exceeds the maximum expected outage and snapshot handoff window.
 
-A missing/purged checkpoint binlog may require a new snapshot rather than a normal resume.
+A resubmit checks the saved checkpoint against MySQL's live binlog range. When the checkpoint is confirmed purged, Rivus runs a fresh snapshot before returning to CDC; if the range cannot be verified, Rivus keeps the failure explicit rather than assuming that a destructive reload is safe.
 
 ## Metadata MySQL expectations
 

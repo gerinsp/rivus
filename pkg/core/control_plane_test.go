@@ -83,6 +83,30 @@ func (s *memoryJobStore) RequestJobResume(_ context.Context, jobID string, role 
 	}
 	record.DesiredState = meta.DesiredStateRunning
 	record.ExecutionRole = role
+	record.ResumeRequested = true
+	record.LastStatus = string(JobStatusQueued)
+	record.LeaseOwner = ""
+	record.LeaseUntil = time.Time{}
+	record.UpdatedAt = time.Now()
+	s.jobs[jobID] = record
+	return true, nil
+}
+
+func (s *memoryJobStore) RequestJobFreshSnapshot(_ context.Context, jobID string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	record, ok := s.jobs[jobID]
+	if !ok {
+		return false, nil
+	}
+	switch record.LastStatus {
+	case string(JobStatusPaused), string(JobStatusFailed), string(JobStatusStopped):
+	default:
+		return false, nil
+	}
+	record.DesiredState = meta.DesiredStateRunning
+	record.ExecutionRole = meta.JobExecutionRoleSnapshot
+	record.ResumeRequested = false
 	record.LastStatus = string(JobStatusQueued)
 	record.LeaseOwner = ""
 	record.LeaseUntil = time.Time{}
@@ -206,8 +230,78 @@ func TestMasterResubmitPreservesStreamingHandoffRole(t *testing.T) {
 		t.Fatalf("resubmitted job status=%s, want QUEUED", job.GetStatus())
 	}
 	record, _ = store.Get(job.Config.ID)
-	if record.ExecutionRole != meta.JobExecutionRoleStreaming || record.DesiredState != meta.DesiredStateRunning || record.LeaseOwner != "" {
-		t.Fatalf("resubmit record role=%s desired=%s owner=%q", record.ExecutionRole, record.DesiredState, record.LeaseOwner)
+	if record.ExecutionRole != meta.JobExecutionRoleStreaming || record.DesiredState != meta.DesiredStateRunning || record.LeaseOwner != "" || !record.ResumeRequested {
+		t.Fatalf("resubmit record role=%s desired=%s owner=%q resume_requested=%t", record.ExecutionRole, record.DesiredState, record.LeaseOwner, record.ResumeRequested)
+	}
+
+	reg, modes := newSplitWorkerTestRegistry()
+	worker := NewJobManager(reg,
+		WithJobStore(store),
+		WithWorkerRole(WorkerRoleStreaming),
+		WithWorkerID("streaming-resubmit"),
+	)
+	if err := worker.RestorePersistedJobs(context.Background()); err != nil {
+		t.Fatalf("RestorePersistedJobs returned error: %v", err)
+	}
+	if err := worker.reconcileWorkerJobs(context.Background(), store); err != nil {
+		t.Fatalf("reconcileWorkerJobs returned error: %v", err)
+	}
+	select {
+	case mode := <-modes:
+		if mode != config.JobModeResume {
+			t.Fatalf("resubmitted streaming mode=%s, want %s", mode, config.JobModeResume)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for resubmitted streaming job")
+	}
+	_ = worker.Cancel(job.Config.ID)
+}
+
+func TestMasterResubmitMarksSnapshotRoleAsResume(t *testing.T) {
+	store := newMemoryJobStore()
+	cfg := newTestJobConfig("master-snapshot-resubmit")
+	if err := store.SaveJob(context.Background(), meta.PersistedJob{
+		ID:            cfg.ID,
+		Name:          cfg.Name,
+		Config:        cfg,
+		DesiredState:  meta.DesiredStateStopped,
+		ExecutionRole: meta.JobExecutionRoleSnapshot,
+		LastStatus:    string(JobStatusFailed),
+	}); err != nil {
+		t.Fatalf("SaveJob returned error: %v", err)
+	}
+
+	master := NewJobManager(nil, WithJobStore(store), WithControlPlaneRole())
+	if err := master.RestorePersistedJobs(context.Background()); err != nil {
+		t.Fatalf("RestorePersistedJobs returned error: %v", err)
+	}
+	if _, err := master.RequestResubmit(cfg.ID); err != nil {
+		t.Fatalf("RequestResubmit returned error: %v", err)
+	}
+	record, _ := store.Get(cfg.ID)
+	if record.ExecutionRole != meta.JobExecutionRoleSnapshot || !record.ResumeRequested || record.LastStatus != string(JobStatusQueued) {
+		t.Fatalf("resubmit record role=%s resume_requested=%t status=%s", record.ExecutionRole, record.ResumeRequested, record.LastStatus)
+	}
+
+	reg, modes := newSplitWorkerTestRegistry()
+	worker := NewJobManager(reg,
+		WithJobStore(store),
+		WithWorkerRole(WorkerRoleSnapshot),
+		WithWorkerID("snapshot-resubmit"),
+	)
+	if err := worker.RestorePersistedJobs(context.Background()); err != nil {
+		t.Fatalf("worker RestorePersistedJobs returned error: %v", err)
+	}
+	if err := worker.reconcileWorkerJobs(context.Background(), store); err != nil {
+		t.Fatalf("reconcileWorkerJobs returned error: %v", err)
+	}
+	select {
+	case mode := <-modes:
+		if mode != config.JobModeSnapshotHandoffResume {
+			t.Fatalf("resubmitted snapshot role mode=%s, want %s", mode, config.JobModeSnapshotHandoffResume)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for resubmitted snapshot-role job")
 	}
 }
 
@@ -300,7 +394,7 @@ func TestWorkerAppliesDurablePauseGracefully(t *testing.T) {
 	store := newMemoryJobStore()
 	drainStarted := make(chan struct{}, 1)
 	allowDrain := make(chan struct{})
-	reg, _ := newGracefulPauseTestRegistry(drainStarted, allowDrain)
+	reg, modes := newGracefulPauseTestRegistry(drainStarted, allowDrain)
 	cfg := newTestJobConfig("worker-remote-pause")
 	cfg.Mode = config.JobModeLatest
 
@@ -325,6 +419,14 @@ func TestWorkerAppliesDurablePauseGracefully(t *testing.T) {
 	}
 	if err := manager.reconcileWorkerJobs(context.Background(), store); err != nil {
 		t.Fatalf("reconcileWorkerJobs returned error: %v", err)
+	}
+	select {
+	case mode := <-modes:
+		if mode != config.JobModeLatest {
+			t.Fatalf("new queued streaming mode=%s, want %s", mode, config.JobModeLatest)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for new queued streaming job")
 	}
 	job, err := manager.Get(cfg.ID)
 	if err != nil {

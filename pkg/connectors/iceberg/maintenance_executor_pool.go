@@ -342,9 +342,25 @@ func processClaimedMaintenanceTask(
 		if err := store.FinishTask(finalizeCtx, task.ID, workerID, meta.MaintenanceTaskSucceeded, "", nil); err != nil {
 			return "failed", err
 		}
+		if outcome.FollowUpCompaction {
+			if err := store.ScheduleCompactionCheck(
+				finalizeCtx,
+				state.TableKey,
+				time.Now().UTC(),
+				outcome.FollowUpCompactionPriority,
+			); err != nil {
+				log.Printf("[maintenance-worker %s] schedule follow-up compaction table=%s error=%v", workerID, state.TableKey, err)
+			}
+		}
 		return "succeeded", nil
 	case "skipped":
-		_ = store.RecordStateSuccess(finalizeCtx, state.TableKey, task.Operation, time.Now().UTC(), false)
+		// A skipped compaction did not establish a new growth baseline. Keeping
+		// last_compaction_at and the CDC counters unchanged prevents a no-op from
+		// making old file growth look like a sudden new burst. Periodic cleanup
+		// checks still record their successful check time when they are no-ops.
+		if task.Operation != maintenanceOperationCompact {
+			_ = store.RecordStateSuccess(finalizeCtx, state.TableKey, task.Operation, time.Now().UTC(), false)
+		}
 		if err := store.FinishTask(finalizeCtx, task.ID, workerID, meta.MaintenanceTaskSkipped, "", nil); err != nil {
 			return "failed", err
 		}

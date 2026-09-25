@@ -216,6 +216,7 @@ func (m *tableMaintenanceMonitor) publishDurableStatus(parent context.Context, s
 	var latest time.Time
 	inventoryScanning := false
 	inventoryPending := false
+	inventoryStale := false
 	for _, state := range states {
 		tableState := durableMaintenanceTableState(state, m.cfg.TableMaintenance)
 		if tableState == "scanning" {
@@ -223,6 +224,9 @@ func (m *tableMaintenanceMonitor) publishDurableStatus(parent context.Context, s
 		}
 		if tableState == "inventory_pending" {
 			inventoryPending = true
+		}
+		if tableState == "stale" {
+			inventoryStale = true
 		}
 		operations := []string{}
 		if result, resultErr := store.LatestResultForTable(ctx, state.TableKey); resultErr == nil && result != nil {
@@ -280,6 +284,8 @@ func (m *tableMaintenanceMonitor) publishDurableStatus(parent context.Context, s
 		status.State = "error"
 	case inventoryPending:
 		status.State = "inventory_pending"
+	case inventoryStale:
+		status.State = "stale"
 	case summary.Blocked > 0 && summary.Blocked == summary.Tables:
 		status.State = "waiting_for_snapshot"
 	case status.TablesTotal > 0 && status.TablesScanned == 0:
@@ -301,13 +307,20 @@ func (m *tableMaintenanceMonitor) publishDurableStatus(parent context.Context, s
 }
 
 func durableMaintenanceTableState(state meta.IcebergMaintenanceState, cfg config.IcebergTableMaintenanceConfig) string {
+	return DurableMaintenanceTableStateAt(state, cfg, time.Now().UTC())
+}
+
+// DurableMaintenanceTableStateAt returns the user-visible state for one table
+// from its durable inventory record. Keep every API and runtime view routed
+// through this function so freshness and eligibility cannot drift apart.
+func DurableMaintenanceTableStateAt(state meta.IcebergMaintenanceState, cfg config.IcebergTableMaintenanceConfig, now time.Time) string {
 	if !state.SnapshotComplete {
 		return "waiting_for_snapshot"
 	}
-	if state.InventoryLeaseUntil != nil && state.InventoryLeaseUntil.After(time.Now().UTC()) {
+	if state.InventoryLeaseUntil != nil && state.InventoryLeaseUntil.After(now) {
 		return "scanning"
 	}
-	if state.LeaseUntil != nil && state.LeaseUntil.After(time.Now().UTC()) {
+	if state.LeaseUntil != nil && state.LeaseUntil.After(now) {
 		return "running"
 	}
 	if state.LastError != "" {
@@ -319,13 +332,34 @@ func durableMaintenanceTableState(state meta.IcebergMaintenanceState, cfg config
 	if state.LastInventoryAt == nil {
 		return "inventory_pending"
 	}
-	dataReady := cfg.DataFilesThreshold > 0 && state.ActiveSmallFiles >= cfg.DataFilesThreshold
-	deleteReady := cfg.EqualityDeleteFilesThreshold > 0 &&
-		state.ActiveEqualityDeleteFiles >= cfg.EqualityDeleteFilesThreshold
-	positionDeleteReady := cfg.PositionDeleteFilesThreshold > 0 &&
-		state.ActivePositionDeleteFiles >= cfg.PositionDeleteFilesThreshold
-	smallBytesReady := cfg.SmallFilesMinCount > 0 && cfg.SmallFilesMinTotalBytes > 0 &&
-		state.ActiveSmallFiles >= cfg.SmallFilesMinCount && state.ActiveSmallBytes >= cfg.SmallFilesMinTotalBytes
+	if state.LastInventoryAt.Before(now.Add(-meta.MaintenanceInventoryMaxAge)) {
+		return "stale"
+	}
+	dataThreshold := cfg.DataFilesThreshold
+	if dataThreshold <= 0 {
+		dataThreshold = defaultDataFilesThreshold
+	}
+	deleteThreshold := cfg.EqualityDeleteFilesThreshold
+	if deleteThreshold <= 0 {
+		deleteThreshold = defaultEqualityDeleteFilesThreshold
+	}
+	positionDeleteThreshold := cfg.PositionDeleteFilesThreshold
+	if positionDeleteThreshold <= 0 {
+		positionDeleteThreshold = defaultPositionDeleteFilesThreshold
+	}
+	smallMinCount := cfg.SmallFilesMinCount
+	if smallMinCount <= 0 {
+		smallMinCount = defaultNativeMinSmallFiles
+	}
+	smallMinBytes := cfg.SmallFilesMinTotalBytes
+	if smallMinBytes <= 0 {
+		smallMinBytes = defaultNativeMinSmallBytes
+	}
+
+	dataReady := state.ActiveSmallFiles >= dataThreshold
+	deleteReady := state.ActiveEqualityDeleteFiles >= deleteThreshold
+	positionDeleteReady := state.ActivePositionDeleteFiles >= positionDeleteThreshold
+	smallBytesReady := state.ActiveSmallFiles >= smallMinCount && state.ActiveSmallBytes >= smallMinBytes
 	if dataReady || deleteReady || positionDeleteReady || smallBytesReady {
 		return "ready"
 	}

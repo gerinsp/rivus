@@ -79,8 +79,10 @@ type nativeMaintenanceSettings struct {
 }
 
 type nativeTaskOutcome struct {
-	Result    meta.IcebergMaintenanceResult
-	Retryable bool
+	Result                     meta.IcebergMaintenanceResult
+	Retryable                  bool
+	FollowUpCompaction         bool
+	FollowUpCompactionPriority int
 }
 
 type activeFileInventory struct {
@@ -219,38 +221,42 @@ func executeNativeMaintenanceTask(
 		}
 		// The planning decision below must use the inventory just read, rather
 		// than the state value that was loaded before this task was leased.
-		state.InventorySnapshotID = inventory.SnapshotID
-		state.ActiveDataFiles = inventory.DataFiles
-		state.ActiveSmallFiles = inventory.SmallFiles
-		state.ActiveSmallBytes = inventory.SmallBytes
-		state.ActiveEqualityDeleteFiles = inventory.EqualityDeletes
-		state.ActivePositionDeleteFiles = inventory.PositionDeletes
+		state = stateWithActiveInventory(state, inventory)
 	}
-	setupCancel()
-
-	var outcome nativeTaskOutcome
-	switch task.Operation {
-	case "compact":
-		outcome = executeHybridCompaction(ctx, jobID, jobCfg, iceCfg, tbl, state, task, settings)
-	case "expire_snapshots":
-		taskCtx, cancel := context.WithTimeout(ctx, settings.Timeout)
-		outcome = executeNativeSnapshotExpiration(taskCtx, tbl, result, settings)
-		cancel()
-	case "remove_orphan_files":
-		taskCtx, cancel := context.WithTimeout(ctx, settings.Timeout)
-		outcome = executeBoundedOrphanCleanup(taskCtx, tbl, result, settings)
-		cancel()
-	default:
-		result.Error = fmt.Sprintf("unsupported maintenance operation %q", task.Operation)
-		return finish(nativeTaskOutcome{Result: result})
-	}
+	outcome := executeAfterMaintenanceSetup(setupCancel, func() nativeTaskOutcome {
+		switch task.Operation {
+		case maintenanceOperationCompact:
+			return executeHybridCompaction(ctx, jobID, jobCfg, iceCfg, state, task, settings)
+		case maintenanceOperationExpire:
+			taskCtx, cancel := context.WithTimeout(ctx, settings.Timeout)
+			defer cancel()
+			return executeNativeSnapshotExpiration(taskCtx, tbl, result, settings)
+		case maintenanceOperationOrphan:
+			taskCtx, cancel := context.WithTimeout(ctx, settings.Timeout)
+			defer cancel()
+			return executeBoundedOrphanCleanup(taskCtx, tbl, result, settings)
+		default:
+			result.Error = fmt.Sprintf("unsupported maintenance operation %q", task.Operation)
+			return nativeTaskOutcome{Result: result}
+		}
+	})
 
 	if task.Operation == "compact" && outcome.Result.Status == "succeeded" {
 		refreshCtx, refreshCancel := context.WithTimeout(ctx, settings.Timeout)
-		if err := tbl.Refresh(refreshCtx); err == nil {
-			if inventory, inventoryErr := scanActiveFileInventory(refreshCtx, tbl, settings.SmallFileSizeBytes); inventoryErr == nil {
+		if refreshedTable, err := loadNativeMaintenanceTable(refreshCtx, iceCfg, state); err == nil {
+			if inventory, inventoryErr := scanActiveFileInventory(refreshCtx, refreshedTable, settings.SmallFileSizeBytes); inventoryErr == nil {
 				if saveErr := saveActiveFileInventory(refreshCtx, store, state.TableKey, inventory); saveErr != nil {
 					addInventoryWarning(&outcome.Result, saveErr)
+				} else {
+					if followUp, priority := followUpCompactionForInventory(inventory, state, settings, time.Now().UTC()); followUp {
+						outcome.FollowUpCompaction = true
+						outcome.FollowUpCompactionPriority = priority
+						if outcome.Result.Details == nil {
+							outcome.Result.Details = map[string]any{}
+						}
+						outcome.Result.Details["follow_up_compaction"] = true
+						outcome.Result.Details["follow_up_priority"] = outcome.FollowUpCompactionPriority
+					}
 				}
 			} else {
 				addInventoryWarning(&outcome.Result, inventoryErr)
@@ -262,6 +268,28 @@ func executeNativeMaintenanceTask(
 	}
 	outcome.Result.DurationMillis = time.Since(started).Milliseconds()
 	return outcome
+}
+
+// executeAfterMaintenanceSetup releases the context used for the inventory
+// scan before starting the independently bounded maintenance operation.
+// Compaction must load a fresh table under its execution context; reusing the
+// setup table would also reuse an S3 filesystem bound to this cancelled
+// context when the REST catalog provides vended credentials.
+func executeAfterMaintenanceSetup(setupCancel context.CancelFunc, execute func() nativeTaskOutcome) nativeTaskOutcome {
+	setupCancel()
+	return execute()
+}
+
+func loadNativeMaintenanceTable(ctx context.Context, iceCfg config.IcebergConfig, state meta.IcebergMaintenanceState) (*icetable.Table, error) {
+	cat, err := newCatalog(ctx, iceCfg)
+	if err != nil {
+		return nil, fmt.Errorf("create catalog: %w", err)
+	}
+	tbl, err := cat.LoadTable(ctx, namespaceIdentifier(state.Namespace, state.Table))
+	if err != nil {
+		return nil, fmt.Errorf("load table: %w", err)
+	}
+	return tbl, nil
 }
 
 func refreshPendingInventory(ctx context.Context, store *meta.IcebergMaintenanceStore, jobCfg *config.JobConfig, state meta.IcebergMaintenanceState, settings nativeMaintenanceSettings) error {
@@ -287,10 +315,12 @@ func refreshPendingInventory(ctx context.Context, store *meta.IcebergMaintenance
 	if err := saveActiveFileInventory(ctx, store, state.TableKey, inventory); err != nil {
 		return err
 	}
-	if !state.SnapshotComplete || !inventoryTriggersCompaction(inventory, settings) {
+	now := time.Now().UTC()
+	if !state.SnapshotComplete || !proactiveCompactionDue(inventory, state, settings, now) {
 		return nil
 	}
-	return store.ScheduleCompactionCheck(ctx, state.TableKey, time.Now().UTC())
+	observed := stateWithActiveInventory(state, inventory)
+	return store.ScheduleCompactionCheck(ctx, state.TableKey, now, compactionTaskPriority(observed, settings, now))
 }
 
 func scanActiveFileInventory(ctx context.Context, tbl *icetable.Table, smallFileSizeBytes int64) (activeFileInventory, error) {
@@ -396,7 +426,6 @@ func executeHybridCompaction(
 	jobID string,
 	jobCfg *config.JobConfig,
 	iceCfg config.IcebergConfig,
-	tbl *icetable.Table,
 	state meta.IcebergMaintenanceState,
 	task meta.IcebergMaintenanceTask,
 	settings nativeMaintenanceSettings,
@@ -412,6 +441,16 @@ func executeHybridCompaction(
 		Attempt:   task.AttemptCount,
 		CreatedAt: time.Now().UTC(),
 	}
+	tbl, err := loadNativeMaintenanceTable(nativeCtx, iceCfg, state)
+	if err != nil {
+		if errorsIsNoSuchIcebergTable(err) {
+			result.Status = "skipped"
+			result.RoutingReason = "table does not exist yet"
+			return nativeTaskOutcome{Result: result}
+		}
+		result.Error = fmt.Sprintf("load table for compaction: %v", err)
+		return nativeTaskOutcome{Result: result, Retryable: true}
+	}
 	if tbl.CurrentSnapshot() == nil {
 		result.Status = "skipped"
 		result.RoutingReason = "table has no current snapshot"
@@ -420,6 +459,7 @@ func executeHybridCompaction(
 	startSnapshotID := tbl.CurrentSnapshot().SnapshotID
 
 	triggers := compactionTriggersFor(state, settings)
+	projectedGrowthTrigger := !triggers.Any() && proactiveCompactionStateDue(state, settings, time.Now().UTC())
 	cfg := compaction.DefaultConfig()
 	cfg.TargetFileSizeBytes = settings.TargetFileSizeBytes
 	cfg.MinFileSizeBytes = settings.SmallFileSizeBytes
@@ -456,6 +496,9 @@ func executeHybridCompaction(
 		"trigger_small_file_bytes":         triggers.SmallFileBytes,
 		"trigger_equality_delete_files":    triggers.EqualityDelete,
 		"trigger_position_delete_files":    triggers.PositionDelete,
+		"trigger_projected_growth":         projectedGrowthTrigger,
+		"queue_priority":                   task.Priority,
+		"maintenance_pressure":             compactionPressure(state, settings),
 		"starting_snapshot_id":             startSnapshotID,
 		"estimated_output_files":           plan.EstOutputFiles,
 		"estimated_output_bytes":           plan.EstOutputBytes,
@@ -468,7 +511,7 @@ func executeHybridCompaction(
 	// eligibility check. A table with 5,000 delete files must go to Spark even
 	// when those files are small in total.
 	routeSpark, reason := shouldRouteCompactionToSpark(work, state, settings)
-	eligible := triggers.Any()
+	eligible := triggers.Any() || projectedGrowthTrigger
 	coordinateAfterConflict := shouldCoordinateSparkCompaction(task)
 	if eligible && coordinateAfterConflict && settings.Executor != maintenanceExecutorNative {
 		nativeCancel()

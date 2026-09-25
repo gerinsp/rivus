@@ -36,13 +36,17 @@ type PersistedJob struct {
 	Config        *config.JobConfig
 	DesiredState  DesiredState
 	ExecutionRole JobExecutionRole
-	LeaseOwner    string
-	LeaseUntil    time.Time
-	LastStatus    string
-	Errors        []PersistedJobError
-	ProgressJSON  []byte
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	// ResumeRequested distinguishes a lifecycle resubmit from a brand-new
+	// queued submission. Both are QUEUED while waiting for a worker, but only a
+	// resubmit must ignore the configured start mode and use the checkpoint.
+	ResumeRequested bool
+	LeaseOwner      string
+	LeaseUntil      time.Time
+	LastStatus      string
+	Errors          []PersistedJobError
+	ProgressJSON    []byte
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
 }
 
 type PersistedJobError struct {
@@ -156,6 +160,7 @@ func (s *MySQLJobStore) Init(ctx context.Context) error {
 	  meta_key      VARCHAR(255) NULL,
 	  desired_state VARCHAR(32) NOT NULL,
 	  execution_role VARCHAR(32) NOT NULL DEFAULT 'ALL',
+	  resume_requested BOOLEAN NOT NULL DEFAULT FALSE,
 	  lease_owner    VARCHAR(255) NULL,
 	  lease_until    DATETIME(6) NULL,
 	  last_status   VARCHAR(32) NOT NULL,
@@ -187,7 +192,8 @@ func (s *MySQLJobStore) Init(ctx context.Context) error {
 	}
 	for _, migration := range []string{
 		`ALTER TABLE job_registry ADD COLUMN execution_role VARCHAR(32) NOT NULL DEFAULT 'ALL' AFTER desired_state`,
-		`ALTER TABLE job_registry ADD COLUMN lease_owner VARCHAR(255) NULL AFTER execution_role`,
+		`ALTER TABLE job_registry ADD COLUMN resume_requested BOOLEAN NOT NULL DEFAULT FALSE AFTER execution_role`,
+		`ALTER TABLE job_registry ADD COLUMN lease_owner VARCHAR(255) NULL AFTER resume_requested`,
 		`ALTER TABLE job_registry ADD COLUMN lease_until DATETIME(6) NULL AFTER lease_owner`,
 	} {
 		if _, err := s.db.ExecContext(ctx, migration); err != nil && !isDuplicateColumnError(err) {
@@ -270,8 +276,8 @@ func (s *MySQLJobStore) SaveJob(ctx context.Context, job PersistedJob) error {
 	}
 
 	const stmt = `
-	INSERT INTO job_registry (job_id, submission_id, job_name, config_json, meta_key, desired_state, execution_role, last_status, errors_json, progress_json, created_at, updated_at)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
+	INSERT INTO job_registry (job_id, submission_id, job_name, config_json, meta_key, desired_state, execution_role, resume_requested, last_status, errors_json, progress_json, created_at, updated_at)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
 	ON DUPLICATE KEY UPDATE
 	  submission_id = VALUES(submission_id),
 	  job_name = VALUES(job_name),
@@ -279,11 +285,12 @@ func (s *MySQLJobStore) SaveJob(ctx context.Context, job PersistedJob) error {
 	  meta_key = VALUES(meta_key),
 	  desired_state = VALUES(desired_state),
 	  execution_role = VALUES(execution_role),
+	  resume_requested = VALUES(resume_requested),
 	  last_status = VALUES(last_status),
 	  errors_json = VALUES(errors_json),
 	  progress_json = VALUES(progress_json),
 	  updated_at = NOW();`
-	_, err = s.db.ExecContext(ctx, stmt, id, job.SubmissionID, name, string(payload), nullableString(job.MetaKey), string(desired), string(executionRole), status, string(errorsJSON), progressJSON)
+	_, err = s.db.ExecContext(ctx, stmt, id, job.SubmissionID, name, string(payload), nullableString(job.MetaKey), string(desired), string(executionRole), job.ResumeRequested, status, string(errorsJSON), progressJSON)
 	return err
 }
 
@@ -339,7 +346,7 @@ func (s *MySQLJobStore) SaveClaimedJob(ctx context.Context, job PersistedJob, ow
 
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE job_registry
-		SET job_name=?, meta_key=?, desired_state=?, execution_role=?,
+		SET job_name=?, meta_key=?, desired_state=?, execution_role=?, resume_requested=FALSE,
 		    last_status=CASE
 		      WHEN last_status='PAUSING' AND ? IN ('CREATED','QUEUED','PENDING','RUNNING') THEN last_status
 		      ELSE ?
@@ -357,7 +364,7 @@ func (s *MySQLJobStore) SaveClaimedJob(ctx context.Context, job PersistedJob, ow
 
 func (s *MySQLJobStore) LoadJobs(ctx context.Context) ([]PersistedJob, error) {
 	const q = `
-	SELECT job_id, submission_id, job_name, config_json, meta_key, desired_state, execution_role, lease_owner, lease_until, last_status, errors_json, progress_json, created_at, updated_at
+	SELECT job_id, submission_id, job_name, config_json, meta_key, desired_state, execution_role, resume_requested, lease_owner, lease_until, last_status, errors_json, progress_json, created_at, updated_at
 	FROM job_registry
 	ORDER BY created_at ASC`
 	return s.loadJobs(ctx, q)
@@ -374,13 +381,14 @@ func (s *MySQLJobStore) loadJobs(ctx context.Context, query string, args ...any)
 	for rows.Next() {
 		var (
 			jobID, submissionID, name, configJSON, desiredState, executionRole, lastStatus string
+			resumeRequested                                                                bool
 			metaKey                                                                        sql.NullString
 			leaseOwner                                                                     sql.NullString
 			leaseUntil                                                                     sql.NullTime
 			errorsJSON, progressJSON                                                       sql.NullString
 			createdAt, updatedAt                                                           time.Time
 		)
-		if err := rows.Scan(&jobID, &submissionID, &name, &configJSON, &metaKey, &desiredState, &executionRole, &leaseOwner, &leaseUntil, &lastStatus, &errorsJSON, &progressJSON, &createdAt, &updatedAt); err != nil {
+		if err := rows.Scan(&jobID, &submissionID, &name, &configJSON, &metaKey, &desiredState, &executionRole, &resumeRequested, &leaseOwner, &leaseUntil, &lastStatus, &errorsJSON, &progressJSON, &createdAt, &updatedAt); err != nil {
 			return nil, err
 		}
 
@@ -404,20 +412,21 @@ func (s *MySQLJobStore) loadJobs(ctx context.Context, query string, args ...any)
 		}
 
 		out = append(out, PersistedJob{
-			ID:            jobID,
-			SubmissionID:  submissionID,
-			Name:          name,
-			MetaKey:       metaKey.String,
-			Config:        &cfg,
-			DesiredState:  DesiredState(desiredState),
-			ExecutionRole: JobExecutionRole(executionRole),
-			LeaseOwner:    leaseOwner.String,
-			LeaseUntil:    leaseUntil.Time,
-			LastStatus:    lastStatus,
-			Errors:        errorHistory,
-			ProgressJSON:  []byte(progressJSON.String),
-			CreatedAt:     createdAt,
-			UpdatedAt:     updatedAt,
+			ID:              jobID,
+			SubmissionID:    submissionID,
+			Name:            name,
+			MetaKey:         metaKey.String,
+			Config:          &cfg,
+			DesiredState:    DesiredState(desiredState),
+			ExecutionRole:   JobExecutionRole(executionRole),
+			ResumeRequested: resumeRequested,
+			LeaseOwner:      leaseOwner.String,
+			LeaseUntil:      leaseUntil.Time,
+			LastStatus:      lastStatus,
+			Errors:          errorHistory,
+			ProgressJSON:    []byte(progressJSON.String),
+			CreatedAt:       createdAt,
+			UpdatedAt:       updatedAt,
 		})
 	}
 	if err := rows.Err(); err != nil {
@@ -500,7 +509,7 @@ func (s *MySQLJobStore) ClaimJobs(ctx context.Context, role JobExecutionRole, ow
 	}
 
 	const claimedQuery = `
-	SELECT job_id, submission_id, job_name, config_json, meta_key, desired_state, execution_role, lease_owner, lease_until, last_status, errors_json, progress_json, created_at, updated_at
+	SELECT job_id, submission_id, job_name, config_json, meta_key, desired_state, execution_role, resume_requested, lease_owner, lease_until, last_status, errors_json, progress_json, created_at, updated_at
 	FROM job_registry
 	WHERE lease_owner=? AND execution_role=? AND desired_state=? AND lease_until >= UTC_TIMESTAMP(6)
 	ORDER BY updated_at ASC`

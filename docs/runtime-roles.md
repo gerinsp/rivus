@@ -84,7 +84,7 @@ The master does not own source or sink goroutines. Pause, cancel, and resubmit t
 
 - **Pause** writes a `PAUSING` request while retaining the worker lease. The owning worker stops only the source and lets the sink drain and commit its checkpoint before becoming `PAUSED`.
 - **Cancel** sets the durable desired state to `STOPPED` and clears the lease. Guarded worker writes can no longer overwrite the stop request, and the worker stops its local pipeline when ownership is lost.
-- **Resubmit** preserves the durable execution role, clears a terminal job's stale lease, and makes the job claimable from its existing checkpoint. A conditional update prevents resubmit from fencing a job that has already started again.
+- **Resubmit** checks the saved MySQL checkpoint against the live binlog range. An available checkpoint preserves the durable execution role and records a durable resume marker, so a job queued to a snapshot worker resumes its saved snapshot state instead of being mistaken for a new initial submission. A confirmed purged binlog reroutes the job through a fresh snapshot before CDC handoff. A conditional update prevents resubmit from fencing a job that has already started again.
 - **Delete** removes the durable registry record; late claimed-worker writes are already fenced by the existing guarded save path.
 
 Workers poll durable pause requests by lease owner instead of performing one metadata query per running job. A transient control-observer database error is logged and retried; it does not terminate the data worker.

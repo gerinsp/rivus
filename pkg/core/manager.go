@@ -414,11 +414,18 @@ func (m *JobManager) Resubmit(id string) (*Job, error) {
 				return nil, ErrJobStillStopping
 			}
 		}
-		log.Printf("[job %s] resubmit requested mode=resume previous_status=%s", id, job.GetStatus())
-		if m.queueOrStart(job, config.JobModeResume, false) {
+		mode := config.JobModeResume
+		if jobCheckpointBinlogPurged(job) {
+			mode = config.JobModeInitial
+			if normalizeMode(job.Config.Mode) == config.JobModeSnapshotOnly {
+				mode = config.JobModeSnapshotOnly
+			}
+		}
+		log.Printf("[job %s] resubmit requested mode=%s previous_status=%s", id, mode, job.GetStatus())
+		if m.queueOrStart(job, mode, false) {
 			return job, nil
 		}
-		if err := m.startJob(job, config.JobModeResume, false); err != nil {
+		if err := m.startJob(job, mode, false); err != nil {
 			return nil, err
 		}
 		return job, nil
@@ -753,7 +760,9 @@ func (m *JobManager) attachStatusListener(job *Job) {
 		if releaseAfterDrain {
 			persistedStatus = JobStatus("STOPPING")
 		}
-		if m.workerRole == WorkerRoleSnapshot && status == JobStatusDone && normalizeMode(job.Config.Mode) == config.JobModeInitial {
+		runMode := job.currentRunMode()
+		if m.workerRole == WorkerRoleSnapshot && status == JobStatusDone && normalizeMode(job.Config.Mode) != config.JobModeSnapshotOnly &&
+			(runMode == config.JobModeSnapshotHandoff || runMode == config.JobModeSnapshotHandoffResume) {
 			m.mu.Lock()
 			m.executionRoles[job.Config.ID] = meta.JobExecutionRoleStreaming
 			m.mu.Unlock()
@@ -1706,7 +1715,10 @@ func (m *JobManager) startClaimedWorkerJob(record meta.PersistedJob) error {
 
 	mode := config.JobModeResume
 	if m.workerRole == WorkerRoleSnapshot {
-		firstAttempt := snapshotFirstAttempt(record.LastStatus, true)
+		// QUEUED is shared by new submissions and lifecycle resubmissions. The
+		// durable resume marker prevents a resubmitted initial job from being
+		// mistaken for a first attempt and taking another full snapshot.
+		firstAttempt := !record.ResumeRequested && snapshotFirstAttempt(record.LastStatus, true)
 		// A job can be paused while it is waiting in the snapshot queue, before
 		// MySQL has written its first snapshot checkpoint. In that case PAUSED
 		// must not turn an initial job into a resume attempt: there is nothing to
@@ -1721,7 +1733,7 @@ func (m *JobManager) startClaimedWorkerJob(record meta.PersistedJob) error {
 				log.Printf("[job-manager] starting initial snapshot without checkpoint job=%s previous_status=%s", cfg.ID, record.LastStatus)
 			}
 		}
-		if normalizeMode(cfg.Mode) == config.JobModeInitial {
+		if normalizeMode(cfg.Mode) != config.JobModeSnapshotOnly {
 			mode = config.JobModeSnapshotHandoffResume
 			if firstAttempt {
 				mode = config.JobModeSnapshotHandoff
@@ -1736,7 +1748,7 @@ func (m *JobManager) startClaimedWorkerJob(record meta.PersistedJob) error {
 				mode = config.JobModeSnapshotOnly
 			}
 		}
-	} else if strings.EqualFold(record.LastStatus, string(JobStatusCreated)) || strings.EqualFold(record.LastStatus, string(JobStatusQueued)) {
+	} else if !record.ResumeRequested && (strings.EqualFold(record.LastStatus, string(JobStatusCreated)) || strings.EqualFold(record.LastStatus, string(JobStatusQueued))) {
 		mode = normalizeMode(cfg.Mode)
 	}
 
