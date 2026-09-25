@@ -122,6 +122,40 @@ func TestSnapshotFirstAttemptWithoutCheckpoint(t *testing.T) {
 	}
 }
 
+func TestCheckpointBinlogStatus(t *testing.T) {
+	tests := []struct {
+		name       string
+		checkpoint string
+		first      string
+		last       string
+		count      int
+		want       string
+	}{
+		{name: "available", checkpoint: "mysql-bin.000149", first: "mysql-bin.000148", last: "mysql-bin.000150", count: 3, want: "available"},
+		{name: "purged", checkpoint: "mysql-bin.000147", first: "mysql-bin.000148", last: "mysql-bin.000150", count: 3, want: "purged"},
+		{name: "ahead is missing", checkpoint: "mysql-bin.000151", first: "mysql-bin.000148", last: "mysql-bin.000150", count: 3, want: "missing"},
+		{name: "different prefix is missing", checkpoint: "relay-bin.000147", first: "mysql-bin.000148", last: "mysql-bin.000150", count: 3, want: "missing"},
+		{name: "empty server", checkpoint: "mysql-bin.000147", count: 0, want: "no_binlogs"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := checkpointBinlogStatus(tt.checkpoint, tt.first, tt.last, tt.count); got != tt.want {
+				t.Fatalf("checkpointBinlogStatus()=%q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDuplicateStartDoesNotChangeActiveRunMode(t *testing.T) {
+	job := &Job{status: JobStatusRunning, runMode: config.JobModeSnapshotHandoff}
+	if err := job.startWithMode(config.JobModeResume); err != nil {
+		t.Fatalf("duplicate start returned error: %v", err)
+	}
+	if got := job.currentRunMode(); got != config.JobModeSnapshotHandoff {
+		t.Fatalf("active run mode changed to %s, want %s", got, config.JobModeSnapshotHandoff)
+	}
+}
+
 func TestControlPlanePersistsAuthoritativeMetaKey(t *testing.T) {
 	store := newMemoryJobStore()
 	manager := NewJobManager(
@@ -407,6 +441,93 @@ func TestSplitSnapshotOnlyJobDoesNotHandoffToStreaming(t *testing.T) {
 	if record.ExecutionRole != meta.JobExecutionRoleSnapshot || record.DesiredState != meta.DesiredStateStopped {
 		t.Fatalf("snapshot-only result role=%s desired=%s, want SNAPSHOT/STOPPED", record.ExecutionRole, record.DesiredState)
 	}
+}
+
+func TestSplitSnapshotResubmitDoesNotRestartFullSnapshot(t *testing.T) {
+	store := newMemoryJobStore()
+	reg, modes := newSplitWorkerTestRegistry()
+	cfg := newTestJobConfig("snapshot-resubmit")
+	if err := store.SaveJob(context.Background(), meta.PersistedJob{
+		ID:              cfg.ID,
+		Name:            cfg.Name,
+		Config:          cfg,
+		DesiredState:    meta.DesiredStateRunning,
+		ExecutionRole:   meta.JobExecutionRoleSnapshot,
+		ResumeRequested: true,
+		LastStatus:      string(JobStatusQueued),
+	}); err != nil {
+		t.Fatalf("SaveJob returned error: %v", err)
+	}
+
+	snapshot := NewJobManager(reg,
+		WithJobStore(store),
+		WithWorkerRole(WorkerRoleSnapshot),
+		WithWorkerID("snapshot-resubmit"),
+	)
+	if err := snapshot.RestorePersistedJobs(context.Background()); err != nil {
+		t.Fatalf("RestorePersistedJobs returned error: %v", err)
+	}
+	if err := snapshot.reconcileWorkerJobs(context.Background(), store); err != nil {
+		t.Fatalf("reconcileWorkerJobs returned error: %v", err)
+	}
+	select {
+	case mode := <-modes:
+		if mode != config.JobModeSnapshotHandoffResume {
+			t.Fatalf("resubmitted snapshot mode=%s, want %s", mode, config.JobModeSnapshotHandoffResume)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for resubmitted snapshot job")
+	}
+}
+
+func TestFreshSnapshotFallbackHandsStreamingModeBackToCDC(t *testing.T) {
+	store := newMemoryJobStore()
+	reg, modes := newSplitWorkerTestRegistry()
+	cfg := newTestJobConfig("purged-checkpoint-fallback")
+	cfg.Mode = config.JobModeLatest
+	if err := store.SaveJob(context.Background(), meta.PersistedJob{
+		ID:              cfg.ID,
+		Name:            cfg.Name,
+		Config:          cfg,
+		DesiredState:    meta.DesiredStateStopped,
+		ExecutionRole:   meta.JobExecutionRoleStreaming,
+		ResumeRequested: true,
+		LastStatus:      string(JobStatusFailed),
+	}); err != nil {
+		t.Fatalf("SaveJob returned error: %v", err)
+	}
+	if updated, err := store.RequestJobFreshSnapshot(context.Background(), cfg.ID); err != nil || !updated {
+		t.Fatalf("RequestJobFreshSnapshot updated=%t err=%v", updated, err)
+	}
+	record, _ := store.Get(cfg.ID)
+	if record.ExecutionRole != meta.JobExecutionRoleSnapshot || record.ResumeRequested || record.LastStatus != string(JobStatusQueued) {
+		t.Fatalf("fresh snapshot record role=%s resume=%t status=%s", record.ExecutionRole, record.ResumeRequested, record.LastStatus)
+	}
+
+	snapshot := NewJobManager(reg,
+		WithJobStore(store),
+		WithWorkerRole(WorkerRoleSnapshot),
+		WithWorkerID("snapshot-purged-fallback"),
+	)
+	if err := snapshot.RestorePersistedJobs(context.Background()); err != nil {
+		t.Fatalf("RestorePersistedJobs returned error: %v", err)
+	}
+	if err := snapshot.reconcileWorkerJobs(context.Background(), store); err != nil {
+		t.Fatalf("reconcileWorkerJobs returned error: %v", err)
+	}
+	select {
+	case mode := <-modes:
+		if mode != config.JobModeSnapshotHandoff {
+			t.Fatalf("fallback mode=%s, want %s", mode, config.JobModeSnapshotHandoff)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for fresh snapshot fallback")
+	}
+	waitForCondition(t, "fresh snapshot CDC handoff", func() bool {
+		record, ok := store.Get(cfg.ID)
+		return ok && record.ExecutionRole == meta.JobExecutionRoleStreaming &&
+			record.DesiredState == meta.DesiredStateRunning && record.LastStatus == string(JobStatusStopped)
+	})
 }
 
 func TestSplitSnapshotOnlyResumeStopsBeforeCDC(t *testing.T) {

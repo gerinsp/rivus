@@ -72,7 +72,7 @@
         </button>
         <button
           id="tabMaintenanceMonitors"
-          onclick="switchTab('maintenance')"
+          onclick="openMaintenanceMonitors()"
           class="tab-button"
         >
           <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
@@ -500,7 +500,6 @@
           <div>
             <div class="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">Iceberg Operations</div>
             <h2 class="mt-1 text-lg font-semibold text-slate-900">Maintenance Monitors</h2>
-            <p class="mt-1 text-sm text-slate-500">Long-running table inventory and automatic maintenance without snapshot or CDC ingestion.</p>
           </div>
           <div class="flex flex-wrap items-center gap-2">
             <div class="rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-xs font-medium text-emerald-800">
@@ -536,7 +535,7 @@
           <div id="maintenanceMonitorEmpty" class="hidden px-6 py-8">
             <div class="rounded-xl border border-dashed border-slate-300 bg-slate-50 p-5">
               <div class="text-sm font-semibold text-slate-800">No maintenance monitors.</div>
-              <div class="mt-1 text-sm text-slate-600">Create one to maintain existing Iceberg tables without starting ingestion.</div>
+              <div class="mt-1 text-sm text-slate-600">Create a monitor to get started.</div>
             </div>
           </div>
         </div>

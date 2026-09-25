@@ -342,9 +342,22 @@ func processClaimedMaintenanceTask(
 		if err := store.FinishTask(finalizeCtx, task.ID, workerID, meta.MaintenanceTaskSucceeded, "", nil); err != nil {
 			return "failed", err
 		}
+		if outcome.FollowUpCompaction {
+			if err := store.ScheduleCompactionCheck(
+				finalizeCtx,
+				state.TableKey,
+				time.Now().UTC(),
+				outcome.FollowUpCompactionPriority,
+			); err != nil {
+				log.Printf("[maintenance-worker %s] schedule follow-up compaction table=%s error=%v", workerID, state.TableKey, err)
+			}
+		}
 		return "succeeded", nil
 	case "skipped":
-		_ = store.RecordStateSuccess(finalizeCtx, state.TableKey, task.Operation, time.Now().UTC(), false)
+		// Skipped compactions do not establish a new growth baseline.
+		if task.Operation != maintenanceOperationCompact {
+			_ = store.RecordStateSuccess(finalizeCtx, state.TableKey, task.Operation, time.Now().UTC(), false)
+		}
 		if err := store.FinishTask(finalizeCtx, task.ID, workerID, meta.MaintenanceTaskSkipped, "", nil); err != nil {
 			return "failed", err
 		}

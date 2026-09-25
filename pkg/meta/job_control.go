@@ -27,6 +27,7 @@ type JobControlStore interface {
 	RequestJobStop(ctx context.Context, jobID string) (bool, error)
 	RequestJobPause(ctx context.Context, jobID string) (bool, error)
 	RequestJobResume(ctx context.Context, jobID string, role JobExecutionRole) (bool, error)
+	RequestJobFreshSnapshot(ctx context.Context, jobID string) (bool, error)
 }
 
 func (s *MySQLJobStore) LoadJobControl(ctx context.Context, jobID string) (*JobControlState, error) {
@@ -150,9 +151,27 @@ func (s *MySQLJobStore) RequestJobResume(ctx context.Context, jobID string, role
 	}
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE job_registry
-		SET desired_state=?, execution_role=?, last_status='QUEUED', lease_owner=NULL, lease_until=NULL, updated_at=NOW()
+		SET desired_state=?, execution_role=?, resume_requested=TRUE, last_status='QUEUED', lease_owner=NULL, lease_until=NULL, updated_at=NOW()
 		WHERE job_id=? AND last_status IN ('PAUSED','FAILED','STOPPED')`,
 		string(DesiredStateRunning), string(role), jobID)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	return rows > 0, err
+}
+
+// RequestJobFreshSnapshot routes a terminal job through a new snapshot.
+func (s *MySQLJobStore) RequestJobFreshSnapshot(ctx context.Context, jobID string) (bool, error) {
+	jobID = strings.TrimSpace(jobID)
+	if jobID == "" {
+		return false, fmt.Errorf("job id is empty")
+	}
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE job_registry
+		SET desired_state=?, execution_role=?, resume_requested=FALSE, last_status='QUEUED', lease_owner=NULL, lease_until=NULL, updated_at=NOW()
+		WHERE job_id=? AND last_status IN ('PAUSED','FAILED','STOPPED')`,
+		string(DesiredStateRunning), string(JobExecutionRoleSnapshot), jobID)
 	if err != nil {
 		return false, err
 	}

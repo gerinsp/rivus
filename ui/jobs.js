@@ -103,7 +103,7 @@ function renderJobProgress(job) {
 function rowTemplate(job) {
   const id = job.id ?? '-';
   const display = jobDisplay(job.name ?? '-');
-  const detail = 'Open details for pipeline, checkpoint, and lifecycle actions.';
+  const displayDetail = String(display.detail || '').trim();
 
   return `
     <tr class="align-top transition hover:bg-white/70">
@@ -111,7 +111,7 @@ function rowTemplate(job) {
       <td data-label="Job" class="px-6 py-4">
         <div class="max-w-[34rem] md:min-w-[22rem]">
           <div class="font-semibold leading-6 text-slate-900 break-words">${escapeHtml(display.title)}</div>
-          <div class="mt-1 text-xs leading-5 text-slate-500 break-words">${escapeHtml(display.detail || detail)}</div>
+          ${displayDetail ? `<div class="mt-1 text-xs leading-5 text-slate-500 break-words">${escapeHtml(displayDetail)}</div>` : ''}
           ${renderJobProgress(job)}
         </div>
       </td>
@@ -326,7 +326,7 @@ async function bulkResumeArchive(scope) {
   const ids = jobs.filter((job) => RESUMABLE.has(job?.status)).map((job) => job?.id).filter(Boolean);
   const label = scope === 'iceberg' ? 'Iceberg' : 'Doris';
   if (ids.length === 0) return;
-  if (!confirm(`Resume ${ids.length} archived ${label} job(s) from their latest saved checkpoints?`)) return;
+  if (!confirm(`Resume ${ids.length} archived ${label} job(s)?`)) return;
 
   bulkResumeInFlight = true;
   updateArchiveBulkButtons('doris', latestDorisArchiveJobs);
@@ -380,7 +380,7 @@ async function bulkDeleteArchive(scope) {
 }
 
 async function resubmitJob(id) {
-  if (!confirm('Resubmit job ' + id + ' in resume mode from the latest saved checkpoint?')) return;
+  if (!confirm('Resubmit job ' + id + '?')) return;
   const res = await apiFetch('/api/jobs/' + encodeURIComponent(id) + '/resubmit', { method: 'POST' });
   if (!res.ok) {
     alert(await operationErrorMessage(res, 'Resubmit'));

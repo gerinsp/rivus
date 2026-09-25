@@ -12,6 +12,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/gerinsp/rivus/pkg/config"
+	connectoriceberg "github.com/gerinsp/rivus/pkg/connectors/iceberg"
 	"github.com/gerinsp/rivus/pkg/core"
 	"github.com/gerinsp/rivus/pkg/meta"
 )
@@ -146,15 +147,19 @@ func (s *Server) durableIcebergMaintenanceConfigView(ctx context.Context, jobCfg
 	inventoryErrors := 0
 	inventoryScanning := false
 	inventoryPending := false
+	inventoryStale := false
 	var latest time.Time
 
 	for _, state := range states {
-		tableState := durableMaintenanceStateForView(state, tm, now)
+		tableState := connectoriceberg.DurableMaintenanceTableStateAt(state, tm, now)
 		if tableState == "scanning" {
 			inventoryScanning = true
 		}
 		if tableState == "inventory_pending" {
 			inventoryPending = true
+		}
+		if tableState == "stale" {
+			inventoryStale = true
 		}
 		if tableState == "ready" || tableState == "running" {
 			tablesReady++
@@ -200,23 +205,8 @@ func (s *Server) durableIcebergMaintenanceConfigView(ctx context.Context, jobCfg
 		return fmt.Sprint(tables[i]["identifier"]) < fmt.Sprint(tables[j]["identifier"])
 	})
 
-	state := "healthy"
-	switch {
-	case summary.ActiveLeases > 0:
-		state = "running"
-	case inventoryScanning:
-		state = "scanning"
-	case inventoryErrors > 0:
-		state = "error"
-	case inventoryPending:
-		state = "inventory_pending"
-	case summary.Blocked > 0 && summary.Blocked == summary.Tables:
-		state = "waiting_for_snapshot"
-	case summary.Tables > 0 && tablesScanned == 0:
-		state = "inventory_pending"
-	case summary.QueuedTasks > 0 || summary.RetryTasks > 0 || tablesReady > 0:
-		state = "ready"
-	}
+	state := durableMaintenanceOverallState(summary, tablesScanned, tablesReady, inventoryErrors,
+		inventoryScanning, inventoryPending, inventoryStale)
 	if paused {
 		state = "paused"
 	}
@@ -259,51 +249,35 @@ func (s *Server) durableIcebergMaintenanceConfigView(ctx context.Context, jobCfg
 	}, nil
 }
 
-func durableMaintenanceStateForView(state meta.IcebergMaintenanceState, cfg config.IcebergTableMaintenanceConfig, now time.Time) string {
-	if !state.SnapshotComplete {
-		return "waiting_for_snapshot"
-	}
-	if state.InventoryLeaseUntil != nil && state.InventoryLeaseUntil.After(now) {
-		return "scanning"
-	}
-	if state.LeaseUntil != nil && state.LeaseUntil.After(now) {
+func durableMaintenanceOverallState(
+	summary meta.IcebergMaintenanceOwnerSummary,
+	tablesScanned int,
+	tablesReady int,
+	inventoryErrors int,
+	inventoryScanning bool,
+	inventoryPending bool,
+	inventoryStale bool,
+) string {
+	switch {
+	case summary.ActiveLeases > 0:
 		return "running"
-	}
-	if strings.TrimSpace(state.LastError) != "" {
+	case inventoryScanning:
+		return "scanning"
+	case inventoryErrors > 0:
 		return "error"
-	}
-	if state.NextInventoryCheckAt != nil || state.LastInventoryAt == nil {
+	case inventoryPending:
 		return "inventory_pending"
-	}
-
-	dataThreshold := cfg.DataFilesThreshold
-	if dataThreshold <= 0 {
-		dataThreshold = 200
-	}
-	deleteThreshold := cfg.EqualityDeleteFilesThreshold
-	if deleteThreshold <= 0 {
-		deleteThreshold = 50
-	}
-	positionDeleteThreshold := cfg.PositionDeleteFilesThreshold
-	if positionDeleteThreshold <= 0 {
-		positionDeleteThreshold = 25
-	}
-	smallMinCount := cfg.SmallFilesMinCount
-	if smallMinCount <= 0 {
-		smallMinCount = 10
-	}
-	smallMinBytes := cfg.SmallFilesMinTotalBytes
-	if smallMinBytes <= 0 {
-		smallMinBytes = 256 * 1024 * 1024
-	}
-
-	if state.ActiveSmallFiles >= dataThreshold ||
-		state.ActiveEqualityDeleteFiles >= deleteThreshold ||
-		state.ActivePositionDeleteFiles >= positionDeleteThreshold ||
-		(state.ActiveSmallFiles >= smallMinCount && state.ActiveSmallBytes >= smallMinBytes) {
+	case inventoryStale:
+		return "stale"
+	case summary.Blocked > 0 && summary.Blocked == summary.Tables:
+		return "waiting_for_snapshot"
+	case summary.Tables > 0 && tablesScanned == 0:
+		return "inventory_pending"
+	case summary.QueuedTasks > 0 || summary.RetryTasks > 0 || tablesReady > 0:
 		return "ready"
+	default:
+		return "healthy"
 	}
-	return "healthy"
 }
 
 func (s *Server) maintenanceStoreForView(ctx context.Context) (*meta.IcebergMaintenanceStore, error) {

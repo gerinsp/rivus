@@ -756,9 +756,14 @@ func enqueueDueMaintenance(ctx context.Context, store *meta.IcebergMaintenanceSt
 				continue
 			}
 			window := due.UTC().Format(time.RFC3339Nano)
-			_, err := store.EnqueueTask(ctx, state, operation.name, operation.priority, window, now, map[string]any{
+			priority := operation.priority
+			if operation.name == maintenanceOperationCompact {
+				priority = compactionTaskPriority(state, job.Settings, now)
+			}
+			_, err := store.EnqueueTask(ctx, state, operation.name, priority, window, now, map[string]any{
 				"scheduled_at": due.UTC().Format(time.RFC3339Nano),
 				"executor":     job.Settings.Executor,
+				"priority":     priority,
 			})
 			if err != nil {
 				return fmt.Errorf("enqueue %s for %s: %w", operation.name, state.TableKey, err)

@@ -22,6 +22,9 @@ const (
 	MaintenanceTaskFailed    = "failed"
 	MaintenanceTaskRetry     = "retry"
 	MaintenanceTaskCancelled = "cancelled"
+
+	// MaintenanceInventoryMaxAge bounds cached inventory freshness.
+	MaintenanceInventoryMaxAge = time.Hour
 )
 
 type IcebergMaintenanceState struct {
@@ -707,10 +710,7 @@ func (s *IcebergMaintenanceStore) FinishInventoryClaim(ctx context.Context, tabl
 	return nil
 }
 
-// RequestInventoryRefresh schedules a metadata-only inventory scan for a
-// single job. It never reads Parquet data and it never scans every configured
-// table. A normal request only scans tables that have never been inventoried or
-// whose successful Iceberg commit is newer than their saved inventory.
+// RequestInventoryRefresh schedules stale or changed tables for inventory.
 func (s *IcebergMaintenanceStore) RequestInventoryRefresh(ctx context.Context, ownerJobID string, now time.Time, force bool) (int64, error) {
 	ownerJobID = strings.TrimSpace(ownerJobID)
 	if ownerJobID == "" {
@@ -720,7 +720,8 @@ func (s *IcebergMaintenanceStore) RequestInventoryRefresh(ctx context.Context, o
 	where := "owner_job_id=? AND snapshot_complete=1 AND (inventory_lease_until IS NULL OR inventory_lease_until < ?)"
 	args := []any{now, ownerJobID, now}
 	if !force {
-		where += " AND (last_inventory_at IS NULL OR (last_write_at IS NOT NULL AND last_write_at > last_inventory_at))"
+		where += " AND (last_inventory_at IS NULL OR last_inventory_at < ? OR (last_write_at IS NOT NULL AND last_write_at > last_inventory_at))"
+		args = append(args, now.Add(-MaintenanceInventoryMaxAge))
 	}
 	query := `UPDATE iceberg_maintenance_state
 		SET next_inventory_check_at=?, inventory_priority=100, updated_at=UTC_TIMESTAMP(6)
@@ -869,11 +870,22 @@ func (s *IcebergMaintenanceStore) UpdateInventory(ctx context.Context, tableKey 
 	return err
 }
 
-// ScheduleCompactionCheck makes a compaction check due after a fresh manifest
-// inventory has observed an actual small-file or equality-delete threshold.
-// It does not queue work for a table whose initial snapshot is still running.
-func (s *IcebergMaintenanceStore) ScheduleCompactionCheck(ctx context.Context, tableKey string, due time.Time) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE iceberg_maintenance_state AS state
+// ScheduleCompactionCheck schedules work or promotes an existing queued task.
+func (s *IcebergMaintenanceStore) ScheduleCompactionCheck(ctx context.Context, tableKey string, due time.Time, priority int) error {
+	if priority <= 0 {
+		priority = 10
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE iceberg_maintenance_tasks
+	SET priority=LEAST(priority, ?), updated_at=UTC_TIMESTAMP(6)
+	WHERE table_key=? AND operation='compact' AND status IN ('queued','retry')`, priority, tableKey); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE iceberg_maintenance_state AS state
 	SET next_compaction_check_at = CASE
 	      WHEN snapshot_complete = 1 THEN CASE
 	        WHEN next_compaction_check_at IS NULL OR next_compaction_check_at > ? THEN ?
@@ -885,8 +897,10 @@ func (s *IcebergMaintenanceStore) ScheduleCompactionCheck(ctx context.Context, t
 	    SELECT 1 FROM iceberg_maintenance_tasks AS active
 	    WHERE active.table_key=state.table_key AND active.operation='compact'
 	      AND active.status IN ('queued','retry','leased')
-	  )`, due.UTC(), due.UTC(), tableKey)
-	return err
+	  )`, due.UTC(), due.UTC(), tableKey); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *IcebergMaintenanceStore) MarkInventoryMissing(ctx context.Context, tableKey string) error {

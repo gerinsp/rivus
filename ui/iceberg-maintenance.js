@@ -31,6 +31,7 @@ function maintenanceStateLabel(state) {
     ready: 'Ready for maintenance',
     running: 'Maintenance running',
     inventory_pending: 'Waiting for inventory scan',
+    stale: 'Inventory stale',
     healthy: 'Healthy',
     paused: 'Paused',
     error: 'Inventory error',
@@ -45,6 +46,7 @@ function maintenanceStateClass(state) {
       return 'border-blue-200 bg-blue-50 text-blue-700';
     case 'inventory_pending':
     case 'scanning':
+    case 'stale':
       return 'border-amber-200 bg-amber-50 text-amber-700';
     case 'ready':
       return 'border-amber-200 bg-amber-50 text-amber-700';
@@ -81,7 +83,7 @@ function maintenanceMetric(label, value, detail) {
     <div class="stat-card min-w-0">
       <div class="stat-label">${escapeHtml(label)}</div>
       <div class="mono mt-2 text-xl font-semibold text-slate-900">${escapeHtml(value)}</div>
-      <div class="mt-1 text-xs leading-5 text-slate-500">${escapeHtml(detail || '')}</div>
+      ${detail ? `<div class="mt-1 text-xs leading-5 text-slate-500">${escapeHtml(detail)}</div>` : ''}
     </div>
   `;
 }
@@ -91,9 +93,9 @@ function workerConfigStrip(job, enabled, paused = false) {
   const executorLabel = executor === '-' ? '-' : executor.charAt(0).toUpperCase() + executor.slice(1);
   return `
     <div class="grid gap-3 border-b border-slate-200 bg-slate-50 px-5 py-4 sm:grid-cols-3 sm:px-6">
-      ${maintenanceMetric('Automatic maintenance', paused ? 'Paused' : enabled ? 'Enabled' : 'Disabled', paused ? 'Scheduling is temporarily stopped' : enabled ? 'Durable worker scheduling is active' : 'No automatic tasks are scheduled')}
-      ${maintenanceMetric('Scheduler', 'Maintenance Worker', 'CDC only emits lightweight maintenance signals')}
-      ${maintenanceMetric('Executor', executorLabel, 'Compaction policy; cleanup operations stay native')}
+      ${maintenanceMetric('Automatic maintenance', paused ? 'Paused' : enabled ? 'Enabled' : 'Disabled')}
+      ${maintenanceMetric('Scheduler', 'Maintenance Worker')}
+      ${maintenanceMetric('Executor', executorLabel)}
     </div>
   `;
 }
@@ -128,7 +130,7 @@ export function renderIcebergMaintenance(job, options = {}) {
       <div class="px-5 py-5 sm:px-6">
         <div class="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Iceberg Maintenance</div>
         <div class="mt-3 rounded-[16px] border border-slate-200 bg-slate-50 px-4 py-4 text-sm text-slate-600">
-          Durable maintenance-worker state will appear after the Iceberg sink starts.
+          Waiting for maintenance data.
         </div>
       </div>
       ${workerConfigStrip(job, configuredEnabled)}
@@ -141,7 +143,6 @@ export function renderIcebergMaintenance(job, options = {}) {
       <div class="flex flex-col gap-3 px-5 py-5 sm:flex-row sm:items-center sm:justify-between sm:px-6">
         <div>
           <div class="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Iceberg Maintenance</div>
-          <div class="mt-2 text-sm text-slate-600">Automatic maintenance is disabled for this job. The maintenance worker will not schedule tasks.</div>
         </div>
         <span class="rounded-full border px-3 py-1.5 text-xs font-semibold ${maintenanceStateClass('disabled')}">Disabled</span>
       </div>
@@ -153,7 +154,7 @@ export function renderIcebergMaintenance(job, options = {}) {
   const state = String(maintenance.state || 'watching');
   const paused = state.toLowerCase() === 'paused' || maintenance.paused === true;
   const tables = Array.isArray(maintenance.tables) ? [...maintenance.tables] : [];
-  const stateOrder = { running: 0, ready: 1, error: 2, accumulating: 3, scanning: 4, waiting_for_snapshot: 5, healthy: 6 };
+  const stateOrder = { running: 0, ready: 1, error: 2, stale: 3, accumulating: 4, scanning: 5, inventory_pending: 6, waiting_for_snapshot: 7, healthy: 8 };
   tables.sort((left, right) => {
     const stateDelta = (stateOrder[left?.state] ?? 9) - (stateOrder[right?.state] ?? 9);
     if (stateDelta !== 0) return stateDelta;
@@ -162,10 +163,26 @@ export function renderIcebergMaintenance(job, options = {}) {
     return String(left?.identifier || '').localeCompare(String(right?.identifier || ''));
   });
 
+  const configuredPageSize = Number(options.pageSize);
+  const pageSize = Number.isFinite(configuredPageSize) && configuredPageSize > 0
+    ? Math.floor(configuredPageSize)
+    : 100;
+  const pageOwner = String(options.pageKey || options.historyOwnerID || job?.id || 'maintenance');
+  if (panel.dataset.maintenancePageOwner !== pageOwner) {
+    panel.dataset.maintenancePageOwner = pageOwner;
+    panel.dataset.maintenancePage = '1';
+  }
+  const pageCount = Math.max(1, Math.ceil(tables.length / pageSize));
+  const requestedPage = Number.parseInt(panel.dataset.maintenancePage || '1', 10);
+  const currentPage = Math.min(pageCount, Math.max(1, Number.isFinite(requestedPage) ? requestedPage : 1));
+  panel.dataset.maintenancePage = String(currentPage);
+  const pageStart = (currentPage - 1) * pageSize;
+  const pageTables = tables.slice(pageStart, pageStart + pageSize);
+
   const dataThreshold = Number(maintenance.data_files_threshold || 0);
   const deleteThreshold = Number(maintenance.equality_delete_files_threshold || 0);
   const positionDeleteThreshold = Number(maintenance.position_delete_files_threshold || 25);
-  const tableRows = tables.map((table) => {
+  const tableRows = pageTables.map((table) => {
     const reason = maintenanceReason(table);
     const reasonCell = table?.error
       ? `<div class="max-w-md break-words text-[11px] leading-4 text-rose-600">${escapeHtml(table.error)}</div>`
@@ -174,7 +191,9 @@ export function renderIcebergMaintenance(job, options = {}) {
         : '<span class="text-[11px] text-slate-400">-</span>';
     const statusDetail = table?.error
       ? '<div class="mt-1 text-[11px] text-rose-600">Needs retry</div>'
-      : '';
+      : String(table?.state || '').toLowerCase() === 'stale'
+        ? '<div class="mt-1 text-[11px] text-amber-700">Refresh required</div>'
+        : '';
     return `
       <tr class="border-b border-slate-100 align-top last:border-0">
         <td class="px-4 py-3">
@@ -206,19 +225,30 @@ export function renderIcebergMaintenance(job, options = {}) {
 
   const checkedAt = maintenance.checked_at ? formatDateTime(maintenance.checked_at) : 'Waiting for first scan';
   const scanned = `${fmtWholeNumber(maintenance.tables_scanned || 0)} / ${fmtWholeNumber(maintenance.tables_total || 0)} tables scanned`;
+  const visibleStart = tables.length === 0 ? 0 : pageStart + 1;
+  const visibleEnd = Math.min(pageStart + pageSize, tables.length);
+  const pagination = tables.length > pageSize
+    ? `<div class="flex items-center gap-2">
+        <button type="button" data-maintenance-page="${currentPage - 1}" class="brand-outline-btn rounded-md px-3 py-1.5 text-xs font-semibold disabled:cursor-not-allowed disabled:opacity-50" ${currentPage === 1 ? 'disabled' : ''}>Previous</button>
+        <span class="mono text-xs text-slate-500">${fmtWholeNumber(currentPage)} / ${fmtWholeNumber(pageCount)}</span>
+        <button type="button" data-maintenance-page="${currentPage + 1}" class="brand-outline-btn rounded-md px-3 py-1.5 text-xs font-semibold disabled:cursor-not-allowed disabled:opacity-50" ${currentPage === pageCount ? 'disabled' : ''}>Next</button>
+      </div>`
+    : '';
   const refreshLabel = String(options.refreshLabel || 'Refresh inventory');
   const refreshDisabled = options.refreshDisabled === true;
   const errors = Number(maintenance.inventory_errors || 0);
   const inventoryNotice = state === 'paused'
-    ? 'This maintenance monitor is paused. Existing inventory remains visible, but automatic scans and maintenance runs will not be scheduled.'
+    ? 'Maintenance is paused.'
     : state === 'waiting_for_snapshot'
-    ? 'Initial snapshot is still running. The maintenance worker waits for the snapshot barrier; file counts refresh after the snapshot completes.'
+    ? 'Waiting for the initial snapshot.'
     : errors > 0
-      ? `${fmtWholeNumber(errors)} table inventory scan(s) failed. Other table counts remain available below.`
-      : 'Counts come from active files in the current Iceberg snapshot, not every object stored in S3.';
+      ? `${fmtWholeNumber(errors)} table scan(s) failed.`
+      : state.toLowerCase() === 'stale'
+        ? 'Inventory is over one hour old. Refresh to update file counts.'
+        : '';
   const inventoryTone = errors > 0
     ? 'border-rose-200 bg-rose-50 text-rose-700'
-    : state === 'waiting_for_snapshot' || state === 'paused'
+    : state === 'waiting_for_snapshot' || state === 'paused' || state.toLowerCase() === 'stale'
       ? 'border-amber-200 bg-amber-50 text-amber-800'
       : 'border-slate-200 bg-slate-50 text-slate-600';
 
@@ -227,7 +257,6 @@ export function renderIcebergMaintenance(job, options = {}) {
       <div class="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
         <div>
           <div class="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Iceberg Maintenance</div>
-          <div class="mt-2 text-sm text-slate-600">Durable maintenance-worker state, active Iceberg inventory, and automatic maintenance progress.</div>
         </div>
         <div class="flex flex-wrap items-center gap-2">
           <span class="rounded-full border px-3 py-1.5 text-xs font-semibold ${maintenanceStateClass(state)}">${escapeHtml(maintenanceStateLabel(state))}</span>
@@ -242,16 +271,20 @@ export function renderIcebergMaintenance(job, options = {}) {
     ${workerConfigStrip(job, configuredEnabled, paused)}
 
     <div class="grid gap-3 bg-slate-50 px-5 py-4 sm:grid-cols-2 xl:grid-cols-5 sm:px-6">
-      ${maintenanceMetric('Active data files', fmtWholeNumber(maintenance.active_data_files || 0), 'Currently referenced')}
-      ${maintenanceMetric('Equality-delete files', fmtWholeNumber(maintenance.active_equality_delete_files || 0), 'Currently referenced')}
+      ${maintenanceMetric('Active data files', fmtWholeNumber(maintenance.active_data_files || 0))}
+      ${maintenanceMetric('Equality-delete files', fmtWholeNumber(maintenance.active_equality_delete_files || 0))}
       ${maintenanceMetric('Eligible small files', fmtWholeNumber(maintenance.eligible_small_files || 0), `Below ${fmtBytes(Number(maintenance.small_file_size_bytes || 0))}`)}
       ${maintenanceMetric('Eligible small bytes', fmtBytes(Number(maintenance.eligible_small_bytes || 0)), `Minimum ${fmtBytes(Number(maintenance.small_files_min_total_bytes || 0))}`)}
       ${maintenanceMetric('Tables ready', fmtWholeNumber(maintenance.tables_ready || 0), `${fmtWholeNumber(maintenance.active_runs || 0)} maintenance run(s) active`)}
     </div>
 
-    <div class="mx-5 mt-4 rounded-[16px] border px-4 py-3 text-sm ${inventoryTone} sm:mx-6">${escapeHtml(inventoryNotice)}</div>
+    ${inventoryNotice ? `<div class="mx-5 mt-4 rounded-[16px] border px-4 py-3 text-sm ${inventoryTone} sm:mx-6">${escapeHtml(inventoryNotice)}</div>` : ''}
 
     <div class="px-5 pb-5 pt-4 sm:px-6 sm:pb-6">
+      <div class="mb-3 flex flex-wrap items-center justify-between gap-2">
+        <div class="text-xs text-slate-500">Rows ${fmtWholeNumber(visibleStart)}–${fmtWholeNumber(visibleEnd)} of ${fmtWholeNumber(tables.length)}</div>
+        ${pagination}
+      </div>
       <div class="overflow-hidden rounded-[16px] border border-slate-200">
         <div class="max-h-[560px] overflow-auto">
           <table class="min-w-full text-sm">
@@ -273,12 +306,13 @@ export function renderIcebergMaintenance(job, options = {}) {
           </table>
         </div>
       </div>
+      ${pagination ? `<div class="mt-3 flex justify-end">${pagination}</div>` : ''}
     </div>
   `);
 
   const refreshButton = panel.querySelector('[data-maintenance-inventory-refresh]');
   if (refreshButton && typeof options.onRefreshInventory === 'function') {
-    refreshButton.addEventListener('click', async () => {
+    refreshButton.onclick = async () => {
       refreshButton.disabled = true;
       refreshButton.textContent = 'Queueing scan...';
       try {
@@ -287,6 +321,13 @@ export function renderIcebergMaintenance(job, options = {}) {
         refreshButton.disabled = false;
         refreshButton.textContent = refreshLabel;
       }
-    });
+    };
   }
+
+  panel.querySelectorAll('[data-maintenance-page]').forEach((button) => {
+    button.onclick = () => {
+      panel.dataset.maintenancePage = button.dataset.maintenancePage;
+      renderIcebergMaintenance(job, options);
+    };
+  });
 }

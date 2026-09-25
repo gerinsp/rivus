@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gerinsp/rivus/pkg/config"
 	"github.com/gerinsp/rivus/pkg/meta"
 )
 
@@ -100,8 +101,8 @@ func (m *JobManager) RequestPause(id string) error {
 	return m.pauseDurableJob(job)
 }
 
-// RequestResubmit makes a remote job claimable again while preserving the
-// durable execution role chosen by snapshot handoff.
+// RequestResubmit resumes a remote job or starts a fresh snapshot when its
+// saved binlog has been purged.
 func (m *JobManager) RequestResubmit(id string) (*Job, error) {
 	m.mu.RLock()
 	job := m.jobs[id]
@@ -136,6 +137,20 @@ func setObservedQueuedProgress(job *Job, role meta.JobExecutionRole) {
 		Phase:   "queued",
 		Summary: "Waiting for " + strings.ToLower(string(role)) + " worker",
 		Detail:  "The job will resume from its durable checkpoint",
+	}
+	job.Updated = time.Now()
+	job.mu.Unlock()
+}
+
+func setObservedFreshSnapshotProgress(job *Job) {
+	if job == nil {
+		return
+	}
+	job.mu.Lock()
+	job.progress = &JobProgress{
+		Phase:   "queued",
+		Summary: "Waiting for snapshot worker",
+		Detail:  "Checkpoint unavailable; restarting the snapshot",
 	}
 	job.Updated = time.Now()
 	job.mu.Unlock()
@@ -204,12 +219,13 @@ func (m *JobManager) resubmitDurableJob(job *Job) (*Job, error) {
 	defer release()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
 	store, err := m.durableControlStore(ctx)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 	state, err := store.LoadJobControl(ctx, job.Config.ID)
+	cancel()
 	if err != nil {
 		return nil, err
 	}
@@ -224,7 +240,19 @@ func (m *JobManager) resubmitDurableJob(job *Job) (*Job, error) {
 	if role != meta.JobExecutionRoleSnapshot && role != meta.JobExecutionRoleStreaming {
 		role = executionRoleForConfig(job.Config)
 	}
-	updated, err := store.RequestJobResume(ctx, job.Config.ID, role)
+	freshSnapshot := jobCheckpointBinlogPurged(job)
+	if freshSnapshot {
+		role = meta.JobExecutionRoleSnapshot
+	}
+
+	updateCtx, updateCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer updateCancel()
+	var updated bool
+	if freshSnapshot {
+		updated, err = store.RequestJobFreshSnapshot(updateCtx, job.Config.ID)
+	} else {
+		updated, err = store.RequestJobResume(updateCtx, job.Config.ID, role)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -237,8 +265,30 @@ func (m *JobManager) resubmitDurableJob(job *Job) (*Job, error) {
 	m.executionRoles[job.Config.ID] = role
 	m.mu.Unlock()
 	setObservedJobStatus(job, JobStatusQueued)
-	setObservedQueuedProgress(job, role)
+	if freshSnapshot {
+		setObservedFreshSnapshotProgress(job)
+	} else {
+		setObservedQueuedProgress(job, role)
+	}
 	return job, nil
+}
+
+func jobCheckpointBinlogPurged(job *Job) bool {
+	if job == nil || job.Config == nil || normalizeMode(job.Config.Mode) == config.JobModeSnapshotOnly {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	status, err := job.durableCheckpointBinlogStatus(ctx)
+	if err != nil {
+		jobID := ""
+		if job.Config != nil {
+			jobID = job.Config.ID
+		}
+		log.Printf("[job-manager] checkpoint binlog inspection skipped job=%s: %v", jobID, err)
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(status), "purged")
 }
 
 // RunControlObserver applies durable lifecycle requests to jobs currently

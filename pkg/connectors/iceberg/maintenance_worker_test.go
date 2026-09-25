@@ -249,6 +249,26 @@ func TestDurableMaintenanceTableStateShowsInventoryScanning(t *testing.T) {
 	}
 }
 
+func TestDurableMaintenanceTableStateDoesNotReportOldInventoryAsHealthy(t *testing.T) {
+	now := time.Date(2026, 9, 24, 12, 0, 0, 0, time.UTC)
+	staleAt := now.Add(-meta.MaintenanceInventoryMaxAge - time.Second)
+	freshAt := now.Add(-meta.MaintenanceInventoryMaxAge + time.Second)
+	cfg := config.IcebergTableMaintenanceConfig{}
+
+	if got := DurableMaintenanceTableStateAt(meta.IcebergMaintenanceState{
+		SnapshotComplete: true,
+		LastInventoryAt:  &staleAt,
+	}, cfg, now); got != "stale" {
+		t.Fatalf("old inventory state = %q, want stale", got)
+	}
+	if got := DurableMaintenanceTableStateAt(meta.IcebergMaintenanceState{
+		SnapshotComplete: true,
+		LastInventoryAt:  &freshAt,
+	}, cfg, now); got != "healthy" {
+		t.Fatalf("fresh inventory state = %q, want healthy", got)
+	}
+}
+
 func TestMaintenanceStartsCompleteOnlyForStreamingResumeModes(t *testing.T) {
 	if maintenanceStartsComplete("initial") || maintenanceStartsComplete("snapshot_only") {
 		t.Fatal("initial snapshot modes must keep maintenance blocked")

@@ -233,6 +233,11 @@ after Spark finishes. Timeouts, resource failures, and other errors do not
 pause writers. Direct/manual Spark compaction remains coordinated by default.
 Snapshot expiration and orphan cleanup remain online and do not pause writers.
 
+Compaction priority follows file pressure and projected CDC growth. Rivus can
+promote queued work, start before a threshold is crossed, and schedule another
+pass when the refreshed inventory is still above threshold. Table leases keep
+operations on the same table sequential.
+
 Initial snapshots remain protected by a snapshot-complete barrier. Native compaction verifies its starting snapshot before staging work. Iceberg commit conflicts are retryable maintenance failures, so CDC wins concurrent writes.
 
 ## Snapshot expiration

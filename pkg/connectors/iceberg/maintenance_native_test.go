@@ -1,9 +1,38 @@
 package iceberg
 
 import (
+	"context"
 	"crypto/sha256"
 	"testing"
 )
+
+func TestCompactionReleasesSetupFilesystemContextBeforeExecution(t *testing.T) {
+	setupCtx, setupCancel := context.WithCancel(context.Background())
+	contextWasCancelled := false
+
+	executeAfterMaintenanceSetup(setupCancel, func() nativeTaskOutcome {
+		contextWasCancelled = setupCtx.Err() == context.Canceled
+		return nativeTaskOutcome{}
+	})
+
+	if !contextWasCancelled {
+		t.Fatal("compaction should release its setup context before loading a fresh table")
+	}
+}
+
+func TestCleanupReleasesSetupContextBeforeExecution(t *testing.T) {
+	setupCtx, setupCancel := context.WithCancel(context.Background())
+	contextWasCancelled := false
+
+	executeAfterMaintenanceSetup(setupCancel, func() nativeTaskOutcome {
+		contextWasCancelled = setupCtx.Err() == context.Canceled
+		return nativeTaskOutcome{}
+	})
+
+	if !contextWasCancelled {
+		t.Fatal("cleanup should not retain its completed setup context")
+	}
+}
 
 func TestOrphanBucketWriterFlushesRecordsAndClosesOnce(t *testing.T) {
 	tempDir := t.TempDir()
