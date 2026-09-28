@@ -56,10 +56,18 @@ func NewMySQLOffsetStore(dsn string) (*MySQLOffsetStore, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(5)
-	db.SetMaxIdleConns(5)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxIdleTime(time.Minute)
 	db.SetConnMaxLifetime(30 * time.Minute)
 
 	return &MySQLOffsetStore{db: db}, nil
+}
+
+func (s *MySQLOffsetStore) Close() error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	return s.db.Close()
 }
 
 func (s *MySQLOffsetStore) Init(ctx context.Context) error {

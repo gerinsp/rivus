@@ -84,7 +84,8 @@ func NewSource(jobID string, cfg SourceConfig, retry config.RetryPolicy, progres
 		return nil, err
 	}
 	db.SetMaxOpenConns(5)
-	db.SetMaxIdleConns(5)
+	db.SetMaxIdleConns(2)
+	db.SetConnMaxIdleTime(time.Minute)
 	db.SetConnMaxLifetime(20 * time.Minute)
 
 	if err := db.Ping(); err != nil {
@@ -110,6 +111,13 @@ func NewSource(jobID string, cfg SourceConfig, retry config.RetryPolicy, progres
 		db:       db,
 		progress: progress,
 	}, nil
+}
+
+func (s *Source) Close() error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	return s.db.Close()
 }
 
 func normalizeDorisSourceConfig(cfg SourceConfig) SourceConfig {

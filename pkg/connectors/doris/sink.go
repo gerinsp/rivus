@@ -132,7 +132,12 @@ func NewSink(jobID, stateKey string, cfg config.DorisConfig, retry config.RetryP
 	if err != nil {
 		return nil, err
 	}
+	db.SetMaxOpenConns(5)
+	db.SetMaxIdleConns(2)
+	db.SetConnMaxIdleTime(time.Minute)
+	db.SetConnMaxLifetime(20 * time.Minute)
 	if err := db.Ping(); err != nil {
+		_ = db.Close()
 		return nil, fmt.Errorf("doris mysql(9030) ping failed: %w", err)
 	}
 
@@ -150,6 +155,13 @@ func NewSink(jobID, stateKey string, cfg config.DorisConfig, retry config.RetryP
 		maxLen:         make(map[string]map[string]int),
 		isString:       make(map[string]map[string]bool),
 	}, nil
+}
+
+func (s *Sink) Close() error {
+	if s == nil || s.sqlDB == nil {
+		return nil
+	}
+	return s.sqlDB.Close()
 }
 
 func (s *Sink) checkpointKey() string {

@@ -176,7 +176,8 @@ func NewIcebergMaintenanceStore(dsn string) (*IcebergMaintenanceStore, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(10)
-	db.SetMaxIdleConns(5)
+	db.SetMaxIdleConns(2)
+	db.SetConnMaxIdleTime(time.Minute)
 	db.SetConnMaxLifetime(30 * time.Minute)
 	return &IcebergMaintenanceStore{db: db}, nil
 }

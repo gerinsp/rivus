@@ -142,10 +142,18 @@ func NewMySQLJobStore(dsn string) (*MySQLJobStore, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(5)
-	db.SetMaxIdleConns(5)
+	db.SetMaxIdleConns(2)
+	db.SetConnMaxIdleTime(time.Minute)
 	db.SetConnMaxLifetime(30 * time.Minute)
 
 	return &MySQLJobStore{db: db}, nil
+}
+
+func (s *MySQLJobStore) Close() error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	return s.db.Close()
 }
 
 func (s *MySQLJobStore) Init(ctx context.Context) error {
