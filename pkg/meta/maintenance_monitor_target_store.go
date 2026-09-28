@@ -83,6 +83,21 @@ func (s *IcebergMaintenanceStore) ApplyMonitorDiscovery(
 	now time.Time,
 ) (IcebergMaintenanceMonitorDelta, error) {
 	var delta IcebergMaintenanceMonitorDelta
+	err := retryMaintenanceTransaction(ctx, func() error {
+		var err error
+		delta, err = s.applyMonitorDiscovery(ctx, monitor, targets, now)
+		return err
+	})
+	return delta, err
+}
+
+func (s *IcebergMaintenanceStore) applyMonitorDiscovery(
+	ctx context.Context,
+	monitor IcebergMaintenanceMonitor,
+	targets []IcebergMaintenanceMonitorTarget,
+	now time.Time,
+) (IcebergMaintenanceMonitorDelta, error) {
+	var delta IcebergMaintenanceMonitorDelta
 	monitor.ID = strings.TrimSpace(monitor.ID)
 	if monitor.ID == "" {
 		return delta, fmt.Errorf("maintenance monitor id is required")
