@@ -109,6 +109,17 @@ func (s *IcebergMaintenanceStore) SyncMaintenanceReservations(
 	selectors []IcebergMaintenanceReservationSelector,
 	now time.Time,
 ) error {
+	return retryMaintenanceTransaction(ctx, func() error {
+		return s.syncMaintenanceReservations(ctx, ownerJobID, submissionID, kind, selectors, now)
+	})
+}
+
+func (s *IcebergMaintenanceStore) syncMaintenanceReservations(
+	ctx context.Context,
+	ownerJobID, submissionID, kind string,
+	selectors []IcebergMaintenanceReservationSelector,
+	now time.Time,
+) error {
 	ownerJobID = strings.TrimSpace(ownerJobID)
 	submissionID = strings.TrimSpace(submissionID)
 	kind = strings.ToLower(strings.TrimSpace(kind))
@@ -232,6 +243,16 @@ func (s *IcebergMaintenanceStore) ReleaseMaintenanceReservations(
 	ownerJobID, submissionID string,
 	now time.Time,
 ) error {
+	return retryMaintenanceTransaction(ctx, func() error {
+		return s.releaseMaintenanceReservations(ctx, ownerJobID, submissionID, now)
+	})
+}
+
+func (s *IcebergMaintenanceStore) releaseMaintenanceReservations(
+	ctx context.Context,
+	ownerJobID, submissionID string,
+	now time.Time,
+) error {
 	ownerJobID = strings.TrimSpace(ownerJobID)
 	submissionID = strings.TrimSpace(submissionID)
 	if ownerJobID == "" || submissionID == "" {
@@ -308,6 +329,12 @@ func (s *IcebergMaintenanceStore) ReleaseMaintenanceReservations(
 }
 
 func (s *IcebergMaintenanceStore) ReleaseMaintenanceReservationsExcept(ctx context.Context, _ map[string]string, now time.Time) error {
+	return retryMaintenanceTransaction(ctx, func() error {
+		return s.releaseMaintenanceReservationsExcept(ctx, now)
+	})
+}
+
+func (s *IcebergMaintenanceStore) releaseMaintenanceReservationsExcept(ctx context.Context, now time.Time) error {
 	ownerRows, err := s.db.QueryContext(ctx, `SELECT DISTINCT owner_job_id FROM iceberg_maintenance_reservations WHERE active=1`)
 	if err != nil {
 		return err

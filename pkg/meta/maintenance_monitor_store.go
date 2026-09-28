@@ -161,6 +161,12 @@ func (s *IcebergMaintenanceStore) GetMonitor(ctx context.Context, id string) (*I
 }
 
 func (s *IcebergMaintenanceStore) SetMonitorStatus(ctx context.Context, id string, status MaintenanceMonitorStatus, now time.Time) error {
+	return retryMaintenanceTransaction(ctx, func() error {
+		return s.setMonitorStatus(ctx, id, status, now)
+	})
+}
+
+func (s *IcebergMaintenanceStore) setMonitorStatus(ctx context.Context, id string, status MaintenanceMonitorStatus, now time.Time) error {
 	if status != MaintenanceMonitorActive && status != MaintenanceMonitorPaused {
 		return fmt.Errorf("invalid maintenance monitor status %q", status)
 	}
@@ -219,6 +225,12 @@ func (s *IcebergMaintenanceStore) SetMonitorStatus(ctx context.Context, id strin
 }
 
 func (s *IcebergMaintenanceStore) DeleteMonitor(ctx context.Context, id string, now time.Time) error {
+	return retryMaintenanceTransaction(ctx, func() error {
+		return s.deleteMonitor(ctx, id, now)
+	})
+}
+
+func (s *IcebergMaintenanceStore) deleteMonitor(ctx context.Context, id string, now time.Time) error {
 	id = strings.TrimSpace(id)
 	ownerID := MaintenanceMonitorOwnerID(id)
 	catalogs, err := s.monitorCatalogs(ctx, id)
