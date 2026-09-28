@@ -69,6 +69,7 @@ func RunMaintenanceWorkerBounded(ctx context.Context, dsn string, opts Maintenan
 	if err != nil {
 		return err
 	}
+	defer jobStore.Close()
 	if err := jobStore.Init(ctx); err != nil {
 		return fmt.Errorf("initialize job store: %w", err)
 	}

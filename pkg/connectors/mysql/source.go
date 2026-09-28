@@ -66,7 +66,8 @@ func NewSource(jobID, stateKey string, cfg config.MySQLConfig, retry config.Retr
 	}
 
 	db.SetMaxOpenConns(10)
-	db.SetMaxIdleConns(10)
+	db.SetMaxIdleConns(2)
+	db.SetConnMaxIdleTime(time.Minute)
 	db.SetConnMaxLifetime(20 * time.Minute)
 
 	if err := db.Ping(); err != nil {
@@ -115,6 +116,13 @@ func NewSource(jobID, stateKey string, cfg config.MySQLConfig, retry config.Retr
 		progress:      progress,
 		allowedTables: allowed,
 	}, nil
+}
+
+func (s *Source) Close() error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	return s.db.Close()
 }
 
 func (s *Source) UseSnapshotBatchEvents(enabled bool) {

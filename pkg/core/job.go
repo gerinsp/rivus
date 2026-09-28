@@ -343,13 +343,9 @@ func (j *Job) checkpointReader() (meta.OffsetStore, string, error) {
 	j.mu.RLock()
 	store := j.metaStore
 	key := strings.TrimSpace(j.metaKey)
-	cfg := j.Config
 	j.mu.RUnlock()
 
 	if store != nil && key != "" {
-		return store, key, nil
-	}
-	if cfg == nil || strings.TrimSpace(cfg.Meta.MySQLDSN) == "" {
 		return store, key, nil
 	}
 
@@ -358,28 +354,69 @@ func (j *Job) checkpointReader() (meta.OffsetStore, string, error) {
 	}
 
 	if store == nil {
-		metaStore, err := meta.NewMySQLOffsetStore(cfg.Meta.MySQLDSN)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		var err error
+		store, err = j.ensureMetaStore(ctx)
 		if err != nil {
 			return nil, key, err
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		if err := metaStore.Init(ctx); err != nil {
-			return nil, key, err
-		}
-		store = metaStore
 	}
 
 	j.mu.Lock()
-	if j.metaStore == nil {
-		j.metaStore = store
-	}
 	if strings.TrimSpace(j.metaKey) == "" {
 		j.metaKey = key
 	}
 	j.mu.Unlock()
 
 	return store, key, nil
+}
+
+func (j *Job) ensureMetaStore(ctx context.Context) (meta.OffsetStore, error) {
+	j.mu.RLock()
+	store := j.metaStore
+	cfg := j.Config
+	j.mu.RUnlock()
+	if store != nil || cfg == nil || strings.TrimSpace(cfg.Meta.MySQLDSN) == "" {
+		return store, nil
+	}
+
+	created, err := meta.NewMySQLOffsetStore(cfg.Meta.MySQLDSN)
+	if err != nil {
+		return nil, err
+	}
+	if err := created.Init(ctx); err != nil {
+		_ = created.Close()
+		return nil, err
+	}
+
+	j.mu.Lock()
+	if j.metaStore == nil {
+		j.metaStore = created
+		store = created
+		created = nil
+	} else {
+		store = j.metaStore
+	}
+	j.mu.Unlock()
+	if created != nil {
+		_ = created.Close()
+	}
+	return store, nil
+}
+
+func closeOffsetStore(store meta.OffsetStore) {
+	if closer, ok := store.(interface{ Close() error }); ok {
+		_ = closer.Close()
+	}
+}
+
+func (j *Job) closeMetaStore() {
+	j.mu.Lock()
+	store := j.metaStore
+	j.metaStore = nil
+	j.mu.Unlock()
+	closeOffsetStore(store)
 }
 
 func (j *Job) checkpointBinlogDiagnostics(ctx context.Context, off *meta.Offset) *CheckpointBinlogDiagnostics {
@@ -1011,6 +1048,12 @@ func (j *Job) addError(component string, err error) {
 	log.Printf("[job %s] %s error: %v", jobID, component, err)
 }
 
+func closeConnector(value any) {
+	if closer, ok := value.(interface{ Close() error }); ok {
+		_ = closer.Close()
+	}
+}
+
 func (j *Job) setCancel(cancel context.CancelFunc) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -1127,6 +1170,7 @@ func (j *Job) failStart(component string, err error, cancel context.CancelFunc) 
 	if cancel != nil {
 		cancel()
 	}
+	j.closeMetaStore()
 	return err
 }
 
@@ -1216,8 +1260,23 @@ func (j *Job) CleanupMeta() {
 	store := j.metaStore
 	key := j.metaKey
 	j.mu.RUnlock()
+	if store == nil && key != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_, _ = j.ensureMetaStore(ctx)
+		cancel()
+	}
 
-	if store == nil || key == "" {
+	j.mu.Lock()
+	store = j.metaStore
+	j.metaStore = nil
+	key = j.metaKey
+	j.mu.Unlock()
+
+	if store == nil {
+		return
+	}
+	defer closeOffsetStore(store)
+	if key == "" {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -1397,9 +1456,7 @@ func (j *Job) startWithMode(mode config.JobMode) (err error) {
 
 	if j.registry == nil {
 		err := fmt.Errorf("job registry is nil (JobManager must pass registry to NewJob)")
-		j.addError("system", err)
-		j.setStatus(JobStatusFailed)
-		return err
+		return j.failStart("system", err, nil)
 	}
 
 	j.mu.Lock()
@@ -1424,14 +1481,9 @@ func (j *Job) startWithMode(mode config.JobMode) (err error) {
 
 	// init meta store
 	if j.Config.Meta.MySQLDSN != "" {
-		store, err := meta.NewMySQLOffsetStore(j.Config.Meta.MySQLDSN)
-		if err != nil {
+		if _, err := j.ensureMetaStore(ctx); err != nil {
 			return j.failStart("system", err, cancel)
 		}
-		if err := store.Init(ctx); err != nil {
-			return j.failStart("system", err, cancel)
-		}
-		j.metaStore = store
 	}
 
 	// pick connectors
@@ -1446,6 +1498,7 @@ func (j *Job) startWithMode(mode config.JobMode) (err error) {
 	// store metakey
 	j.mu.Lock()
 	j.metaKey = metaKey
+	runtimeMetaStore := j.metaStore
 	j.mu.Unlock()
 
 	jctx := connector.JobContext{
@@ -1461,7 +1514,7 @@ func (j *Job) startWithMode(mode config.JobMode) (err error) {
 		SourceConfig: srcCfg,
 		JobConfig:    j.Config,
 		Retry:        j.Config.Retry,
-		MetaStore:    j.metaStore,
+		MetaStore:    runtimeMetaStore,
 		Metadata:     j.Config.Metadata,
 		ReportProgress: func(info connector.ProgressInfo) {
 			j.updateProgress(info)
@@ -1476,12 +1529,15 @@ func (j *Job) startWithMode(mode config.JobMode) (err error) {
 
 	sink, err := j.registry.NewSink(sinkType, jctx, sinkCfg)
 	if err != nil {
+		closeConnector(src)
 		return j.failStart("sink", err, cancel)
 	}
 	if provider, ok := sink.(connector.MaintenanceOwnershipProvider); ok {
 		lifecycle := provider.MaintenanceOwnershipLifecycle()
 		if lifecycle != nil {
 			if err := lifecycle.Reserve(ctx); err != nil {
+				closeConnector(src)
+				closeConnector(sink)
 				return j.failStart("maintenance ownership", err, cancel)
 			}
 			j.mu.Lock()
@@ -1517,6 +1573,7 @@ func (j *Job) startWithMode(mode config.JobMode) (err error) {
 	j.setRunDone(runDone)
 	go func() {
 		runWG.Wait()
+		j.closeMetaStore()
 		close(runDone)
 	}()
 
@@ -1524,6 +1581,7 @@ func (j *Job) startWithMode(mode config.JobMode) (err error) {
 	go func() {
 		defer runWG.Done()
 		defer close(events)
+		defer closeConnector(src)
 		defer j.recoverPipelinePanic("source", cancel)
 
 		// Preflight ensure table (generic)
@@ -1562,6 +1620,7 @@ func (j *Job) startWithMode(mode config.JobMode) (err error) {
 	// sink goroutine
 	go func() {
 		defer runWG.Done()
+		defer closeConnector(sink)
 		defer j.recoverPipelinePanic("sink", cancel)
 		if err := sink.Run(ctx, events); err != nil {
 			// kalau stop/cancel, jangan FAILED

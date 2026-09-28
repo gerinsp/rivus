@@ -99,6 +99,7 @@ func RunMaintenanceWorker(ctx context.Context, dsn string, opts MaintenanceWorke
 	if err != nil {
 		return err
 	}
+	defer jobStore.Close()
 	if err := jobStore.Init(ctx); err != nil {
 		return fmt.Errorf("initialize job store: %w", err)
 	}

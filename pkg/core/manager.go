@@ -855,6 +855,7 @@ func (m *JobManager) Shutdown(ctx context.Context) error {
 	m.lifecycleMu.Unlock()
 
 	if len(jobs) == 0 {
+		m.closeAllJobMetaStores()
 		return nil
 	}
 
@@ -908,7 +909,25 @@ func (m *JobManager) Shutdown(ctx context.Context) error {
 	}
 
 	log.Printf("[job-manager] graceful shutdown drain complete jobs=%d", len(jobs))
+	m.closeAllJobMetaStores()
 	return errors.Join(persistErrs...)
+}
+
+func (m *JobManager) closeAllJobMetaStores() {
+	m.mu.RLock()
+	jobs := make([]*Job, 0, len(m.jobs))
+	for _, job := range m.jobs {
+		if job != nil {
+			jobs = append(jobs, job)
+		}
+	}
+	m.mu.RUnlock()
+	for _, job := range jobs {
+		job.closeMetaStore()
+	}
+	if closer, ok := m.jobStore.(interface{ Close() error }); ok {
+		_ = closer.Close()
+	}
 }
 
 func (m *JobManager) desiredStateForJobStatus(jobID string, status JobStatus) meta.DesiredState {
@@ -1686,6 +1705,7 @@ func (m *JobManager) startClaimedWorkerJob(record meta.PersistedJob) error {
 				return fmt.Errorf("stale job submission %s is still stopping: %w", cfg.ID, ErrJobStillStopping)
 			}
 		}
+		staleJob.closeMetaStore()
 		m.mu.Lock()
 		if m.jobs[cfg.ID] == staleJob {
 			delete(m.jobs, cfg.ID)
