@@ -1684,8 +1684,8 @@ func TestPreflightInitialCountResumePerformsSafeFullReload(t *testing.T) {
 	}
 }
 
-func TestPreflightFreshDorisInitialSnapshotResetsTargets(t *testing.T) {
-	cfg := newTestJobConfig("job-doris-authoritative-initial")
+func TestPreflightFreshAuthoritativeInitialSnapshotResetsTargets(t *testing.T) {
+	cfg := newTestJobConfig("job-authoritative-initial")
 	cfg.Mode = config.JobModeInitial
 	cfg.Sink = &config.ConnectorSpec{Type: "doris", Config: map[string]any{}}
 	job := NewJob(cfg, connector.NewRegistry())

@@ -3,6 +3,7 @@ package iceberg
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow/array"
 	iceberglib "github.com/apache/iceberg-go"
+	icecatalog "github.com/apache/iceberg-go/catalog"
 	icerest "github.com/apache/iceberg-go/catalog/rest"
 	"github.com/apache/iceberg-go/table"
 	"github.com/gerinsp/rivus/pkg/config"
@@ -21,6 +23,121 @@ type emptyUnauthorizedRESTError struct{}
 
 func (emptyUnauthorizedRESTError) Error() string { return ": " }
 func (emptyUnauthorizedRESTError) Unwrap() error { return icerest.ErrUnauthorized }
+
+type namespaceCatalogStub struct {
+	icecatalog.Catalog
+	checkExists bool
+	checkErr    error
+	loadErr     error
+	namespaces  []table.Identifier
+	listErr     error
+	created     []table.Identifier
+	checkCalls  int
+	loadCalls   int
+	listCalls   int
+	createCalls int
+}
+
+func (s *namespaceCatalogStub) CheckNamespaceExists(context.Context, table.Identifier) (bool, error) {
+	s.checkCalls++
+	return s.checkExists, s.checkErr
+}
+
+func (s *namespaceCatalogStub) LoadNamespaceProperties(context.Context, table.Identifier) (iceberglib.Properties, error) {
+	s.loadCalls++
+	return nil, s.loadErr
+}
+
+func (s *namespaceCatalogStub) ListNamespaces(context.Context, table.Identifier) ([]table.Identifier, error) {
+	s.listCalls++
+	return s.namespaces, s.listErr
+}
+
+func (s *namespaceCatalogStub) CreateNamespace(_ context.Context, ident table.Identifier, _ iceberglib.Properties) error {
+	s.createCalls++
+	s.created = append(s.created, append(table.Identifier(nil), ident...))
+	return nil
+}
+
+func TestEnsureNamespaceFallsBackWhenRESTHeadReturnsBadRequest(t *testing.T) {
+	catalog := &namespaceCatalogStub{
+		checkErr:   icerest.ErrBadRequest,
+		loadErr:    icerest.ErrBadRequest,
+		namespaces: []table.Identifier{{"other_namespace"}},
+	}
+	sink := &Sink{
+		cfg:     config.IcebergConfig{Warehouse: "asmat"},
+		catalog: catalog,
+	}
+
+	if err := sink.ensureNamespace(context.Background(), "jackal2_bronze"); err != nil {
+		t.Fatalf("ensureNamespace returned error: %v", err)
+	}
+	if catalog.checkCalls != 1 || catalog.loadCalls != 1 || catalog.listCalls != 1 {
+		t.Fatalf("fallback calls check=%d load=%d list=%d, want 1 each", catalog.checkCalls, catalog.loadCalls, catalog.listCalls)
+	}
+	if catalog.createCalls != 1 {
+		t.Fatalf("CreateNamespace calls = %d, want 1", catalog.createCalls)
+	}
+	if got := strings.Join(catalog.created[0], "."); got != "jackal2_bronze" {
+		t.Fatalf("created namespace = %q, want jackal2_bronze", got)
+	}
+}
+
+func TestEnsureNamespaceUsesGETFallbackForExistingNamespace(t *testing.T) {
+	catalog := &namespaceCatalogStub{checkErr: icerest.ErrBadRequest}
+	sink := &Sink{
+		cfg:     config.IcebergConfig{Warehouse: "asmat"},
+		catalog: catalog,
+	}
+
+	if err := sink.ensureNamespace(context.Background(), "jackal2_bronze"); err != nil {
+		t.Fatalf("ensureNamespace returned error: %v", err)
+	}
+	if catalog.loadCalls != 1 {
+		t.Fatalf("LoadNamespaceProperties calls = %d, want 1", catalog.loadCalls)
+	}
+	if catalog.listCalls != 0 || catalog.createCalls != 0 {
+		t.Fatalf("list calls=%d create calls=%d, want 0 after successful GET", catalog.listCalls, catalog.createCalls)
+	}
+}
+
+func TestEnsureNamespaceCreatesAfterGETReportsMissing(t *testing.T) {
+	catalog := &namespaceCatalogStub{
+		checkErr: icerest.ErrBadRequest,
+		loadErr:  icecatalog.ErrNoSuchNamespace,
+	}
+	sink := &Sink{
+		cfg:     config.IcebergConfig{Warehouse: "asmat"},
+		catalog: catalog,
+	}
+
+	if err := sink.ensureNamespace(context.Background(), "jackal2_bronze"); err != nil {
+		t.Fatalf("ensureNamespace returned error: %v", err)
+	}
+	if catalog.listCalls != 0 {
+		t.Fatalf("ListNamespaces calls = %d, want 0 after definitive GET result", catalog.listCalls)
+	}
+	if catalog.createCalls != 1 {
+		t.Fatalf("CreateNamespace calls = %d, want 1", catalog.createCalls)
+	}
+}
+
+func TestEnsureNamespaceDoesNotHideNonCompatibilityError(t *testing.T) {
+	catalog := &namespaceCatalogStub{checkErr: icerest.ErrUnauthorized}
+	sink := &Sink{
+		cfg:     config.IcebergConfig{Warehouse: "asmat"},
+		catalog: catalog,
+	}
+
+	err := sink.ensureNamespace(context.Background(), "jackal2_bronze")
+	if !errors.Is(err, icerest.ErrUnauthorized) {
+		t.Fatalf("ensureNamespace error = %v, want unauthorized", err)
+	}
+	if catalog.loadCalls != 0 || catalog.listCalls != 0 || catalog.createCalls != 0 {
+		t.Fatalf("fallback ran for unauthorized error: load=%d list=%d create=%d", catalog.loadCalls, catalog.listCalls, catalog.createCalls)
+	}
+}
 
 type fakeCDCEqualityCommitter struct {
 	calls    int
