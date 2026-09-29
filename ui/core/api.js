@@ -127,6 +127,7 @@ export function statusPill(status) {
 export function progressPill(progress) {
   const phase = String(progress?.phase || '').trim().toLowerCase();
   const labelMap = {
+    queued: 'QUEUED',
     preflight: 'PRE-FLIGHT',
     snapshot: 'SNAPSHOT',
     snapshot_complete: 'SNAPSHOT DONE',
@@ -136,6 +137,7 @@ export function progressPill(progress) {
     failed: 'FAILED',
   };
   const classMap = {
+    queued: 'border-sky-200 bg-sky-50 text-sky-800',
     preflight: 'border-amber-200 bg-amber-50 text-amber-800',
     snapshot: 'border-blue-200 bg-blue-50 text-blue-800',
     snapshot_complete: 'border-blue-200 bg-blue-50 text-blue-800',

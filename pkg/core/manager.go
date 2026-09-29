@@ -279,6 +279,11 @@ func (m *JobManager) Submit(cfg *config.JobConfig) (*Job, error) {
 
 	if shouldQueue {
 		job.setStatus(JobStatusQueued)
+		job.updateProgress(connector.ProgressInfo{
+			Phase:   "queued",
+			Summary: "Waiting in queue",
+			Detail:  "The job is waiting for an active snapshot/preflight slot to finish",
+		})
 		return job, nil
 	}
 
@@ -1862,6 +1867,11 @@ func (m *JobManager) queueOrStart(job *Job, mode config.JobMode, removeOnStartFa
 	m.mu.Unlock()
 	if shouldQueue {
 		job.setStatus(JobStatusQueued)
+		job.updateProgress(connector.ProgressInfo{
+			Phase:   "queued",
+			Summary: "Waiting in queue",
+			Detail:  "The job is waiting for an active snapshot/preflight slot to finish",
+		})
 		return true
 	}
 	return false

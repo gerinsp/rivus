@@ -78,7 +78,10 @@ function actionButtons(job) {
 }
 
 function renderJobProgress(job) {
-  const progress = job?.progress;
+  const isQueued = String(job?.status || '').toUpperCase() === 'QUEUED';
+  const progress = isQueued
+    ? { phase: 'queued', summary: job?.progress?.summary && job?.progress?.phase === 'queued' ? job.progress.summary : 'Waiting in queue' }
+    : job?.progress;
   if (!progress) {
     if (!ACTIVE.has(job?.status)) return '';
     return `

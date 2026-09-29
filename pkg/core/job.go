@@ -1357,9 +1357,11 @@ func (j *Job) preflight(ctx context.Context, src connector.Source, sink connecto
 	reloadTargets := make(map[string]*snapshotReloadTarget)
 	skipTables := make([]connector.TableRef, 0)
 	for _, t := range lister.Tables() {
-		schema, err := sp.FetchSchema(ctx, t.Schema, t.Table)
+		fetchCtx, fetchCancel := context.WithTimeout(ctx, 45*time.Second)
+		schema, err := sp.FetchSchema(fetchCtx, t.Schema, t.Table)
+		fetchCancel()
 		if err != nil {
-			return err
+			return fmt.Errorf("preflight fetch schema %s.%s failed: %w", t.Schema, t.Table, err)
 		}
 		if skipMissingPK && pkSkipper.SkipSnapshotTableWithoutPrimaryKey(t.Schema, t.Table, schema) {
 			if snapshotSkipper == nil {
@@ -1386,8 +1388,11 @@ func (j *Job) preflight(ctx context.Context, src connector.Source, sink connecto
 				targetDB, targetTbl = resolver.ResolveTarget(t.Schema, t.Table)
 			}
 
-			if err := tm.EnsureTable(ctx, targetDB, targetTbl, schema); err != nil {
-				return err
+			ensureCtx, ensureCancel := context.WithTimeout(ctx, 45*time.Second)
+			err := tm.EnsureTable(ensureCtx, targetDB, targetTbl, schema)
+			ensureCancel()
+			if err != nil {
+				return fmt.Errorf("preflight ensure table %s.%s failed: %w", targetDB, targetTbl, err)
 			}
 
 			if safeSnapshotReload {
