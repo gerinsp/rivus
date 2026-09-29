@@ -2280,7 +2280,7 @@ func runMySQLBackground(jobID, operation string, run func() error) (err error) {
 }
 
 func (s *Source) monitorCDCLag(ctx context.Context) {
-	if s.offsetSto == nil || s.progress == nil {
+	if s.progress == nil {
 		return
 	}
 
@@ -2304,18 +2304,19 @@ func (s *Source) monitorCDCLag(ctx context.Context) {
 }
 
 func (s *Source) reportCDCLag(ctx context.Context) error {
-	checkpoint, err := s.offsetSto.GetOffset(ctx, s.checkpointKey())
-	if err != nil {
-		return fmt.Errorf("get checkpoint: %w", err)
-	}
-	if checkpoint == nil && s.checkpointKey() != s.jobID {
-		checkpoint, err = s.offsetSto.GetOffset(ctx, s.jobID)
+	var checkpoint *meta.Offset
+	if s.offsetSto != nil {
+		var err error
+		checkpoint, err = s.offsetSto.GetOffset(ctx, s.checkpointKey())
 		if err != nil {
-			return fmt.Errorf("get legacy checkpoint: %w", err)
+			return fmt.Errorf("get checkpoint: %w", err)
 		}
-	}
-	if checkpoint == nil || strings.TrimSpace(checkpoint.BinlogFile) == "" || checkpoint.BinlogPos == 0 {
-		return nil
+		if checkpoint == nil && s.checkpointKey() != s.jobID {
+			checkpoint, err = s.offsetSto.GetOffset(ctx, s.jobID)
+			if err != nil {
+				return fmt.Errorf("get legacy checkpoint: %w", err)
+			}
+		}
 	}
 
 	latest, err := s.getMasterPos(ctx)
@@ -2330,22 +2331,28 @@ func (s *Source) reportCDCLag(ctx context.Context) error {
 		return fmt.Errorf("get available binlogs: %w", err)
 	}
 
+	info := connector.ProgressInfo{
+		Phase:               "cdc_health",
+		CDCLatestFile:       latest.Name,
+		CDCLatestPos:        latest.Pos,
+		CDCEarliestFile:     earliestFile,
+		CDCAvailableBinlogs: availableCount,
+		CDCBinlogStatus:     "no_checkpoint",
+	}
+	if checkpoint == nil || strings.TrimSpace(checkpoint.BinlogFile) == "" || checkpoint.BinlogPos == 0 {
+		s.reportProgress(info)
+		return nil
+	}
+
 	lagFiles, ok := binlogFileLag(checkpoint.BinlogFile, latest.Name)
 	if !ok {
 		return fmt.Errorf("cannot compare checkpoint file %q with latest file %q", checkpoint.BinlogFile, latest.Name)
 	}
-
-	s.reportProgress(connector.ProgressInfo{
-		Phase:               "cdc_health",
-		CDCCheckpointFile:   checkpoint.BinlogFile,
-		CDCCheckpointPos:    checkpoint.BinlogPos,
-		CDCLatestFile:       latest.Name,
-		CDCLatestPos:        latest.Pos,
-		CDCLagFiles:         lagFiles,
-		CDCEarliestFile:     earliestFile,
-		CDCAvailableBinlogs: availableCount,
-		CDCBinlogStatus:     binlogCheckpointStatus(checkpoint.BinlogFile, earliestFile, latestAvailableFile, availableCount),
-	})
+	info.CDCCheckpointFile = checkpoint.BinlogFile
+	info.CDCCheckpointPos = checkpoint.BinlogPos
+	info.CDCLagFiles = lagFiles
+	info.CDCBinlogStatus = binlogCheckpointStatus(checkpoint.BinlogFile, earliestFile, latestAvailableFile, availableCount)
+	s.reportProgress(info)
 	return nil
 }
 

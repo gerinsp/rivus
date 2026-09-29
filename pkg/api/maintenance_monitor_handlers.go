@@ -12,6 +12,7 @@ import (
 
 	"github.com/gerinsp/rivus/pkg/config"
 	"github.com/gerinsp/rivus/pkg/connectors/iceberg"
+	"github.com/gerinsp/rivus/pkg/core"
 	"github.com/gerinsp/rivus/pkg/meta"
 )
 
@@ -28,6 +29,8 @@ type maintenanceMonitorView struct {
 	ID              string                        `json:"id"`
 	Name            string                        `json:"name"`
 	Status          meta.MaintenanceMonitorStatus `json:"status"`
+	HealthStatus    string                        `json:"health_status,omitempty"`
+	HealthDetail    string                        `json:"health_detail,omitempty"`
 	Catalog         string                        `json:"catalog"`
 	Executor        string                        `json:"executor"`
 	ResourceProfile string                        `json:"resource_profile"`
@@ -248,8 +251,10 @@ func maintenanceMonitorResponse(monitor meta.IcebergMaintenanceMonitor) (mainten
 	if tableCount == 0 {
 		tableCount = len(tables)
 	}
+	healthStatus, healthDetail := maintenanceMonitorHealth(monitor, catalog)
 	return maintenanceMonitorView{
 		ID: monitor.ID, Name: monitor.Name, Status: monitor.Status,
+		HealthStatus: healthStatus, HealthDetail: healthDetail,
 		Catalog: catalog, Executor: executor, ResourceProfile: profile,
 		Tables: tables, TableCount: tableCount, LastInventoryAt: monitor.LastInventoryAt,
 		DiscoveredCount: monitor.DiscoveredCount, OwnedCount: monitor.OwnedCount,
@@ -258,6 +263,22 @@ func maintenanceMonitorResponse(monitor meta.IcebergMaintenanceMonitor) (mainten
 		LastDiscoveryAt: monitor.LastDiscoveryAt, DiscoveryError: monitor.LastDiscoveryError,
 		LastError: monitor.LastError, CreatedAt: monitor.CreatedAt, UpdatedAt: monitor.UpdatedAt,
 	}, nil
+}
+
+func maintenanceMonitorHealth(monitor meta.IcebergMaintenanceMonitor, catalog string) (string, string) {
+	if monitor.Status != meta.MaintenanceMonitorActive {
+		return "", ""
+	}
+	if detail := strings.TrimSpace(monitor.LastDiscoveryError); detail != "" {
+		return core.JobHealthCritical, "Catalog discovery failed: " + detail
+	}
+	if detail := strings.TrimSpace(monitor.LastError); detail != "" {
+		return core.JobHealthDegraded, "Table maintenance error: " + detail
+	}
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(catalog)), "auto:") && monitor.LastDiscoveryAt == nil {
+		return "PENDING", "Waiting for the first successful catalog discovery"
+	}
+	return core.JobHealthHealthy, ""
 }
 
 func maintenanceMonitorMutationError(w http.ResponseWriter, err error) {

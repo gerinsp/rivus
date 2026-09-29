@@ -18,13 +18,16 @@ func (s *Server) handleGetJobGraph(w http.ResponseWriter, r *http.Request) {
 
 	g := job.Graph()
 	if g == nil {
+		health := job.Health()
 		// fallback minimal
 		writeJSON(w, 200, &core.JobGraph{
-			JobID:    jobID,
-			Status:   job.StatusValue(),
-			Progress: job.Progress(),
-			Nodes:    []core.GraphNode{},
-			Edges:    []core.GraphEdge{},
+			JobID:        jobID,
+			Status:       job.StatusValue(),
+			HealthStatus: health.Status,
+			HealthDetail: health.Detail,
+			Progress:     job.Progress(),
+			Nodes:        []core.GraphNode{},
+			Edges:        []core.GraphEdge{},
 		})
 		return
 	}

@@ -20,6 +20,7 @@ const (
 
 type jobHealthNotification struct {
 	AlertType      jobHealthAlertType
+	Incident       string
 	JobID          string
 	JobName        string
 	SinkType       string

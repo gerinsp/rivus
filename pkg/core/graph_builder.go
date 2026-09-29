@@ -40,10 +40,13 @@ func (j *Job) buildGraphLocked() *JobGraph {
 	bufferID := "buffer:events"
 	sinkID := "sink:" + sinkType
 
-	return &JobGraph{
-		JobID:    j.Config.ID,
-		Status:   j.status,
-		Progress: progressCopy,
+	health := deriveJobHealth(j.status, progressCopy, j.Updated, time.Now())
+	graph := &JobGraph{
+		JobID:        j.Config.ID,
+		Status:       j.status,
+		HealthStatus: health.Status,
+		HealthDetail: health.Detail,
+		Progress:     progressCopy,
 		Nodes: []GraphNode{
 			buildSourceGraphNode(j.Config, sourceID, sourceType, j.status, progressCopy, lastErrComponent, lastErrMessage),
 			buildBufferGraphNode(j.Config, bufferID, j.status, progressCopy, lastErrComponent, lastErrMessage),
@@ -53,6 +56,27 @@ func (j *Job) buildGraphLocked() *JobGraph {
 			buildSourceBufferEdge(j.Config, sourceID, bufferID, j.status, progressCopy),
 			buildBufferSinkEdge(j.Config, bufferID, sinkID, j.status, progressCopy),
 		},
+	}
+	applyGraphHealth(graph, health)
+	return graph
+}
+
+func applyGraphHealth(graph *JobGraph, health JobHealth) {
+	if graph == nil || health.Status == "" || health.Status == JobHealthHealthy || health.Status == JobHealthDegraded {
+		return
+	}
+	for i := range graph.Nodes {
+		graph.Nodes[i].Status = JobStatus(health.Status)
+		graph.Nodes[i].State = health.Status
+		if strings.TrimSpace(health.Detail) != "" {
+			graph.Nodes[i].Detail = health.Detail
+		}
+	}
+	for i := range graph.Edges {
+		graph.Edges[i].State = health.Status
+		if strings.TrimSpace(health.Detail) != "" {
+			graph.Edges[i].Detail = health.Detail
+		}
 	}
 }
 

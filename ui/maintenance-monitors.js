@@ -64,6 +64,9 @@ function monitorRow(monitor) {
 	const owned = Number(monitor.owned_count ?? monitor.table_count ?? 0);
 	const reserved = Number(monitor.reserved_count || 0);
 	const conflicts = Number(monitor.conflict_count || 0);
+  const healthStatus = String(monitor.health_status || '').trim().toUpperCase();
+  const shownStatus = healthStatus && healthStatus !== 'HEALTHY' ? healthStatus : monitor.status;
+  const healthDetail = String(monitor.health_detail || '').trim();
   return `
     <tr class="align-top transition hover:bg-white/70">
       <td data-label="ID" class="px-6 py-4">${idChip(monitor.id)}</td>
@@ -73,7 +76,11 @@ function monitorRow(monitor) {
         ${monitor.last_error ? `<div class="mt-2 text-xs text-rose-700">${escapeHtml(monitor.last_error)}</div>` : ''}
 		${monitor.last_discovery_error ? `<div class="mt-2 text-xs text-rose-700">Discovery: ${escapeHtml(monitor.last_discovery_error)}</div>` : ''}
       </td>
-      <td data-label="Status" class="px-6 py-4">${statusPill(monitor.status)}</td>
+      <td data-label="Status" class="px-6 py-4">
+        ${statusPill(shownStatus)}
+        ${shownStatus !== monitor.status ? `<div class="mt-1 text-[11px] font-medium uppercase text-slate-500">Lifecycle: ${escapeHtml(monitor.status)}</div>` : ''}
+        ${healthDetail && shownStatus !== monitor.status ? `<div class="mt-2 max-w-[18rem] text-xs leading-5 text-slate-600">${escapeHtml(healthDetail)}</div>` : ''}
+      </td>
       <td data-label="Catalog" class="px-6 py-4">
         <div class="mono text-xs font-semibold text-slate-800">${escapeHtml(monitor.catalog || '-')}</div>
         <div class="mt-1 text-xs text-slate-500">${escapeHtml(monitor.executor || 'hybrid')} · ${escapeHtml(monitor.resource_profile || 'small')}</div>
@@ -168,7 +175,9 @@ export async function showMaintenanceMonitorDetails(id) {
 
   document.getElementById('maintenanceMonitorDetailName').textContent = monitor.name || monitor.id || 'Maintenance monitor';
   document.getElementById('maintenanceMonitorDetailID').textContent = monitor.id || '-';
-  document.getElementById('maintenanceMonitorDetailStatus').innerHTML = statusPill(monitor.status);
+  const healthStatus = String(monitor.health_status || '').trim().toUpperCase();
+  const shownStatus = healthStatus && healthStatus !== 'HEALTHY' ? healthStatus : monitor.status;
+  document.getElementById('maintenanceMonitorDetailStatus').innerHTML = `${statusPill(shownStatus)}${shownStatus !== monitor.status ? `<span class="ml-2 text-xs text-slate-500">Lifecycle: ${escapeHtml(monitor.status)}</span>` : ''}`;
   list?.classList.add('hidden');
   detail.classList.remove('hidden');
 

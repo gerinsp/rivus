@@ -108,6 +108,8 @@ function renderGraphProgress(graph) {
   const completedTables = Number(progress.completed_tables);
   const totalTables = Number(progress.total_tables);
   const currentTableRows = Number(progress.current_table_rows);
+  const healthStatus = String(graph?.health_status || '').trim().toUpperCase();
+  const shownStatus = healthStatus && healthStatus !== 'HEALTHY' ? healthStatus : (graph?.status || '-');
 
   const currentPosition = Number.isFinite(currentTableIndex) && currentTableIndex > 0 && Number.isFinite(totalTables) && totalTables > 0
     ? `${fmtWholeNumber(currentTableIndex)} / ${fmtWholeNumber(totalTables)}`
@@ -135,7 +137,8 @@ function renderGraphProgress(graph) {
     <div class="rounded-[20px] border border-slate-200 bg-white p-5">
       <div class="flex flex-wrap items-center gap-2">
         ${progressPill(progress)}
-        ${statusPill(graph?.status || '-')}
+        ${statusPill(shownStatus)}
+        ${shownStatus !== graph?.status ? `<span class="text-xs text-slate-500">Lifecycle: ${escapeHtml(graph?.status || '-')}</span>` : ''}
       </div>
       <div class="mt-4 text-lg font-semibold tracking-tight text-slate-900">${escapeHtml(summary)}</div>
       ${showDetail ? `<div class="mt-1 text-sm leading-6 text-slate-500 break-words">${escapeHtml(detail)}</div>` : ''}
@@ -195,7 +198,7 @@ function graphStatePill(state) {
   let tone = ['border-slate-200 bg-slate-100 text-slate-700', 'bg-slate-400'];
   if (upper.includes('BACKPRESSURE') || upper.includes('WAITING') || upper.includes('PAUSED')) {
     tone = ['border-amber-200 bg-amber-50 text-amber-800', 'bg-amber-500'];
-  } else if (upper.includes('BLOCKED') || upper.includes('FAILED') || upper.includes('ERROR')) {
+  } else if (upper.includes('BLOCKED') || upper.includes('FAILED') || upper.includes('ERROR') || upper.includes('CRITICAL') || upper.includes('STALE')) {
     tone = ['border-rose-200 bg-rose-50 text-rose-800', 'bg-rose-500'];
   } else if (upper.includes('COMPLETED') || upper.includes('DONE') || upper.includes('EMPTY')) {
     tone = ['border-blue-200 bg-blue-50 text-blue-800', 'bg-blue-500'];
@@ -221,7 +224,7 @@ function graphStateKind(state) {
   const upper = String(state || '').trim().toUpperCase();
   if (!upper) return 'neutral';
   if (upper.includes('BACKPRESSURE') || upper.includes('WAITING') || upper.includes('PAUSED') || upper.includes('SLOWLY')) return 'warning';
-  if (upper.includes('BLOCKED') || upper.includes('FAILED') || upper.includes('ERROR')) return 'error';
+  if (upper.includes('BLOCKED') || upper.includes('FAILED') || upper.includes('ERROR') || upper.includes('CRITICAL') || upper.includes('STALE')) return 'error';
   if (upper.includes('COMPLETED') || upper.includes('DONE') || upper.includes('EMPTY')) return 'done';
   if (upper.includes('FLOW') || upper.includes('READING') || upper.includes('WRITING') || upper.includes('APPLYING') || upper.includes('RUNNING') || upper.includes('READY')) return 'active';
   return 'neutral';
@@ -280,6 +283,16 @@ function findGraphNode(graph, type) {
 }
 
 function renderGraphAlert(graph) {
+  const healthStatus = String(graph?.health_status || '').trim().toUpperCase();
+  const healthDetail = String(graph?.health_detail || '').trim();
+  if (healthStatus === 'CRITICAL' || healthStatus === 'STALE') {
+    return `
+      <div class="mt-4 rounded-[16px] border px-4 py-3 ${graphBannerClass('error')}">
+        <div class="text-sm font-semibold">${escapeHtml(healthStatus === 'STALE' ? 'Runtime heartbeat is stale' : 'Critical job health')}</div>
+        <div class="mt-1 text-sm">${escapeHtml(healthDetail || 'The lifecycle is still marked running, but the pipeline is not healthy.')}</div>
+      </div>
+    `;
+  }
   const sourceNode = findGraphNode(graph, 'source');
   const bufferNode = findGraphNode(graph, 'buffer');
   const sinkNode = findGraphNode(graph, 'sink');
@@ -492,7 +505,7 @@ function binlogDiagnosticTone(status) {
   }
 }
 
-function renderBinlogDiagnostics(diag, hasCdcOffset = false) {
+function renderBinlogDiagnostics(diag, hasCdcOffset = false, jobHealthStatus = '') {
   if (!diag) {
     if (!hasCdcOffset) return '';
     return `
@@ -503,7 +516,8 @@ function renderBinlogDiagnostics(diag, hasCdcOffset = false) {
     `;
   }
 
-  const status = String(diag.status || 'unknown').toUpperCase();
+  const rawStatus = String(diag.status || 'unknown').toLowerCase();
+  const status = rawStatus === 'available' ? 'FILE AVAILABLE' : rawStatus.toUpperCase();
   const range = diag.earliest_file || diag.latest_file ? `${diag.earliest_file || '-'} -> ${diag.latest_file || '-'}` : '-';
   const checkpoint = checkpointPosition(diag.checkpoint_file, diag.checkpoint_pos);
   const checkpointToLatestFiles = binlogFileDistance(diag.checkpoint_file, diag.latest_file);
@@ -557,13 +571,20 @@ function renderBinlogDiagnostics(diag, hasCdcOffset = false) {
   const detail = diag.error
     ? `Diagnostic error: ${diag.error}`
     : diag.status === 'available'
-      ? 'Checkpoint binlog is still present on the MySQL server.'
+      ? 'The checkpoint file still exists on MySQL. This confirms resumability only; it does not mean CDC is current or healthy.'
       : diag.status === 'purged'
         ? 'Checkpoint binlog is older than the earliest binlog currently available on the MySQL server.'
         : 'Checkpoint binlog was not found in the currently available MySQL binlog range.';
 
+  const normalizedHealth = String(jobHealthStatus || '').trim().toUpperCase();
+  const diagnosticTone = rawStatus === 'available' && normalizedHealth === 'STALE'
+    ? 'border-rose-200 bg-rose-50 text-rose-800'
+    : rawStatus === 'available' && normalizedHealth === 'DEGRADED'
+      ? 'border-amber-200 bg-amber-50 text-amber-800'
+      : binlogDiagnosticTone(diag.status);
+
   return `
-    <div class="mt-4 rounded-[16px] border px-4 py-3 ${binlogDiagnosticTone(diag.status)}">
+    <div class="mt-4 rounded-[16px] border px-4 py-3 ${diagnosticTone}">
       <div class="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <div class="text-sm font-semibold">Binlog checkpoint ${escapeHtml(status)}</div>
@@ -624,7 +645,7 @@ function renderCheckpoint(job) {
       ${metaKey ? `<div class="mono max-w-full rounded-full border border-slate-200 bg-slate-50 px-3 py-1.5 text-[11px] text-slate-600 break-all">${escapeHtml(metaKey)}</div>` : ''}
     </div>
     <div class="mt-4 grid gap-3 lg:grid-cols-3">${cards.length > 0 ? cards.join('') : '<div class="rounded-[16px] border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-500">No checkpoint rows found.</div>'}</div>
-    ${renderBinlogDiagnostics(checkpoint.binlog_diagnostics, !!cdc)}
+    ${renderBinlogDiagnostics(checkpoint.binlog_diagnostics, !!cdc, job?.health_status)}
   `);
 }
 
@@ -691,7 +712,8 @@ export async function refreshGraph(options = {}) {
   const graph = await res.json();
   const progressSummary = String(graph?.progress?.summary || '').trim();
   const runtimeState = String((Array.isArray(graph?.nodes) ? graph.nodes.find((node) => String(node?.type || '').toLowerCase() === 'buffer')?.state : '') || '').trim();
-  statusEl.textContent = graph.status || job?.status || '-';
+  const healthStatus = String(graph?.health_status || job?.health_status || '').trim().toUpperCase();
+  statusEl.textContent = healthStatus && healthStatus !== 'HEALTHY' ? healthStatus : (graph.status || job?.status || '-');
   rawEl.textContent = JSON.stringify(graph, null, 2);
   metaEl.textContent = progressSummary || runtimeState || 'Graph ready';
   renderGraph(graph);

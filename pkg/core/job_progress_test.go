@@ -86,3 +86,52 @@ func TestCDCHealthProgressDoesNotReplaceStreamingProgress(t *testing.T) {
 		t.Fatalf("health fields were not merged: %+v", progress)
 	}
 }
+
+func TestCDCHealthProgressPromotesStaleSnapshotPhaseToStreaming(t *testing.T) {
+	job := NewJob(&config.JobConfig{ID: "job-1"}, nil)
+	job.updateProgress(connector.ProgressInfo{
+		Phase:   "snapshot",
+		Summary: "Checking saved snapshot state",
+	})
+
+	job.updateProgress(connector.ProgressInfo{
+		Phase:             "cdc_health",
+		CDCCheckpointFile: "mysql-bin.000183",
+		CDCCheckpointPos:  100,
+		CDCLatestFile:     "mysql-bin.000183",
+		CDCLatestPos:      200,
+		CDCBinlogStatus:   "available",
+	})
+
+	progress := job.Progress()
+	if progress == nil || progress.Phase != "streaming" {
+		t.Fatalf("progress = %+v, want streaming phase", progress)
+	}
+	if progress.Summary != "CDC streaming" {
+		t.Fatalf("summary = %q, want CDC streaming", progress.Summary)
+	}
+}
+
+func TestPreflightProgressClearsPreviousRuntimeDetails(t *testing.T) {
+	job := NewJob(&config.JobConfig{ID: "job-1"}, nil)
+	job.updateProgress(connector.ProgressInfo{
+		Phase:                   "streaming",
+		Summary:                 "Waiting for sink flush",
+		CDCCheckpointFile:       "mysql-bin.000183",
+		CheckpointPending:       true,
+		CheckpointPendingTables: "app.orders pending=10",
+	})
+
+	job.updateProgress(connector.ProgressInfo{
+		Phase:   "preflight",
+		Summary: "Preparing job",
+	})
+
+	progress := job.Progress()
+	if progress == nil || progress.Phase != "preflight" {
+		t.Fatalf("progress = %+v, want preflight", progress)
+	}
+	if progress.CheckpointPending || progress.CDCCheckpointFile != "" || progress.CheckpointPendingTables != "" {
+		t.Fatalf("preflight retained stale runtime details: %+v", progress)
+	}
+}

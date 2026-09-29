@@ -94,6 +94,39 @@ func TestJobManagerNotifiesOnBackpressure(t *testing.T) {
 	}
 }
 
+func TestJobManagerNotifiesOncePerBackpressureIncident(t *testing.T) {
+	notifier := &recordingJobHealthNotifier{ch: make(chan jobHealthNotification, 3)}
+	manager := NewJobManager(nil, withJobHealthNotifier(notifier))
+	job := newRunningHealthNotificationJob("pressure-incident-job", config.TelegramNotificationConfig{
+		Enabled:            true,
+		BotToken:           "bot-token",
+		ChatID:             "chat-id",
+		NotifyBackpressure: true,
+	})
+	pressure := &JobProgress{Phase: "streaming", Summary: "Waiting for sink flush"}
+
+	manager.maybeNotifyJobHealth(job, pressure)
+	manager.maybeNotifyJobHealth(job, pressure)
+	select {
+	case <-notifier.ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first backpressure notification")
+	}
+	select {
+	case payload := <-notifier.ch:
+		t.Fatalf("continuous incident sent duplicate notification: %+v", payload)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	manager.maybeNotifyJobHealth(job, &JobProgress{Phase: "streaming", Summary: "CDC streaming"})
+	manager.maybeNotifyJobHealth(job, pressure)
+	select {
+	case <-notifier.ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("backpressure notification did not re-arm after recovery")
+	}
+}
+
 func TestJobManagerNotifiesOncePerPurgedCheckpointIncident(t *testing.T) {
 	t.Setenv("RIVUS_TELEGRAM_ENABLED", "true")
 	t.Setenv("TELEGRAM_BOT_TOKEN", "bot-token")

@@ -36,9 +36,11 @@ type GraphEdge struct {
 }
 
 type JobGraph struct {
-	JobID    string       `json:"job_id"`
-	Status   JobStatus    `json:"status"`
-	Progress *JobProgress `json:"progress,omitempty"`
-	Nodes    []GraphNode  `json:"nodes"`
-	Edges    []GraphEdge  `json:"edges"`
+	JobID        string       `json:"job_id"`
+	Status       JobStatus    `json:"status"`
+	HealthStatus string       `json:"health_status,omitempty"`
+	HealthDetail string       `json:"health_detail,omitempty"`
+	Progress     *JobProgress `json:"progress,omitempty"`
+	Nodes        []GraphNode  `json:"nodes"`
+	Edges        []GraphEdge  `json:"edges"`
 }

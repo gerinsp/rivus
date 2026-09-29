@@ -929,7 +929,12 @@ func (j *Job) updateProgress(info connector.ProgressInfo) {
 	if j.progress != nil {
 		previousPhase = j.progress.Phase
 	}
-	if isCDCHealthRuntimeProgress(progress.Phase) && j.progress != nil {
+	// Preflight starts a new runtime attempt. Do not carry sink/checkpoint
+	// details from the previous attempt into the new one; doing so made a job
+	// look as if it was still streaming while it was actually blocked in setup.
+	if strings.EqualFold(strings.TrimSpace(progress.Phase), "preflight") {
+		// Keep the freshly reported preflight progress as-is.
+	} else if isCDCHealthRuntimeProgress(progress.Phase) && j.progress != nil {
 		progress = mergeCDCHealthProgress(*j.progress, *progress)
 	} else if isSinkRuntimeProgress(progress.Phase) && j.progress != nil {
 		progress = mergeSinkRuntimeProgress(*j.progress, *progress)
@@ -959,6 +964,15 @@ func isCDCHealthRuntimeProgress(phase string) bool {
 
 func mergeCDCHealthProgress(previous, incoming JobProgress) *JobProgress {
 	merged := previous
+	// The CDC health monitor only runs after the source has entered binlog
+	// streaming. Treat its heartbeat as authoritative phase evidence so a
+	// missed/throttled initial streaming update cannot leave the durable UI
+	// stuck on SNAPSHOT forever.
+	merged.Phase = "streaming"
+	if graphPhase(&previous) != "streaming" {
+		merged.Summary = "CDC streaming"
+		merged.Detail = "CDC health heartbeat received"
+	}
 	merged.CDCCheckpointFile = incoming.CDCCheckpointFile
 	merged.CDCCheckpointPos = incoming.CDCCheckpointPos
 	merged.CDCLatestFile = incoming.CDCLatestFile

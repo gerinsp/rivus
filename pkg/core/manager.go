@@ -50,16 +50,18 @@ const (
 )
 
 type JobInfo struct {
-	ID         string       `json:"id"`
-	Name       string       `json:"name"`
-	Status     JobStatus    `json:"status"`
-	Created    string       `json:"created"`
-	Updated    string       `json:"updated"`
-	MetaKey    string       `json:"meta_key"`
-	SinkType   string       `json:"sink_type"`
-	ErrorCount int          `json:"error_count"`
-	LastError  *JobError    `json:"last_error,omitempty"`
-	Progress   *JobProgress `json:"progress,omitempty"`
+	ID           string       `json:"id"`
+	Name         string       `json:"name"`
+	Status       JobStatus    `json:"status"`
+	HealthStatus string       `json:"health_status,omitempty"`
+	HealthDetail string       `json:"health_detail,omitempty"`
+	Created      string       `json:"created"`
+	Updated      string       `json:"updated"`
+	MetaKey      string       `json:"meta_key"`
+	SinkType     string       `json:"sink_type"`
+	ErrorCount   int          `json:"error_count"`
+	LastError    *JobError    `json:"last_error,omitempty"`
+	Progress     *JobProgress `json:"progress,omitempty"`
 }
 
 type JobManager struct {
@@ -468,17 +470,20 @@ func (m *JobManager) List() []JobInfo {
 			last := errors[len(errors)-1]
 			lastError = &last
 		}
+		health := j.Health()
 		out = append(out, JobInfo{
-			ID:         j.Config.ID,
-			Name:       j.Config.Name,
-			Status:     j.GetStatus(),
-			Created:    j.Created.Format("2006-01-02 15:04:05"),
-			Updated:    j.Updated.Format("2006-01-02 15:04:05"),
-			MetaKey:    j.MetaKey(),
-			SinkType:   sinkTypeFromConfig(j.Config),
-			ErrorCount: len(errors),
-			LastError:  lastError,
-			Progress:   j.Progress(),
+			ID:           j.Config.ID,
+			Name:         j.Config.Name,
+			Status:       j.GetStatus(),
+			HealthStatus: health.Status,
+			HealthDetail: health.Detail,
+			Created:      j.Created.Format("2006-01-02 15:04:05"),
+			Updated:      j.Updated.Format("2006-01-02 15:04:05"),
+			MetaKey:      j.MetaKey(),
+			SinkType:     sinkTypeFromConfig(j.Config),
+			ErrorCount:   len(errors),
+			LastError:    lastError,
+			Progress:     j.Progress(),
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -1187,21 +1192,27 @@ func (m *JobManager) maybeNotifyJobHealth(job *Job, progress *JobProgress) {
 		}
 		if m.updateJobHealthIncident(job.Config.ID, jobHealthAlertCheckpointPurged, incident) {
 			if payload, ok := buildJobHealthNotification(job, progress, jobHealthAlertCheckpointPurged); ok {
+				payload.Incident = incident
 				m.dispatchJobHealthNotification(payload)
 			}
 		}
 	}
 
-	if !purgedCheckpoint && tg.NotifyCDCLag &&
+	lagging := !purgedCheckpoint && strings.TrimSpace(progress.CDCLatestFile) != "" &&
+		progress.CDCLagFiles >= tg.CDCLagFilesThreshold
+	if tg.NotifyCDCLag && m.updateJobHealthIncident(job.Config.ID, jobHealthAlertCDCLag, activeHealthIncident(lagging)) &&
 		strings.TrimSpace(progress.CDCLatestFile) != "" &&
 		progress.CDCLagFiles >= tg.CDCLagFilesThreshold {
 		if payload, ok := buildJobHealthNotification(job, progress, jobHealthAlertCDCLag); ok {
+			payload.Incident = "active"
 			m.dispatchJobHealthNotification(payload)
 		}
 	}
 
-	if tg.NotifyBackpressure && isBackpressureProgress(progress) {
+	backpressured := isBackpressureProgress(progress)
+	if tg.NotifyBackpressure && m.updateJobHealthIncident(job.Config.ID, jobHealthAlertBackpressure, activeHealthIncident(backpressured)) {
 		if payload, ok := buildJobHealthNotification(job, progress, jobHealthAlertBackpressure); ok {
+			payload.Incident = "active"
 			m.dispatchJobHealthNotification(payload)
 		}
 	}
@@ -1227,17 +1238,20 @@ func (m *JobManager) updateJobHealthIncident(jobID string, alertType jobHealthAl
 }
 
 func (m *JobManager) clearJobHealthIncident(payload jobHealthNotification) {
-	if payload.AlertType != jobHealthAlertCheckpointPurged {
-		return
-	}
 	key := payload.JobID + ":" + string(payload.AlertType)
-	incident := strings.TrimSpace(payload.CheckpointFile) + "->" + strings.TrimSpace(payload.EarliestFile)
 	m.healthAlertMu.Lock()
-	if m.healthAlertActive[key] == incident {
+	if payload.Incident == "" || m.healthAlertActive[key] == payload.Incident {
 		delete(m.healthAlertActive, key)
 		delete(m.healthAlertLastSent, key)
 	}
 	m.healthAlertMu.Unlock()
+}
+
+func activeHealthIncident(active bool) string {
+	if active {
+		return "active"
+	}
+	return ""
 }
 
 func (m *JobManager) dispatchJobHealthNotification(payload jobHealthNotification) {
@@ -2111,7 +2125,10 @@ func snapshotProgressReleasesSlot(progress *JobProgress) bool {
 	case "snapshot_complete", "streaming", "done", "failed", "stopped":
 		return true
 	default:
-		return false
+		// CDC health is emitted only by a live streaming source. These fields
+		// protect the snapshot gate when an older persisted phase was stale.
+		return strings.TrimSpace(progress.CDCCurrentFile) != "" ||
+			strings.TrimSpace(progress.CDCCheckpointFile) != ""
 	}
 }
 

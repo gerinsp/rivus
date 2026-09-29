@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gerinsp/rivus/pkg/core"
 	"github.com/gerinsp/rivus/pkg/meta"
 )
 
@@ -117,6 +118,31 @@ sink:
             namespace: static_reference
             reason: immutable schema
 `
+}
+
+func TestMaintenanceMonitorHealthReportsDiscoveryFailure(t *testing.T) {
+	monitor := meta.IcebergMaintenanceMonitor{
+		Status:             meta.MaintenanceMonitorActive,
+		LastDiscoveryError: "initialize catalog: context deadline exceeded",
+	}
+	status, detail := maintenanceMonitorHealth(monitor, "auto:*")
+	if status != core.JobHealthCritical {
+		t.Fatalf("health status = %q, want %q", status, core.JobHealthCritical)
+	}
+	if !strings.Contains(detail, "context deadline exceeded") {
+		t.Fatalf("health detail = %q, want discovery error", detail)
+	}
+}
+
+func TestMaintenanceMonitorHealthDoesNotOverridePausedLifecycle(t *testing.T) {
+	monitor := meta.IcebergMaintenanceMonitor{
+		Status:             meta.MaintenanceMonitorPaused,
+		LastDiscoveryError: "catalog unavailable",
+	}
+	status, detail := maintenanceMonitorHealth(monitor, "auto:*")
+	if status != "" || detail != "" {
+		t.Fatalf("paused health = %q %q, want empty", status, detail)
+	}
 }
 
 func TestMaintenanceMonitorAPIAcceptsCatalogMonitoring(t *testing.T) {

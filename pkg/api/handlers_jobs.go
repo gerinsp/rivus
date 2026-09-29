@@ -226,10 +226,13 @@ func (s *Server) handleJobByID(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "job not found"})
 			return
 		}
+		health := job.Health()
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"id":                  job.Config.ID,
 			"name":                job.Config.Name,
 			"status":              job.GetStatus(),
+			"health_status":       health.Status,
+			"health_detail":       health.Detail,
 			"created":             job.Created,
 			"updated":             job.Updated,
 			"meta_key":            job.MetaKey(),

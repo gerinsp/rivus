@@ -261,7 +261,11 @@ func NewSink(jobID, stateKey, jobName string, cfg config.IcebergConfig, retry co
 		return nil, err
 	}
 
-	cat, err := newCatalog(context.Background(), cfg)
+	// Catalog setup performs network discovery. Bound it so an unreachable REST
+	// endpoint fails the job instead of occupying a snapshot slot indefinitely.
+	catalogCtx, cancelCatalog := context.WithTimeout(context.Background(), time.Minute)
+	defer cancelCatalog()
+	cat, err := newCatalog(catalogCtx, cfg)
 	if err != nil {
 		return nil, err
 	}
