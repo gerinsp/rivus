@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -3191,7 +3192,7 @@ func (s *Sink) evictIdle(now time.Time) {
 
 func (s *Sink) ensureNamespace(ctx context.Context, namespace string) error {
 	ident := namespaceOnlyIdentifier(namespace)
-	exists, err := s.catalog.CheckNamespaceExists(ctx, ident)
+	exists, err := s.namespaceExists(ctx, ident)
 	if err != nil {
 		return s.operationError(fmt.Sprintf("check namespace=%q", namespace), err)
 	}
@@ -3202,6 +3203,47 @@ func (s *Sink) ensureNamespace(ctx context.Context, namespace string) error {
 		return s.operationError(fmt.Sprintf("create namespace=%q", namespace), err)
 	}
 	return nil
+}
+
+// namespaceExists works around REST catalogs that reject the Iceberg HEAD
+// namespace endpoint with HTTP 400. Gravitino supports the equivalent GET and
+// namespace-listing endpoints, so use those only for this compatibility error.
+// Other catalog errors must remain visible rather than being mistaken for a
+// missing namespace.
+func (s *Sink) namespaceExists(ctx context.Context, ident icetable.Identifier) (bool, error) {
+	if len(ident) == 0 {
+		return false, fmt.Errorf("empty namespace identifier")
+	}
+	exists, err := s.catalog.CheckNamespaceExists(ctx, ident)
+	if err == nil {
+		return exists, nil
+	}
+	if !errors.Is(err, icerest.ErrBadRequest) {
+		return false, err
+	}
+
+	if _, loadErr := s.catalog.LoadNamespaceProperties(ctx, ident); loadErr == nil {
+		return true, nil
+	} else if errors.Is(loadErr, icecatalog.ErrNoSuchNamespace) {
+		return false, nil
+	} else if !errors.Is(loadErr, icerest.ErrBadRequest) {
+		return false, fmt.Errorf("HEAD namespace check failed: %v; GET namespace fallback failed: %w", err, loadErr)
+	}
+
+	parent := ident[:len(ident)-1]
+	namespaces, listErr := s.catalog.ListNamespaces(ctx, parent)
+	if listErr != nil {
+		if errors.Is(listErr, icecatalog.ErrNoSuchNamespace) {
+			return false, nil
+		}
+		return false, fmt.Errorf("HEAD namespace check failed: %v; namespace listing fallback failed: %w", err, listErr)
+	}
+	for _, candidate := range namespaces {
+		if slices.Equal(candidate, ident) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (s *Sink) loadOrCreateTable(ctx context.Context, namespace, tableName string, schema *model.TableSchema, pkCols []string) (*icetable.Table, bool, error) {
