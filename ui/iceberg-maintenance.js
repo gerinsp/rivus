@@ -32,7 +32,7 @@ function maintenanceStateLabel(state) {
     running: 'Maintenance running',
     inventory_pending: 'Waiting for inventory scan',
     stale: 'Inventory stale',
-    partitioned: 'No compactable group',
+    partitioned: 'Files spread across partitions',
     healthy: 'Healthy',
     paused: 'Paused',
     error: 'Inventory error',
@@ -219,7 +219,7 @@ export function renderIcebergMaintenance(job, options = {}) {
         <td class="px-4 py-3 text-right"><div class="mono text-xs font-semibold text-slate-800">${equalityLabel}</div>${retainedEquality ? `<div class="mt-1 text-[11px] text-slate-500">${fmtWholeNumber(retainedEquality)} retained</div>` : ''}</td>
         <td class="px-4 py-3 text-right"><div class="mono text-xs font-semibold text-slate-800">${positionLabel}</div>${retainedPosition ? `<div class="mt-1 text-[11px] text-slate-500">${fmtWholeNumber(retainedPosition)} retained</div>` : ''}</td>
         <td class="px-4 py-3 text-xs text-slate-600">
-          <div>Small: <span class="mono font-semibold text-slate-800">${fmtWholeNumber(table?.eligible_small_files || 0)} / ${fmtWholeNumber(dataThreshold)}</span> <span class="text-slate-400">·</span> ${fmtWholeNumber(table?.compactable_files || 0)} compactable</div>
+          <div>Small: <span class="mono font-semibold text-slate-800">${fmtWholeNumber(table?.eligible_small_files || 0)} / ${fmtWholeNumber(dataThreshold)}</span></div>
           <div class="mt-1">Equality: <span class="mono font-semibold text-slate-800">${equalityLabel} / ${fmtWholeNumber(deleteThreshold)}</span></div>
           <div class="mt-1">Position: <span class="mono font-semibold text-slate-800">${positionLabel} / ${fmtWholeNumber(positionDeleteThreshold)}</span></div>
         </td>

@@ -85,7 +85,8 @@ func (s *IcebergMaintenanceStore) ClaimPendingInventoryStateForMaintenance(
 	    SELECT 1 FROM iceberg_maintenance_monitors AS monitor
 	    WHERE monitor.monitor_id=SUBSTRING(iceberg_maintenance_state.owner_job_id, 9) AND monitor.status='ACTIVE'
 	  ))
-	ORDER BY inventory_priority DESC, next_inventory_check_at ASC, table_key
+	ORDER BY inventory_priority DESC, (last_error IS NOT NULL AND last_error<>'') DESC,
+	 next_inventory_check_at ASC, table_key
 	LIMIT 1 FOR UPDATE SKIP LOCKED`, now.UTC(), minimumPriority, now.UTC(), now.UTC())
 	state, err := scanMaintenanceState(row)
 	if errors.Is(err, sql.ErrNoRows) {

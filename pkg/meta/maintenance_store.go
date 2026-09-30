@@ -685,7 +685,8 @@ func (s *IcebergMaintenanceStore) DueStates(ctx context.Context, operation strin
 // ClaimPendingInventoryState claims one due inventory scan. The small, leased
 // claim prevents a first inventory sweep from becoming an unbounded startup
 // burst for large deployments. Explicit job-detail refresh requests receive a
-// higher priority than the slow first-scan sweep.
+// higher priority than the slow first-scan sweep. Within a priority, retry
+// failed scans before an equally large bulk refresh keeps their errors stale.
 func (s *IcebergMaintenanceStore) ClaimPendingInventoryState(ctx context.Context, workerID string, now time.Time, lease time.Duration, minimumPriority int) (*IcebergMaintenanceState, error) {
 	if lease <= 0 {
 		lease = 15 * time.Minute
@@ -715,7 +716,8 @@ func (s *IcebergMaintenanceStore) ClaimPendingInventoryState(ctx context.Context
 	    SELECT 1 FROM iceberg_maintenance_monitors AS monitor
 	    WHERE monitor.monitor_id=SUBSTRING(iceberg_maintenance_state.owner_job_id, 9) AND monitor.status='ACTIVE'
 	  ))
-	ORDER BY inventory_priority DESC, next_inventory_check_at ASC, table_key
+	ORDER BY inventory_priority DESC, (last_error IS NOT NULL AND last_error<>'') DESC,
+	 next_inventory_check_at ASC, table_key
 	LIMIT 1 FOR UPDATE SKIP LOCKED`, now.UTC(), minimumPriority, now.UTC())
 	state, err := scanMaintenanceState(row)
 	if errors.Is(err, sql.ErrNoRows) {
