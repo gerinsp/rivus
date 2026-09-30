@@ -86,15 +86,17 @@ type nativeTaskOutcome struct {
 }
 
 type activeFileInventory struct {
-	SnapshotID       int64
-	DataFiles        int
-	SmallFiles       int
-	SmallBytes       int64
-	EqualityDeletes  int
-	PositionDeletes  int
-	CompactableFiles int
-	CompactableBytes int64
-	CompactionGroups int
+	SnapshotID                int64
+	DataFiles                 int
+	SmallFiles                int
+	SmallBytes                int64
+	EqualityDeletes           int
+	PositionDeletes           int
+	ApplicableEqualityDeletes int
+	ApplicablePositionDeletes int
+	CompactableFiles          int
+	CompactableBytes          int64
+	CompactionGroups          int
 }
 
 type compactionWorkload struct {
@@ -355,10 +357,39 @@ func scanActiveFileInventory(ctx context.Context, tbl *icetable.Table, settings 
 			}
 		}
 	}
+	if inventory.EqualityDeletes > 0 || inventory.PositionDeletes > 0 {
+		// Manifest entries count every delete file retained by the snapshot.
+		// Only the scan planner knows which unique deletes apply to live data.
+		plannedTasks, planErr := tbl.Scan().PlanFiles(ctx)
+		if planErr != nil {
+			return inventory, fmt.Errorf("plan applicable delete files: %w", planErr)
+		}
+		inventoryApplicableDeletes(&inventory, plannedTasks)
+		dataTasks = plannedTasks
+	}
 	if err := addCompactableInventory(&inventory, dataTasks, settings); err != nil {
 		return inventory, err
 	}
 	return inventory, nil
+}
+
+func inventoryApplicableDeletes(inventory *activeFileInventory, tasks []icetable.FileScanTask) {
+	seenEquality := make(map[string]struct{})
+	seenPosition := make(map[string]struct{})
+	for _, task := range tasks {
+		for _, file := range task.EqualityDeleteFiles {
+			if file != nil {
+				seenEquality[file.FilePath()] = struct{}{}
+			}
+		}
+		for _, file := range task.DeleteFiles {
+			if file != nil {
+				seenPosition[file.FilePath()] = struct{}{}
+			}
+		}
+	}
+	inventory.ApplicableEqualityDeletes = len(seenEquality)
+	inventory.ApplicablePositionDeletes = len(seenPosition)
 }
 
 // addCompactableInventory records only files that the real Iceberg planner can
@@ -408,18 +439,21 @@ func accumulateActiveFile(inventory *activeFileInventory, file iceberglib.DataFi
 func saveActiveFileInventory(ctx context.Context, store *meta.IcebergMaintenanceStore, tableKey string, inventory activeFileInventory) error {
 	return store.UpdateInventory(ctx, tableKey, inventory.SnapshotID, inventory.DataFiles, inventory.SmallFiles,
 		inventory.SmallBytes, inventory.EqualityDeletes, inventory.PositionDeletes,
+		inventory.ApplicableEqualityDeletes, inventory.ApplicablePositionDeletes,
 		inventory.CompactableFiles, inventory.CompactableBytes, inventory.CompactionGroups)
 }
 
 func inventoryTriggersCompaction(inventory activeFileInventory, settings nativeMaintenanceSettings) bool {
 	return compactionTriggersFor(meta.IcebergMaintenanceState{
-		ActiveSmallFiles:          inventory.SmallFiles,
-		ActiveSmallBytes:          inventory.SmallBytes,
-		ActiveEqualityDeleteFiles: inventory.EqualityDeletes,
-		ActivePositionDeleteFiles: inventory.PositionDeletes,
-		ActiveCompactableFiles:    inventory.CompactableFiles,
-		ActiveCompactableBytes:    inventory.CompactableBytes,
-		ActiveCompactionGroups:    inventory.CompactionGroups,
+		ActiveSmallFiles:              inventory.SmallFiles,
+		ActiveSmallBytes:              inventory.SmallBytes,
+		ActiveEqualityDeleteFiles:     inventory.EqualityDeletes,
+		ActivePositionDeleteFiles:     inventory.PositionDeletes,
+		ApplicableEqualityDeleteFiles: &inventory.ApplicableEqualityDeletes,
+		ApplicablePositionDeleteFiles: &inventory.ApplicablePositionDeletes,
+		ActiveCompactableFiles:        inventory.CompactableFiles,
+		ActiveCompactableBytes:        inventory.CompactableBytes,
+		ActiveCompactionGroups:        inventory.CompactionGroups,
 	}, settings).Any()
 }
 
@@ -428,12 +462,12 @@ func compactionTriggersFor(state meta.IcebergMaintenanceState, settings nativeMa
 		SmallFileCount: settings.DataFilesThreshold > 0 && state.ActiveSmallFiles >= settings.DataFilesThreshold && state.ActiveCompactionGroups > 0,
 		SmallFileBytes: settings.MinSmallFiles > 0 && settings.MinSmallBytes > 0 &&
 			state.ActiveCompactableFiles >= settings.MinSmallFiles && state.ActiveCompactableBytes >= settings.MinSmallBytes,
-		EqualityDelete: settings.EqualityDeleteThreshold > 0 && state.ActiveEqualityDeleteFiles >= settings.EqualityDeleteThreshold,
+		EqualityDelete: settings.EqualityDeleteThreshold > 0 && state.EffectiveEqualityDeleteFiles() >= settings.EqualityDeleteThreshold,
 		// Trino snapshot replacement intentionally leaves a small number of
 		// position-delete files while it replaces the recent history window.
 		// Make the table eligible only after the per-table threshold is reached;
 		// engine routing is decided separately from the selected workload size.
-		PositionDelete: settings.PositionDeleteThreshold > 0 && state.ActivePositionDeleteFiles >= settings.PositionDeleteThreshold,
+		PositionDelete: settings.PositionDeleteThreshold > 0 && state.EffectivePositionDeleteFiles() >= settings.PositionDeleteThreshold,
 	}
 }
 
@@ -529,6 +563,8 @@ func executeHybridCompaction(
 		"position_delete_files":            work.PositionDeletes,
 		"active_equality_delete_files":     state.ActiveEqualityDeleteFiles,
 		"active_position_delete_files":     state.ActivePositionDeleteFiles,
+		"applicable_equality_delete_files": state.EffectiveEqualityDeleteFiles(),
+		"applicable_position_delete_files": state.EffectivePositionDeleteFiles(),
 		"trigger_small_file_count":         triggers.SmallFileCount,
 		"trigger_small_file_bytes":         triggers.SmallFileBytes,
 		"trigger_equality_delete_files":    triggers.EqualityDelete,
@@ -740,7 +776,7 @@ func buildCompactionWorkload(plan compaction.Plan) compactionWorkload {
 }
 
 func shouldRouteCompactionToSpark(work compactionWorkload, state meta.IcebergMaintenanceState, settings nativeMaintenanceSettings) (bool, string) {
-	equalityDeletes := maxInt(work.EqualityDeletes, state.ActiveEqualityDeleteFiles)
+	equalityDeletes := maxInt(work.EqualityDeletes, state.EffectiveEqualityDeleteFiles())
 	switch {
 	case equalityDeletes > settings.MaxEqualityDeleteFiles:
 		return true, fmt.Sprintf("equality-delete files %d exceed native limit %d", equalityDeletes, settings.MaxEqualityDeleteFiles)
@@ -755,7 +791,7 @@ func shouldRouteCompactionToSpark(work compactionWorkload, state meta.IcebergMai
 
 func hasDeleteWork(work compactionWorkload, state meta.IcebergMaintenanceState) bool {
 	return work.EqualityDeletes > 0 || work.PositionDeletes > 0 ||
-		state.ActiveEqualityDeleteFiles > 0 || state.ActivePositionDeleteFiles > 0
+		state.EffectiveEqualityDeleteFiles() > 0 || state.EffectivePositionDeleteFiles() > 0
 }
 
 func executeSparkCompactionFallback(

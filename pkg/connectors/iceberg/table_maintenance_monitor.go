@@ -244,27 +244,31 @@ func (m *tableMaintenanceMonitor) publishDurableStatus(parent context.Context, s
 			status.TablesScanned++
 		}
 		status.Tables = append(status.Tables, connector.TableMaintenanceTableStatus{
-			Namespace:                 state.Namespace,
-			Table:                     state.Table,
-			Identifier:                state.Namespace + "." + state.Table,
-			State:                     tableState,
-			ActiveDataFiles:           state.ActiveDataFiles,
-			ActiveEqualityDeleteFiles: state.ActiveEqualityDeleteFiles,
-			ActivePositionDeleteFiles: state.ActivePositionDeleteFiles,
-			EligibleSmallFiles:        state.ActiveSmallFiles,
-			EligibleSmallBytes:        state.ActiveSmallBytes,
-			CompactableFiles:          state.ActiveCompactableFiles,
-			CompactableBytes:          state.ActiveCompactableBytes,
-			CompactionGroups:          state.ActiveCompactionGroups,
-			NewDataFiles:              state.NewDataFiles,
-			NewEqualityDeleteFiles:    state.NewEqualityDeleteFiles,
-			CheckedAt:                 checkedAt,
-			Error:                     state.LastError,
-			Operations:                operations,
+			Namespace:                     state.Namespace,
+			Table:                         state.Table,
+			Identifier:                    state.Namespace + "." + state.Table,
+			State:                         tableState,
+			ActiveDataFiles:               state.ActiveDataFiles,
+			ActiveEqualityDeleteFiles:     state.ActiveEqualityDeleteFiles,
+			ActivePositionDeleteFiles:     state.ActivePositionDeleteFiles,
+			ApplicableEqualityDeleteFiles: state.EffectiveEqualityDeleteFiles(),
+			ApplicablePositionDeleteFiles: state.EffectivePositionDeleteFiles(),
+			EligibleSmallFiles:            state.ActiveSmallFiles,
+			EligibleSmallBytes:            state.ActiveSmallBytes,
+			CompactableFiles:              state.ActiveCompactableFiles,
+			CompactableBytes:              state.ActiveCompactableBytes,
+			CompactionGroups:              state.ActiveCompactionGroups,
+			NewDataFiles:                  state.NewDataFiles,
+			NewEqualityDeleteFiles:        state.NewEqualityDeleteFiles,
+			CheckedAt:                     checkedAt,
+			Error:                         state.LastError,
+			Operations:                    operations,
 		})
 		status.ActiveDataFiles += state.ActiveDataFiles
 		status.ActiveEqualityDeleteFiles += state.ActiveEqualityDeleteFiles
 		status.ActivePositionDeleteFiles += state.ActivePositionDeleteFiles
+		status.ApplicableEqualityDeleteFiles += state.EffectiveEqualityDeleteFiles()
+		status.ApplicablePositionDeleteFiles += state.EffectivePositionDeleteFiles()
 		status.EligibleSmallFiles += state.ActiveSmallFiles
 		status.EligibleSmallBytes += state.ActiveSmallBytes
 		if tableState == "ready" || tableState == "running" {
@@ -359,8 +363,8 @@ func DurableMaintenanceTableStateAt(state meta.IcebergMaintenanceState, cfg conf
 
 	dataPressure := state.ActiveSmallFiles >= dataThreshold
 	dataReady := dataPressure && state.ActiveCompactionGroups > 0
-	deleteReady := state.ActiveEqualityDeleteFiles >= deleteThreshold
-	positionDeleteReady := state.ActivePositionDeleteFiles >= positionDeleteThreshold
+	deleteReady := state.EffectiveEqualityDeleteFiles() >= deleteThreshold
+	positionDeleteReady := state.EffectivePositionDeleteFiles() >= positionDeleteThreshold
 	smallBytesReady := state.ActiveCompactableFiles >= smallMinCount && state.ActiveCompactableBytes >= smallMinBytes
 	if dataReady || deleteReady || positionDeleteReady || smallBytesReady {
 		return "ready"
@@ -486,24 +490,26 @@ func (m *tableMaintenanceMonitor) statusLocked(now time.Time) *connector.TableMa
 		}
 		status.ActiveDataFiles += state.activeDataFiles
 		status.ActiveEqualityDeleteFiles += state.activeEqDeletes
+		status.ApplicableEqualityDeleteFiles += state.activeEqDeletes
 		status.EligibleSmallFiles += state.activeSmallFiles
 		status.EligibleSmallBytes += state.activeSmallBytes
 		if state.lastCheckedAt.After(latest) {
 			latest = state.lastCheckedAt
 		}
 		status.Tables = append(status.Tables, connector.TableMaintenanceTableStatus{
-			Namespace:                 state.target.Namespace,
-			Table:                     state.target.Table,
-			Identifier:                key,
-			State:                     tableState,
-			ActiveDataFiles:           state.activeDataFiles,
-			ActiveEqualityDeleteFiles: state.activeEqDeletes,
-			EligibleSmallFiles:        state.activeSmallFiles,
-			EligibleSmallBytes:        state.activeSmallBytes,
-			NewDataFiles:              state.newDataFiles,
-			NewEqualityDeleteFiles:    state.newEqualityDeletes,
-			CheckedAt:                 formatMaintenanceTime(state.lastCheckedAt),
-			Error:                     state.lastInventoryError,
+			Namespace:                     state.target.Namespace,
+			Table:                         state.target.Table,
+			Identifier:                    key,
+			State:                         tableState,
+			ActiveDataFiles:               state.activeDataFiles,
+			ActiveEqualityDeleteFiles:     state.activeEqDeletes,
+			ApplicableEqualityDeleteFiles: state.activeEqDeletes,
+			EligibleSmallFiles:            state.activeSmallFiles,
+			EligibleSmallBytes:            state.activeSmallBytes,
+			NewDataFiles:                  state.newDataFiles,
+			NewEqualityDeleteFiles:        state.newEqualityDeletes,
+			CheckedAt:                     formatMaintenanceTime(state.lastCheckedAt),
+			Error:                         state.lastInventoryError,
 		})
 	}
 	switch {

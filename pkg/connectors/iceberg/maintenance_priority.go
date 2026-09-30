@@ -41,8 +41,8 @@ func compactionTaskPriority(state meta.IcebergMaintenanceState, settings nativeM
 func compactionPressure(state meta.IcebergMaintenanceState, settings nativeMaintenanceSettings) float64 {
 	pressure := 0.0
 	pressure = math.Max(pressure, ratio(state.ActiveCompactableFiles, settings.DataFilesThreshold))
-	pressure = math.Max(pressure, ratio(state.ActiveEqualityDeleteFiles, settings.EqualityDeleteThreshold))
-	pressure = math.Max(pressure, ratio(state.ActivePositionDeleteFiles, settings.PositionDeleteThreshold))
+	pressure = math.Max(pressure, ratio(state.EffectiveEqualityDeleteFiles(), settings.EqualityDeleteThreshold))
+	pressure = math.Max(pressure, ratio(state.EffectivePositionDeleteFiles(), settings.PositionDeleteThreshold))
 	if settings.MinSmallFiles > 0 && settings.MinSmallBytes > 0 {
 		countPressure := ratio(state.ActiveCompactableFiles, settings.MinSmallFiles)
 		bytePressure := float64(state.ActiveCompactableBytes) / float64(settings.MinSmallBytes)
@@ -140,6 +140,8 @@ func stateWithActiveInventory(state meta.IcebergMaintenanceState, inventory acti
 	state.ActiveSmallBytes = inventory.SmallBytes
 	state.ActiveEqualityDeleteFiles = inventory.EqualityDeletes
 	state.ActivePositionDeleteFiles = inventory.PositionDeletes
+	state.ApplicableEqualityDeleteFiles = &inventory.ApplicableEqualityDeletes
+	state.ApplicablePositionDeleteFiles = &inventory.ApplicablePositionDeletes
 	state.ActiveCompactableFiles = inventory.CompactableFiles
 	state.ActiveCompactableBytes = inventory.CompactableBytes
 	state.ActiveCompactionGroups = inventory.CompactionGroups

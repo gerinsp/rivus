@@ -11,23 +11,26 @@ import (
 // used by the job-details UI. It is intentionally computed from durable MySQL
 // state rather than worker process memory.
 type IcebergMaintenanceOwnerSummary struct {
-	Tables             int        `json:"tables"`
-	InventoriedTables  int        `json:"inventoried_tables"`
-	InventoryErrors    int        `json:"inventory_errors"`
-	LatestInventoryAt  *time.Time `json:"latest_inventory_at,omitempty"`
-	ActiveDataFiles    int        `json:"active_data_files"`
-	ActiveSmallFiles   int        `json:"active_small_files"`
-	ActiveSmallBytes   int64      `json:"active_small_bytes"`
-	EqualityDeletes    int        `json:"active_equality_delete_files"`
-	PositionDeletes    int        `json:"active_position_delete_files"`
-	Blocked            int        `json:"snapshot_blocked"`
-	QueuedTasks        int        `json:"queued_tasks"`
-	RetryTasks         int        `json:"retry_tasks"`
-	ActiveLeases       int        `json:"active_leases"`
-	FailedTasks        int        `json:"failed_tasks"`
-	FailedTables       int        `json:"failed_tables"`
-	OldestQueuedAt     *time.Time `json:"oldest_queued_at,omitempty"`
-	OldestQueuedAgeSec int64      `json:"oldest_queued_age_seconds"`
+	Tables                    int        `json:"tables"`
+	InventoriedTables         int        `json:"inventoried_tables"`
+	InventoryErrors           int        `json:"inventory_errors"`
+	LatestInventoryAt         *time.Time `json:"latest_inventory_at,omitempty"`
+	ActiveDataFiles           int        `json:"active_data_files"`
+	ActiveSmallFiles          int        `json:"active_small_files"`
+	ActiveSmallBytes          int64      `json:"active_small_bytes"`
+	EqualityDeletes           int        `json:"active_equality_delete_files"`
+	PositionDeletes           int        `json:"active_position_delete_files"`
+	ApplicableEqualityDeletes int        `json:"applicable_equality_delete_files"`
+	ApplicablePositionDeletes int        `json:"applicable_position_delete_files"`
+	ApplicableCountsPending   int        `json:"applicable_counts_pending"`
+	Blocked                   int        `json:"snapshot_blocked"`
+	QueuedTasks               int        `json:"queued_tasks"`
+	RetryTasks                int        `json:"retry_tasks"`
+	ActiveLeases              int        `json:"active_leases"`
+	FailedTasks               int        `json:"failed_tasks"`
+	FailedTables              int        `json:"failed_tables"`
+	OldestQueuedAt            *time.Time `json:"oldest_queued_at,omitempty"`
+	OldestQueuedAgeSec        int64      `json:"oldest_queued_age_seconds"`
 }
 
 func (s *IcebergMaintenanceStore) ListStatesForOwner(ctx context.Context, ownerJobID string, limit int) ([]IcebergMaintenanceState, error) {
@@ -43,7 +46,8 @@ func (s *IcebergMaintenanceStore) ListStatesForOwner(ctx context.Context, ownerJ
 	rows, err := s.db.QueryContext(ctx, `SELECT table_key, catalog, namespace_name, table_name, owner_type, owner_job_id,
 	 snapshot_complete, last_snapshot_id, inventory_snapshot_id, last_inventory_at, last_write_at, new_data_files, new_equality_delete_files,
 	 active_data_files, active_small_files, active_small_bytes, active_equality_delete_files,
-	 active_position_delete_files, active_compactable_files, active_compactable_bytes, active_compaction_groups,
+	 active_position_delete_files, applicable_equality_delete_files, applicable_position_delete_files,
+	 active_compactable_files, active_compactable_bytes, active_compaction_groups,
 	 next_compaction_check_at, next_expire_check_at, next_orphan_check_at,
 	 last_compaction_at, last_expire_at, last_orphan_at, inventory_lease_owner, inventory_lease_until, lease_owner, lease_until,
 	 attempt_count, last_error, created_at, updated_at
@@ -84,11 +88,15 @@ func (s *IcebergMaintenanceStore) SummaryForOwner(ctx context.Context, ownerJobI
 	 COALESCE(SUM(active_small_files),0),
 	 COALESCE(SUM(active_small_bytes),0),
 	 COALESCE(SUM(active_equality_delete_files),0),
-	 COALESCE(SUM(active_position_delete_files),0)
+	 COALESCE(SUM(active_position_delete_files),0),
+	 COALESCE(SUM(applicable_equality_delete_files),0),
+	 COALESCE(SUM(applicable_position_delete_files),0),
+	 COALESCE(SUM(last_inventory_at IS NOT NULL AND (applicable_equality_delete_files IS NULL OR applicable_position_delete_files IS NULL)),0)
 	FROM iceberg_maintenance_state WHERE owner_job_id=?`, ownerJobID).Scan(
 		&out.Tables, &out.InventoriedTables, &out.InventoryErrors, &out.Blocked, &latestInventory,
 		&out.ActiveDataFiles, &out.ActiveSmallFiles, &out.ActiveSmallBytes,
 		&out.EqualityDeletes, &out.PositionDeletes,
+		&out.ApplicableEqualityDeletes, &out.ApplicablePositionDeletes, &out.ApplicableCountsPending,
 	); err != nil {
 		return out, err
 	}

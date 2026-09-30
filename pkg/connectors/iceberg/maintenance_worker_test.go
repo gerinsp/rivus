@@ -229,6 +229,30 @@ func TestAccumulateActiveFileInventory(t *testing.T) {
 	}
 }
 
+func TestInventoryApplicableDeletesCountsUniquePlannedFiles(t *testing.T) {
+	file := func(path string, content iceberg.ManifestEntryContent) iceberg.DataFile {
+		builder, err := iceberg.NewDataFileBuilder(*iceberg.UnpartitionedSpec, content, path, iceberg.ParquetFile,
+			map[int]any{}, map[int]string{}, map[int]int{}, 1, 1024)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return builder.Build()
+	}
+	eq := file("eq-delete.parquet", iceberg.EntryContentEqDeletes)
+	pos := file("pos-delete.parquet", iceberg.EntryContentPosDeletes)
+	inventory := activeFileInventory{EqualityDeletes: 42, PositionDeletes: 161}
+	inventoryApplicableDeletes(&inventory, []icetable.FileScanTask{
+		{File: file("data-a.parquet", iceberg.EntryContentData), EqualityDeleteFiles: []iceberg.DataFile{eq}, DeleteFiles: []iceberg.DataFile{pos}},
+		{File: file("data-b.parquet", iceberg.EntryContentData), EqualityDeleteFiles: []iceberg.DataFile{eq}, DeleteFiles: []iceberg.DataFile{pos}},
+	})
+	if inventory.ApplicableEqualityDeletes != 1 || inventory.ApplicablePositionDeletes != 1 {
+		t.Fatalf("applicable deletes = equality:%d position:%d, want one unique file each", inventory.ApplicableEqualityDeletes, inventory.ApplicablePositionDeletes)
+	}
+	if inventory.EqualityDeletes != 42 || inventory.PositionDeletes != 161 {
+		t.Fatal("raw referenced delete counts must remain available separately")
+	}
+}
+
 func TestOrphanCleanupSkipsInactiveTables(t *testing.T) {
 	now := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
 	settings := defaultNativeMaintenanceSettings()
@@ -355,6 +379,8 @@ func TestCompactionRoutingBoundaries(t *testing.T) {
 func TestCompactionTriggersFor(t *testing.T) {
 	const megabyte = 1024 * 1024
 	settings := defaultNativeMaintenanceSettings()
+	noApplicableDeletes := 0
+	applicableDeletesAtThreshold := settings.PositionDeleteThreshold
 	cases := []struct {
 		name  string
 		state meta.IcebergMaintenanceState
@@ -373,6 +399,22 @@ func TestCompactionTriggersFor(t *testing.T) {
 			name: "25 active position deletes trigger maintenance",
 			state: meta.IcebergMaintenanceState{
 				ActivePositionDeleteFiles: 25,
+			},
+			want: compactionTriggers{PositionDelete: true},
+		},
+		{
+			name: "retained position deletes do not trigger without applicable deletes",
+			state: meta.IcebergMaintenanceState{
+				ActivePositionDeleteFiles:     161,
+				ApplicablePositionDeleteFiles: &noApplicableDeletes,
+			},
+			want: compactionTriggers{},
+		},
+		{
+			name: "applicable position deletes trigger at threshold",
+			state: meta.IcebergMaintenanceState{
+				ActivePositionDeleteFiles:     161,
+				ApplicablePositionDeleteFiles: &applicableDeletesAtThreshold,
 			},
 			want: compactionTriggers{PositionDelete: true},
 		},

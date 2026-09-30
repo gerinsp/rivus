@@ -186,6 +186,12 @@ export function renderIcebergMaintenance(job, options = {}) {
   const deleteThreshold = Number(maintenance.equality_delete_files_threshold || 0);
   const positionDeleteThreshold = Number(maintenance.position_delete_files_threshold || 25);
   const tableRows = pageTables.map((table) => {
+    const applicableEquality = table?.applicable_equality_delete_files == null ? null : Number(table.applicable_equality_delete_files);
+    const applicablePosition = table?.applicable_position_delete_files == null ? null : Number(table.applicable_position_delete_files);
+    const retainedEquality = applicableEquality == null ? 0 : Math.max(0, Number(table?.active_equality_delete_files || 0) - applicableEquality);
+    const retainedPosition = applicablePosition == null ? 0 : Math.max(0, Number(table?.active_position_delete_files || 0) - applicablePosition);
+    const equalityLabel = applicableEquality == null ? '–' : fmtWholeNumber(applicableEquality);
+    const positionLabel = applicablePosition == null ? '–' : fmtWholeNumber(applicablePosition);
     const reason = maintenanceReason(table);
     const reasonCell = table?.error
       ? `<div class="max-w-md break-words text-[11px] leading-4 text-rose-600">${escapeHtml(table.error)}</div>`
@@ -210,12 +216,12 @@ export function renderIcebergMaintenance(job, options = {}) {
           <div class="mono text-xs font-semibold text-slate-800">${fmtWholeNumber(table?.eligible_small_files || 0)}</div>
           <div class="mt-1 text-[11px] text-slate-500">${escapeHtml(fmtBytes(Number(table?.eligible_small_bytes || 0)))}</div>
         </td>
-        <td class="mono px-4 py-3 text-right text-xs font-semibold text-slate-800">${fmtWholeNumber(table?.active_equality_delete_files || 0)}</td>
-        <td class="mono px-4 py-3 text-right text-xs font-semibold text-slate-800">${fmtWholeNumber(table?.active_position_delete_files || 0)}</td>
+        <td class="px-4 py-3 text-right"><div class="mono text-xs font-semibold text-slate-800">${equalityLabel}</div>${retainedEquality ? `<div class="mt-1 text-[11px] text-slate-500">${fmtWholeNumber(retainedEquality)} retained</div>` : ''}</td>
+        <td class="px-4 py-3 text-right"><div class="mono text-xs font-semibold text-slate-800">${positionLabel}</div>${retainedPosition ? `<div class="mt-1 text-[11px] text-slate-500">${fmtWholeNumber(retainedPosition)} retained</div>` : ''}</td>
         <td class="px-4 py-3 text-xs text-slate-600">
           <div>Small: <span class="mono font-semibold text-slate-800">${fmtWholeNumber(table?.eligible_small_files || 0)} / ${fmtWholeNumber(dataThreshold)}</span> <span class="text-slate-400">·</span> ${fmtWholeNumber(table?.compactable_files || 0)} compactable</div>
-          <div class="mt-1">Equality: <span class="mono font-semibold text-slate-800">${fmtWholeNumber(table?.active_equality_delete_files || 0)} / ${fmtWholeNumber(deleteThreshold)}</span></div>
-          <div class="mt-1">Position: <span class="mono font-semibold text-slate-800">${fmtWholeNumber(table?.active_position_delete_files || 0)} / ${fmtWholeNumber(positionDeleteThreshold)}</span></div>
+          <div class="mt-1">Equality: <span class="mono font-semibold text-slate-800">${equalityLabel} / ${fmtWholeNumber(deleteThreshold)}</span></div>
+          <div class="mt-1">Position: <span class="mono font-semibold text-slate-800">${positionLabel} / ${fmtWholeNumber(positionDeleteThreshold)}</span></div>
         </td>
         <td class="px-4 py-3">
           <span class="inline-flex rounded-full border px-2.5 py-1 text-[11px] font-semibold ${maintenanceStateClass(table?.state)}">${escapeHtml(maintenanceStateLabel(table?.state))}</span>
@@ -279,7 +285,7 @@ export function renderIcebergMaintenance(job, options = {}) {
 
     <div class="grid gap-3 bg-slate-50 px-5 py-4 sm:grid-cols-2 xl:grid-cols-5 sm:px-6">
       ${maintenanceMetric('Active data files', fmtWholeNumber(maintenance.active_data_files || 0))}
-      ${maintenanceMetric('Equality-delete files', fmtWholeNumber(maintenance.active_equality_delete_files || 0))}
+      ${maintenanceMetric('Applicable equality deletes', fmtWholeNumber(maintenance.applicable_equality_delete_files || 0), Number(maintenance.applicable_counts_pending || 0) ? `${fmtWholeNumber(maintenance.applicable_counts_pending)} tables pending scan` : '')}
       ${maintenanceMetric('Eligible small files', fmtWholeNumber(maintenance.eligible_small_files || 0), `Below ${fmtBytes(Number(maintenance.small_file_size_bytes || 0))}`)}
       ${maintenanceMetric('Eligible small bytes', fmtBytes(Number(maintenance.eligible_small_bytes || 0)), `Minimum ${fmtBytes(Number(maintenance.small_files_min_total_bytes || 0))}`)}
       ${maintenanceMetric(listLimited ? 'Tables ready (shown)' : 'Tables ready', fmtWholeNumber(maintenance.tables_ready || 0), `${fmtWholeNumber(maintenance.active_runs || 0)} maintenance run(s) active`)}
@@ -300,8 +306,8 @@ export function renderIcebergMaintenance(job, options = {}) {
                 <th class="min-w-64 px-4 py-3 text-left text-[11px] font-semibold uppercase tracking-[0.14em]">Iceberg table</th>
                 <th class="px-4 py-3 text-right text-[11px] font-semibold uppercase tracking-[0.14em]">Data files</th>
                 <th class="px-4 py-3 text-right text-[11px] font-semibold uppercase tracking-[0.14em]">Small files</th>
-                <th class="px-4 py-3 text-right text-[11px] font-semibold uppercase tracking-[0.14em]">Equality deletes</th>
-                <th class="px-4 py-3 text-right text-[11px] font-semibold uppercase tracking-[0.14em]">Position deletes</th>
+                <th class="px-4 py-3 text-right text-[11px] font-semibold uppercase tracking-[0.14em]">Applicable equality deletes</th>
+                <th class="px-4 py-3 text-right text-[11px] font-semibold uppercase tracking-[0.14em]">Applicable position deletes</th>
                 <th class="min-w-44 px-4 py-3 text-left text-[11px] font-semibold uppercase tracking-[0.14em]">Current / trigger</th>
                 <th class="min-w-32 px-4 py-3 text-left text-[11px] font-semibold uppercase tracking-[0.14em]">Status</th>
                 <th class="min-w-64 px-4 py-3 text-left text-[11px] font-semibold uppercase tracking-[0.14em]">Maintenance reason</th>
