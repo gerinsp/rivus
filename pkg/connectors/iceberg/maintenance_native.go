@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	stdfs "io/fs"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -22,6 +23,7 @@ import (
 
 	"github.com/gerinsp/rivus/pkg/config"
 	"github.com/gerinsp/rivus/pkg/meta"
+	"github.com/gerinsp/rivus/pkg/util"
 )
 
 const (
@@ -325,6 +327,43 @@ func refreshPendingInventory(ctx context.Context, store *meta.IcebergMaintenance
 }
 
 func scanActiveFileInventory(ctx context.Context, tbl *icetable.Table, settings nativeMaintenanceSettings) (activeFileInventory, error) {
+	return retryInventoryDNS(ctx, func() (activeFileInventory, error) {
+		return scanActiveFileInventoryOnce(ctx, tbl, settings)
+	})
+}
+
+// A transient Docker DNS miss can happen while opening an S3 manifest. Retry
+// the entire scan so no partially accumulated file counts are persisted.
+func retryInventoryDNS(ctx context.Context, scan func() (activeFileInventory, error)) (activeFileInventory, error) {
+	var inventory activeFileInventory
+	err := util.RetryWithBackoff(ctx, config.RetryPolicy{
+		MaxAttempts: 2,
+		BaseBackoff: 250 * time.Millisecond,
+		MaxBackoff:  250 * time.Millisecond,
+	}, func() error {
+		candidate, scanErr := scan()
+		if scanErr == nil {
+			inventory = candidate
+			return nil
+		}
+		if !isDNSLookupFailure(scanErr) {
+			return util.Permanent(scanErr)
+		}
+		return scanErr
+	})
+	return inventory, err
+}
+
+func isDNSLookupFailure(err error) bool {
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "no such host") || strings.Contains(message, "temporary failure in name resolution")
+}
+
+func scanActiveFileInventoryOnce(ctx context.Context, tbl *icetable.Table, settings nativeMaintenanceSettings) (activeFileInventory, error) {
 	var inventory activeFileInventory
 	if tbl == nil || tbl.CurrentSnapshot() == nil {
 		return inventory, nil

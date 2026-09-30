@@ -3,6 +3,7 @@ package iceberg
 import (
 	"context"
 	"fmt"
+	"net"
 	"testing"
 	"time"
 
@@ -250,6 +251,31 @@ func TestInventoryApplicableDeletesCountsUniquePlannedFiles(t *testing.T) {
 	}
 	if inventory.EqualityDeletes != 42 || inventory.PositionDeletes != 161 {
 		t.Fatal("raw referenced delete counts must remain available separately")
+	}
+}
+
+func TestRetryInventoryDNS(t *testing.T) {
+	attempts := 0
+	inventory, err := retryInventoryDNS(context.Background(), func() (activeFileInventory, error) {
+		attempts++
+		if attempts == 1 {
+			return activeFileInventory{DataFiles: 99}, fmt.Errorf("open manifest: %w", &net.DNSError{Err: "no such host", Name: "nos.wjv-1.neo.id"})
+		}
+		return activeFileInventory{DataFiles: 1}, nil
+	})
+	if err != nil || attempts != 2 || inventory.DataFiles != 1 {
+		t.Fatalf("retry inventory = %#v, attempts=%d, err=%v", inventory, attempts, err)
+	}
+}
+
+func TestRetryInventoryDNSDoesNotRetryNonDNSFailure(t *testing.T) {
+	attempts := 0
+	_, err := retryInventoryDNS(context.Background(), func() (activeFileInventory, error) {
+		attempts++
+		return activeFileInventory{}, fmt.Errorf("manifest is corrupt")
+	})
+	if err == nil || attempts != 1 {
+		t.Fatalf("non-DNS failure attempts=%d, err=%v", attempts, err)
 	}
 }
 
