@@ -109,7 +109,6 @@ function rowTemplate(job) {
   const displayDetail = String(display.detail || '').trim();
   const healthStatus = String(job.health_status || '').trim().toUpperCase();
   const shownStatus = healthStatus && healthStatus !== 'HEALTHY' ? healthStatus : job.status;
-  const healthDetail = String(job.health_detail || '').trim();
 
   return `
     <tr class="align-top transition hover:bg-white/70">
@@ -123,8 +122,6 @@ function rowTemplate(job) {
       </td>
       <td data-label="Status" class="px-6 py-4">
         ${statusPill(shownStatus)}
-        ${shownStatus !== job.status ? `<div class="mt-1 text-[11px] font-medium uppercase text-slate-500">Lifecycle: ${escapeHtml(job.status)}</div>` : ''}
-        ${healthDetail && shownStatus !== job.status ? `<div class="mt-2 max-w-[18rem] text-xs leading-5 text-slate-600">${escapeHtml(healthDetail)}</div>` : ''}
       </td>
       <td data-label="Created" class="px-6 py-4 text-slate-600">${tableDateCell(job.created)}</td>
       <td data-label="Updated" class="px-6 py-4 text-slate-600">${tableDateCell(job.updated)}</td>

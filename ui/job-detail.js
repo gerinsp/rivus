@@ -138,11 +138,10 @@ function renderGraphProgress(graph) {
       <div class="flex flex-wrap items-center gap-2">
         ${progressPill(progress)}
         ${statusPill(shownStatus)}
-        ${shownStatus !== graph?.status ? `<span class="text-xs text-slate-500">Lifecycle: ${escapeHtml(graph?.status || '-')}</span>` : ''}
       </div>
       <div class="mt-4 text-lg font-semibold tracking-tight text-slate-900">${escapeHtml(summary)}</div>
       ${showDetail ? `<div class="mt-1 text-sm leading-6 text-slate-500 break-words">${escapeHtml(detail)}</div>` : ''}
-      ${sinkSummary ? `
+      ${sinkSummary && !checkpointPending ? `
         <div class="mt-3 rounded-[14px] border border-indigo-100 bg-indigo-50 px-4 py-3 text-sm leading-6 text-indigo-900">
           <span class="font-semibold">Sink:</span>
           <span class="ml-1">${escapeHtml(sinkSummary)}</span>
@@ -288,8 +287,7 @@ function renderGraphAlert(graph) {
   if (healthStatus === 'CRITICAL' || healthStatus === 'STALE') {
     return `
       <div class="mt-4 rounded-[16px] border px-4 py-3 ${graphBannerClass('error')}">
-        <div class="text-sm font-semibold">${escapeHtml(healthStatus === 'STALE' ? 'Runtime heartbeat is stale' : 'Critical job health')}</div>
-        <div class="mt-1 text-sm">${escapeHtml(healthDetail || 'The lifecycle is still marked running, but the pipeline is not healthy.')}</div>
+        <div class="text-sm font-medium">${escapeHtml(healthDetail || healthStatus)}</div>
       </div>
     `;
   }

@@ -44,12 +44,8 @@ func deriveJobHealth(status JobStatus, progress *JobProgress, updated, now time.
 		case "missing", "no_binlogs":
 			return JobHealth{Status: JobHealthCritical, Detail: "Saved CDC checkpoint is not resumable from the available MySQL binlogs"}
 		}
-		if isBackpressureProgress(progress) || progress.CheckpointPending {
-			detail := "Sink is not draining events fast enough"
-			if progress.CheckpointPending {
-				detail = "Checkpoint is waiting for pending sink events"
-			}
-			return JobHealth{Status: JobHealthDegraded, Detail: detail}
+		if isBackpressureProgress(progress) {
+			return JobHealth{Status: JobHealthDegraded, Detail: "Sink is not draining events fast enough"}
 		}
 	}
 

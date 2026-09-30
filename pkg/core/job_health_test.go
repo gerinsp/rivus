@@ -20,6 +20,17 @@ func TestDeriveJobHealthMarksBackpressureDegraded(t *testing.T) {
 	}
 }
 
+func TestDeriveJobHealthDoesNotMarkNormalCheckpointWaitDegraded(t *testing.T) {
+	health := deriveJobHealth(JobStatusRunning, &JobProgress{
+		Phase:             "streaming",
+		Summary:           "CDC streaming",
+		CheckpointPending: true,
+	}, time.Now(), time.Now())
+	if health.Status != JobHealthHealthy {
+		t.Fatalf("health = %+v, want HEALTHY", health)
+	}
+}
+
 func TestDeriveJobHealthMarksOldActiveStateStale(t *testing.T) {
 	now := time.Now()
 	health := deriveJobHealth(JobStatusRunning, &JobProgress{Phase: "streaming"}, now.Add(-3*time.Minute), now)

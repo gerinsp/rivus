@@ -41,7 +41,10 @@ const (
 const (
 	defaultWorkerPollInterval  = 2 * time.Second
 	defaultWorkerLeaseDuration = 30 * time.Second
-	defaultWorkerClaimLimit    = 1000
+	// Claim one new job per reconciliation pass. Connector construction can
+	// involve network discovery, so bulk-claiming every runnable job gives all
+	// of them the same short lease before they can actually be started.
+	defaultWorkerClaimLimit = 1
 )
 
 const (
@@ -1630,7 +1633,22 @@ func (m *JobManager) RunWorker(ctx context.Context) error {
 	}
 
 	log.Printf("[job-manager] worker started role=%s owner=%s poll=%s lease=%s", m.workerRole, m.workerID, m.workerPollInterval, m.workerLeaseDuration)
-	if err := m.reconcileWorkerJobs(ctx, store); err != nil {
+	// Lease renewal must never share the connector-startup call stack. A slow
+	// source/sink constructor previously blocked reconciliation long enough for
+	// every already-running job lease to expire while its durable status stayed
+	// RUNNING.
+	renewCtx, stopRenewal := context.WithCancel(ctx)
+	renewalDone := make(chan struct{})
+	go func() {
+		defer close(renewalDone)
+		m.runWorkerLeaseRenewal(renewCtx, store)
+	}()
+	defer func() {
+		stopRenewal()
+		<-renewalDone
+	}()
+
+	if err := m.claimAndStartWorkerJobs(ctx, store); err != nil {
 		log.Printf("[job-manager] initial worker reconciliation failed role=%s: %v", m.workerRole, err)
 	}
 	ticker := time.NewTicker(m.workerPollInterval)
@@ -1640,7 +1658,7 @@ func (m *JobManager) RunWorker(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			if err := m.reconcileWorkerJobs(ctx, store); err != nil && ctx.Err() == nil {
+			if err := m.claimAndStartWorkerJobs(ctx, store); err != nil && ctx.Err() == nil {
 				log.Printf("[job-manager] worker reconciliation failed role=%s: %v", m.workerRole, err)
 			}
 		}
@@ -1648,6 +1666,40 @@ func (m *JobManager) RunWorker(ctx context.Context) error {
 }
 
 func (m *JobManager) reconcileWorkerJobs(ctx context.Context, store meta.JobWorkerStore) error {
+	if err := m.renewWorkerJobLeases(ctx, store); err != nil {
+		return err
+	}
+	return m.claimAndStartWorkerJobs(ctx, store)
+}
+
+func (m *JobManager) runWorkerLeaseRenewal(ctx context.Context, store meta.JobWorkerStore) {
+	interval := m.workerPollInterval
+	if maxInterval := m.workerLeaseDuration / 3; maxInterval > 0 && interval > maxInterval {
+		interval = maxInterval
+	}
+	if interval <= 0 {
+		interval = time.Second
+	}
+
+	renew := func() {
+		if err := m.renewWorkerJobLeases(ctx, store); err != nil && ctx.Err() == nil {
+			log.Printf("[job-manager] worker lease renewal failed role=%s: %v", m.workerRole, err)
+		}
+	}
+	renew()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			renew()
+		}
+	}
+}
+
+func (m *JobManager) renewWorkerJobLeases(ctx context.Context, store meta.JobWorkerStore) error {
 	role := m.durableWorkerRole()
 
 	m.mu.RLock()
@@ -1681,7 +1733,11 @@ func (m *JobManager) reconcileWorkerJobs(ctx context.Context, store meta.JobWork
 			m.releaseWorkerLease(job.Config.ID, job.SubmissionID())
 		}
 	}
+	return nil
+}
 
+func (m *JobManager) claimAndStartWorkerJobs(ctx context.Context, store meta.JobWorkerStore) error {
+	role := m.durableWorkerRole()
 	records, err := store.ClaimJobs(ctx, role, m.workerID, defaultWorkerClaimLimit, m.workerLeaseDuration)
 	if err != nil {
 		return err
