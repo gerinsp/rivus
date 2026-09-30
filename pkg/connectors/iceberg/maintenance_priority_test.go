@@ -12,9 +12,10 @@ func TestCompactionTaskPriorityPromotesSevereBacklog(t *testing.T) {
 	settings := defaultNativeMaintenanceSettings()
 	settings.DataFilesThreshold = 50
 	state := meta.IcebergMaintenanceState{
-		ActiveDataFiles:  5550,
-		ActiveSmallFiles: 5550,
-		CreatedAt:        now.Add(-time.Hour),
+		ActiveDataFiles:        5550,
+		ActiveSmallFiles:       5550,
+		ActiveCompactableFiles: 5550,
+		CreatedAt:              now.Add(-time.Hour),
 	}
 
 	if got := compactionTaskPriority(state, settings, now); got != 1 {
@@ -27,13 +28,29 @@ func TestCompactionTaskPriorityKeepsThresholdWorkBelowCritical(t *testing.T) {
 	settings := defaultNativeMaintenanceSettings()
 	settings.DataFilesThreshold = 50
 	state := meta.IcebergMaintenanceState{
-		ActiveDataFiles:  50,
-		ActiveSmallFiles: 50,
-		CreatedAt:        now.Add(-time.Hour),
+		ActiveDataFiles:        50,
+		ActiveSmallFiles:       50,
+		ActiveCompactableFiles: 50,
+		CreatedAt:              now.Add(-time.Hour),
 	}
 
 	if got := compactionTaskPriority(state, settings, now); got != 4 {
 		t.Fatalf("priority for 50/50 small files = %d, want 4", got)
+	}
+}
+
+func TestCompactionTaskPriorityDoesNotPromoteFilesSplitAcrossPartitions(t *testing.T) {
+	now := time.Date(2026, 9, 25, 12, 0, 0, 0, time.UTC)
+	settings := defaultNativeMaintenanceSettings()
+	settings.DataFilesThreshold = 50
+	state := meta.IcebergMaintenanceState{
+		ActiveSmallFiles:       5550,
+		ActiveCompactableFiles: 10,
+		ActiveCompactionGroups: 1,
+		CreatedAt:              now.Add(-time.Hour),
+	}
+	if got := compactionTaskPriority(state, settings, now); got != defaultCompactionTaskPriority {
+		t.Fatalf("priority for 10 compactable files across 5550 small files = %d, want %d", got, defaultCompactionTaskPriority)
 	}
 }
 

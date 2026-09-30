@@ -66,7 +66,7 @@ func (s *IcebergMaintenanceStore) ListMonitorTargets(ctx context.Context, monito
 
 func (s *IcebergMaintenanceStore) RecordMonitorDiscoveryFailure(ctx context.Context, monitorID, message string, now time.Time) error {
 	res, err := s.db.ExecContext(ctx, `UPDATE iceberg_maintenance_monitors
-		SET last_discovery_error=?, updated_at=? WHERE monitor_id=?`, message, now.UTC(), strings.TrimSpace(monitorID))
+		SET last_discovery_attempt_at=?, last_discovery_error=?, updated_at=? WHERE monitor_id=?`, now.UTC(), message, now.UTC(), strings.TrimSpace(monitorID))
 	if err != nil {
 		return err
 	}
@@ -255,7 +255,7 @@ func (s *IcebergMaintenanceStore) applyMonitorDiscovery(
 		}
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE iceberg_maintenance_monitors
-		SET last_discovery_at=?, last_discovery_error=NULL, updated_at=? WHERE monitor_id=?`, now, now, monitor.ID); err != nil {
+		SET last_discovery_at=?, last_discovery_attempt_at=?, last_discovery_error=NULL, updated_at=? WHERE monitor_id=?`, now, now, now, monitor.ID); err != nil {
 		return delta, err
 	}
 	if err := tx.Commit(); err != nil {

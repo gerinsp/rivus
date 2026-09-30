@@ -28,23 +28,24 @@ var (
 )
 
 type IcebergMaintenanceMonitor struct {
-	ID                 string                   `json:"id"`
-	Name               string                   `json:"name"`
-	Status             MaintenanceMonitorStatus `json:"status"`
-	Config             *config.JobConfig        `json:"-"`
-	TableCount         int                      `json:"table_count"`
-	DiscoveredCount    int                      `json:"discovered_count"`
-	OwnedCount         int                      `json:"owned_count"`
-	ReservedCount      int                      `json:"reserved_count"`
-	ExcludedScopeCount int                      `json:"excluded_scope_count"`
-	ConflictCount      int                      `json:"conflict_count"`
-	RetiredCount       int                      `json:"retired_count"`
-	LastInventoryAt    *time.Time               `json:"last_inventory_at,omitempty"`
-	LastDiscoveryAt    *time.Time               `json:"last_discovery_at,omitempty"`
-	LastDiscoveryError string                   `json:"last_discovery_error,omitempty"`
-	LastError          string                   `json:"last_error,omitempty"`
-	CreatedAt          time.Time                `json:"created_at"`
-	UpdatedAt          time.Time                `json:"updated_at"`
+	ID                     string                   `json:"id"`
+	Name                   string                   `json:"name"`
+	Status                 MaintenanceMonitorStatus `json:"status"`
+	Config                 *config.JobConfig        `json:"-"`
+	TableCount             int                      `json:"table_count"`
+	DiscoveredCount        int                      `json:"discovered_count"`
+	OwnedCount             int                      `json:"owned_count"`
+	ReservedCount          int                      `json:"reserved_count"`
+	ExcludedScopeCount     int                      `json:"excluded_scope_count"`
+	ConflictCount          int                      `json:"conflict_count"`
+	RetiredCount           int                      `json:"retired_count"`
+	LastInventoryAt        *time.Time               `json:"last_inventory_at,omitempty"`
+	LastDiscoveryAt        *time.Time               `json:"last_discovery_at,omitempty"`
+	LastDiscoveryAttemptAt *time.Time               `json:"last_discovery_attempt_at,omitempty"`
+	LastDiscoveryError     string                   `json:"last_discovery_error,omitempty"`
+	LastError              string                   `json:"last_error,omitempty"`
+	CreatedAt              time.Time                `json:"created_at"`
+	UpdatedAt              time.Time                `json:"updated_at"`
 }
 
 // MaintenanceMonitorOwnerID namespaces monitor ownership away from ingestion
@@ -92,7 +93,7 @@ func (s *IcebergMaintenanceStore) ListMonitors(ctx context.Context) ([]IcebergMa
 		COALESCE(t.discovered_count, 0), COALESCE(t.owned_count, 0), COALESCE(t.reserved_count, 0),
 		m.excluded_scope_count, COALESCE(t.conflict_count, 0), COALESCE(t.retired_count, 0),
 		COALESCE(st.table_count, 0), st.last_inventory_at, COALESCE(st.last_error, ''),
-		m.last_discovery_at, COALESCE(m.last_discovery_error, ''), m.created_at, m.updated_at
+		m.last_discovery_at, m.last_discovery_attempt_at, COALESCE(m.last_discovery_error, ''), m.created_at, m.updated_at
 	FROM iceberg_maintenance_monitors m
 	LEFT JOIN (
 		SELECT monitor_id,
@@ -131,7 +132,7 @@ func (s *IcebergMaintenanceStore) GetMonitor(ctx context.Context, id string) (*I
 		COALESCE(t.discovered_count, 0), COALESCE(t.owned_count, 0), COALESCE(t.reserved_count, 0),
 		m.excluded_scope_count, COALESCE(t.conflict_count, 0), COALESCE(t.retired_count, 0),
 		COALESCE(st.table_count, 0), st.last_inventory_at, COALESCE(st.last_error, ''),
-		m.last_discovery_at, COALESCE(m.last_discovery_error, ''), m.created_at, m.updated_at
+		m.last_discovery_at, m.last_discovery_attempt_at, COALESCE(m.last_discovery_error, ''), m.created_at, m.updated_at
 	FROM iceberg_maintenance_monitors m
 	LEFT JOIN (
 		SELECT monitor_id,
@@ -197,7 +198,7 @@ func (s *IcebergMaintenanceStore) setMonitorStatus(ctx context.Context, id strin
 	}
 	// Ownership may fall through to, or be reclaimed from, an overlapping
 	// monitor. Mark active monitors due for one fresh reconciliation.
-	if _, err := tx.ExecContext(ctx, `UPDATE iceberg_maintenance_monitors SET last_discovery_at=NULL WHERE status=?`, MaintenanceMonitorActive); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE iceberg_maintenance_monitors SET last_discovery_at=NULL, last_discovery_attempt_at=NULL WHERE status=?`, MaintenanceMonitorActive); err != nil {
 		return err
 	}
 	if status == MaintenanceMonitorPaused {
@@ -261,7 +262,7 @@ func (s *IcebergMaintenanceStore) deleteMonitor(ctx context.Context, id string, 
 	if _, err := tx.ExecContext(ctx, `DELETE FROM iceberg_maintenance_monitor_targets WHERE monitor_id=?`, id); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE iceberg_maintenance_monitors SET last_discovery_at=NULL WHERE status=?`, MaintenanceMonitorActive); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE iceberg_maintenance_monitors SET last_discovery_at=NULL, last_discovery_attempt_at=NULL WHERE status=?`, MaintenanceMonitorActive); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE iceberg_maintenance_state
@@ -378,11 +379,11 @@ type maintenanceMonitorScanner interface {
 func scanMaintenanceMonitor(scanner maintenanceMonitorScanner) (IcebergMaintenanceMonitor, error) {
 	var monitor IcebergMaintenanceMonitor
 	var status, configJSON string
-	var lastInventory, lastDiscovery sql.NullTime
+	var lastInventory, lastDiscovery, lastDiscoveryAttempt sql.NullTime
 	if err := scanner.Scan(&monitor.ID, &monitor.Name, &status, &configJSON,
 		&monitor.DiscoveredCount, &monitor.OwnedCount, &monitor.ReservedCount,
 		&monitor.ExcludedScopeCount, &monitor.ConflictCount, &monitor.RetiredCount,
-		&monitor.TableCount, &lastInventory, &monitor.LastError, &lastDiscovery, &monitor.LastDiscoveryError,
+		&monitor.TableCount, &lastInventory, &monitor.LastError, &lastDiscovery, &lastDiscoveryAttempt, &monitor.LastDiscoveryError,
 		&monitor.CreatedAt, &monitor.UpdatedAt); err != nil {
 		return monitor, err
 	}
@@ -394,6 +395,10 @@ func scanMaintenanceMonitor(scanner maintenanceMonitorScanner) (IcebergMaintenan
 	if lastDiscovery.Valid {
 		value := lastDiscovery.Time.UTC()
 		monitor.LastDiscoveryAt = &value
+	}
+	if lastDiscoveryAttempt.Valid {
+		value := lastDiscoveryAttempt.Time.UTC()
+		monitor.LastDiscoveryAttemptAt = &value
 	}
 	var cfg config.JobConfig
 	if err := json.Unmarshal([]byte(configJSON), &cfg); err != nil {

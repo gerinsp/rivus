@@ -223,6 +223,7 @@ func (s *IcebergMaintenanceStore) Init(ctx context.Context) error {
 		  config_json LONGTEXT NOT NULL,
 		  excluded_scope_count INT NOT NULL DEFAULT 0,
 		  last_discovery_at DATETIME(6) NULL,
+		  last_discovery_attempt_at DATETIME(6) NULL,
 		  last_discovery_error LONGTEXT NULL,
 		  created_at DATETIME(6) NOT NULL,
 		  updated_at DATETIME(6) NOT NULL,
@@ -366,6 +367,9 @@ func (s *IcebergMaintenanceStore) Init(ctx context.Context) error {
 	if err := s.ensureColumn(ctx, "iceberg_maintenance_monitors", "last_discovery_at", "DATETIME(6) NULL AFTER config_json"); err != nil {
 		return err
 	}
+	if err := s.ensureColumn(ctx, "iceberg_maintenance_monitors", "last_discovery_attempt_at", "DATETIME(6) NULL AFTER last_discovery_at"); err != nil {
+		return err
+	}
 	if err := s.ensureColumn(ctx, "iceberg_maintenance_monitors", "excluded_scope_count", "INT NOT NULL DEFAULT 0 AFTER config_json"); err != nil {
 		return err
 	}
@@ -424,6 +428,15 @@ func (s *IcebergMaintenanceStore) ensureColumn(ctx context.Context, table, colum
 		return nil
 	}
 	_, err = s.db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, definition))
+	if err == nil {
+		return nil
+	}
+	// API and worker processes can run this migration concurrently. Treat a
+	// duplicate-column race as success after verifying the resulting schema.
+	if checkErr := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?`, table, column).Scan(&found); checkErr == nil && found != 0 {
+		return nil
+	}
 	return err
 }
 

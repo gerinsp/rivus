@@ -40,12 +40,12 @@ func compactionTaskPriority(state meta.IcebergMaintenanceState, settings nativeM
 
 func compactionPressure(state meta.IcebergMaintenanceState, settings nativeMaintenanceSettings) float64 {
 	pressure := 0.0
-	pressure = math.Max(pressure, ratio(state.ActiveSmallFiles, settings.DataFilesThreshold))
+	pressure = math.Max(pressure, ratio(state.ActiveCompactableFiles, settings.DataFilesThreshold))
 	pressure = math.Max(pressure, ratio(state.ActiveEqualityDeleteFiles, settings.EqualityDeleteThreshold))
 	pressure = math.Max(pressure, ratio(state.ActivePositionDeleteFiles, settings.PositionDeleteThreshold))
 	if settings.MinSmallFiles > 0 && settings.MinSmallBytes > 0 {
-		countPressure := ratio(state.ActiveSmallFiles, settings.MinSmallFiles)
-		bytePressure := float64(state.ActiveSmallBytes) / float64(settings.MinSmallBytes)
+		countPressure := ratio(state.ActiveCompactableFiles, settings.MinSmallFiles)
+		bytePressure := float64(state.ActiveCompactableBytes) / float64(settings.MinSmallBytes)
 		pressure = math.Max(pressure, math.Min(countPressure, bytePressure))
 	}
 	return pressure

@@ -38,6 +38,27 @@ func TestStandaloneMaintenanceMonitorConfigDoesNotClaimLegacyJobOwnership(t *tes
 	}
 }
 
+func TestMaintenanceMonitorDiscoveryBacksOffAfterFailure(t *testing.T) {
+	now := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+	lastSuccess := now.Add(-time.Hour)
+	failedAttempt := now.Add(-time.Minute)
+	monitor := meta.IcebergMaintenanceMonitor{
+		LastDiscoveryAt:        &lastSuccess,
+		LastDiscoveryAttemptAt: &failedAttempt,
+		LastDiscoveryError:     "context deadline exceeded",
+	}
+	if maintenanceMonitorDiscoveryDue(monitor, 10*time.Minute, now) {
+		t.Fatal("failed catalog discovery should wait before retrying")
+	}
+	if !maintenanceMonitorDiscoveryDue(monitor, 10*time.Minute, failedAttempt.Add(maintenanceDiscoveryFailureRetry)) {
+		t.Fatal("failed catalog discovery should retry after backoff")
+	}
+	monitor.LastDiscoveryAttemptAt = nil // monitor configuration or status changed
+	if !maintenanceMonitorDiscoveryDue(monitor, 10*time.Minute, now) {
+		t.Fatal("reset discovery attempt should allow immediate retry")
+	}
+}
+
 func TestCatalogMonitorExcludesOnlyStreamingOwnedTables(t *testing.T) {
 	streamCfg := &config.JobConfig{
 		ID: "stream-orders", Mode: config.JobModeInitial,

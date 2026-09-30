@@ -443,16 +443,12 @@ func syncMaintenanceMonitorStates(ctx context.Context, store *meta.IcebergMainte
 		targets := activeMaintenanceMonitorTargets(persistedTargets)
 		applyDiscovery := false
 		if catalogMonitoringEnabled(iceCfg) {
-			lastDiscovery := time.Time{}
-			if monitor.LastDiscoveryAt != nil {
-				lastDiscovery = monitor.LastDiscoveryAt.UTC()
-			}
-			if lastDiscovery.IsZero() || now.Sub(lastDiscovery) >= maintenanceDiscoveryInterval(iceCfg) {
+			if maintenanceMonitorDiscoveryDue(monitor, maintenanceDiscoveryInterval(iceCfg), now) {
 				discoveryCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 				discovered, discoveryErr := discoverCatalogMonitorTargets(discoveryCtx, cfg, iceCfg)
 				cancel()
 				if discoveryErr != nil {
-					if recordErr := store.RecordMonitorDiscoveryFailure(ctx, monitor.ID, discoveryErr.Error(), now); recordErr != nil {
+					if recordErr := store.RecordMonitorDiscoveryFailure(ctx, monitor.ID, discoveryErr.Error(), time.Now().UTC()); recordErr != nil {
 						return nil, fmt.Errorf("record maintenance monitor %s discovery failure: %w", monitor.ID, recordErr)
 					}
 					log.Printf("[maintenance-worker] monitor=%s catalog discovery failed; retaining %d persisted targets: %v", monitor.ID, len(targets), discoveryErr)
@@ -514,6 +510,16 @@ func syncMaintenanceMonitorStates(ctx context.Context, store *meta.IcebergMainte
 		}
 	}
 	return jobs, nil
+}
+
+const maintenanceDiscoveryFailureRetry = 5 * time.Minute
+
+func maintenanceMonitorDiscoveryDue(monitor meta.IcebergMaintenanceMonitor, interval time.Duration, now time.Time) bool {
+	if monitor.LastDiscoveryAttemptAt != nil && monitor.LastDiscoveryError != "" &&
+		now.Sub(monitor.LastDiscoveryAttemptAt.UTC()) < maintenanceDiscoveryFailureRetry {
+		return false
+	}
+	return monitor.LastDiscoveryAt == nil || now.Sub(monitor.LastDiscoveryAt.UTC()) >= interval
 }
 
 func activeMaintenanceMonitorTargets(targets []meta.IcebergMaintenanceMonitorTarget) []maintenanceMonitorTarget {
