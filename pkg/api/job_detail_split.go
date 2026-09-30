@@ -140,18 +140,10 @@ func (s *Server) durableIcebergMaintenanceConfigView(ctx context.Context, jobCfg
 
 	now := time.Now().UTC()
 	tables := make([]map[string]any, 0, len(states))
-	activeDataFiles := 0
-	activeEqualityDeletes := 0
-	activePositionDeletes := 0
-	eligibleSmallFiles := 0
-	eligibleSmallBytes := int64(0)
-	tablesScanned := 0
 	tablesReady := 0
-	inventoryErrors := 0
 	inventoryScanning := false
 	inventoryPending := false
 	inventoryStale := false
-	var latest time.Time
 
 	for _, state := range states {
 		tableState := connectoriceberg.DurableMaintenanceTableStateAt(state, tm, now)
@@ -167,24 +159,10 @@ func (s *Server) durableIcebergMaintenanceConfigView(ctx context.Context, jobCfg
 		if tableState == "ready" || tableState == "running" {
 			tablesReady++
 		}
-		if strings.TrimSpace(state.LastError) != "" {
-			inventoryErrors++
-		}
-
 		checkedAt := ""
 		if state.LastInventoryAt != nil {
 			checkedAt = state.LastInventoryAt.UTC().Format(time.RFC3339)
-			tablesScanned++
-			if state.LastInventoryAt.After(latest) {
-				latest = *state.LastInventoryAt
-			}
 		}
-
-		activeDataFiles += state.ActiveDataFiles
-		activeEqualityDeletes += state.ActiveEqualityDeleteFiles
-		activePositionDeletes += state.ActivePositionDeleteFiles
-		eligibleSmallFiles += state.ActiveSmallFiles
-		eligibleSmallBytes += state.ActiveSmallBytes
 
 		tables = append(tables, map[string]any{
 			"namespace":                    state.Namespace,
@@ -208,7 +186,7 @@ func (s *Server) durableIcebergMaintenanceConfigView(ctx context.Context, jobCfg
 		return fmt.Sprint(tables[i]["identifier"]) < fmt.Sprint(tables[j]["identifier"])
 	})
 
-	state := durableMaintenanceOverallState(summary, tablesScanned, tablesReady, inventoryErrors,
+	state := durableMaintenanceOverallState(summary, summary.InventoriedTables, tablesReady, summary.InventoryErrors,
 		inventoryScanning, inventoryPending, inventoryStale)
 	if paused {
 		state = "paused"
@@ -220,8 +198,8 @@ func (s *Server) durableIcebergMaintenanceConfigView(ctx context.Context, jobCfg
 	}
 
 	checkedAt := ""
-	if !latest.IsZero() {
-		checkedAt = latest.UTC().Format(time.RFC3339)
+	if summary.LatestInventoryAt != nil {
+		checkedAt = summary.LatestInventoryAt.UTC().Format(time.RFC3339)
 	}
 
 	return map[string]any{
@@ -236,16 +214,17 @@ func (s *Server) durableIcebergMaintenanceConfigView(ctx context.Context, jobCfg
 		"small_file_size_bytes":           smallFileSize,
 		"small_files_min_count":           smallFilesMinCount,
 		"small_files_min_total_bytes":     smallFilesMinBytes,
-		"active_data_files":               activeDataFiles,
-		"active_equality_delete_files":    activeEqualityDeletes,
-		"active_position_delete_files":    activePositionDeletes,
-		"eligible_small_files":            eligibleSmallFiles,
-		"eligible_small_bytes":            eligibleSmallBytes,
+		"active_data_files":               summary.ActiveDataFiles,
+		"active_equality_delete_files":    summary.EqualityDeletes,
+		"active_position_delete_files":    summary.PositionDeletes,
+		"eligible_small_files":            summary.ActiveSmallFiles,
+		"eligible_small_bytes":            summary.ActiveSmallBytes,
 		"tables_total":                    tablesTotal,
-		"tables_scanned":                  tablesScanned,
+		"tables_scanned":                  summary.InventoriedTables,
+		"tables_returned":                 len(tables),
 		"tables_ready":                    tablesReady,
 		"active_runs":                     summary.ActiveLeases,
-		"inventory_errors":                inventoryErrors,
+		"inventory_errors":                summary.InventoryErrors,
 		"paused":                          paused,
 		"checked_at":                      checkedAt,
 		"tables":                          tables,

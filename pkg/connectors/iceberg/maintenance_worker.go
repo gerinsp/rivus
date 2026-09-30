@@ -541,7 +541,7 @@ func scanOnePendingInventory(ctx context.Context, store *meta.IcebergMaintenance
 	if err != nil || state == nil {
 		return false, err
 	}
-	return true, scanClaimedInventory(ctx, store, jobStore, jobs, opts, now, *state)
+	return true, scanClaimedInventory(ctx, store, jobStore, jobs, opts, *state)
 }
 
 // scanPriorityInventoryBatch drains manual refreshes and commit-triggered
@@ -576,7 +576,7 @@ func scanPriorityInventoryBatch(ctx context.Context, store *meta.IcebergMaintena
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := scanClaimedInventory(ctx, store, jobStore, jobs, opts, now, item.state); err != nil {
+			if err := scanClaimedInventory(ctx, store, jobStore, jobs, opts, item.state); err != nil {
 				log.Printf("[maintenance-worker %s] priority inventory table=%s error: %v", opts.WorkerID, item.state.TableKey, err)
 			}
 		}()
@@ -585,12 +585,12 @@ func scanPriorityInventoryBatch(ctx context.Context, store *meta.IcebergMaintena
 	return len(claimed), nil
 }
 
-func scanClaimedInventory(ctx context.Context, store *meta.IcebergMaintenanceStore, jobStore meta.JobStore, jobs map[string]maintenanceWorkerJob, opts MaintenanceWorkerOptions, now time.Time, state meta.IcebergMaintenanceState) error {
+func scanClaimedInventory(ctx context.Context, store *meta.IcebergMaintenanceStore, jobStore meta.JobStore, jobs map[string]maintenanceWorkerJob, opts MaintenanceWorkerOptions, state meta.IcebergMaintenanceState) error {
 	job, ok, err := resolveMaintenanceWorkerJob(ctx, store, jobStore, jobs, state.OwnerJobID)
 	if err != nil {
 		message := fmt.Sprintf("load owner job configuration for inventory scan: %v", err)
 		_ = store.RecordStateError(ctx, state.TableKey, message)
-		if retryErr := store.RetryInventoryClaim(ctx, state.TableKey, opts.WorkerID, now.Add(defaultInventoryRetryBackoff)); retryErr != nil {
+		if retryErr := store.RetryInventoryClaim(ctx, state.TableKey, opts.WorkerID, time.Now().Add(defaultInventoryRetryBackoff)); retryErr != nil {
 			return retryErr
 		}
 		return fmt.Errorf("%s", message)
@@ -598,7 +598,7 @@ func scanClaimedInventory(ctx context.Context, store *meta.IcebergMaintenanceSto
 	if !ok || job.Job.Config == nil {
 		message := "owner job configuration is unavailable for inventory scan"
 		_ = store.RecordStateError(ctx, state.TableKey, message)
-		if retryErr := store.RetryInventoryClaim(ctx, state.TableKey, opts.WorkerID, now.Add(defaultInventoryRetryBackoff)); retryErr != nil {
+		if retryErr := store.RetryInventoryClaim(ctx, state.TableKey, opts.WorkerID, time.Now().Add(defaultInventoryRetryBackoff)); retryErr != nil {
 			return retryErr
 		}
 		return fmt.Errorf("%s", message)
@@ -607,7 +607,7 @@ func scanClaimedInventory(ctx context.Context, store *meta.IcebergMaintenanceSto
 	if err != nil {
 		message := fmt.Sprintf("resolve catalog configuration for inventory scan: %v", err)
 		_ = store.RecordStateError(ctx, state.TableKey, message)
-		if retryErr := store.RetryInventoryClaim(ctx, state.TableKey, opts.WorkerID, now.Add(defaultInventoryRetryBackoff)); retryErr != nil {
+		if retryErr := store.RetryInventoryClaim(ctx, state.TableKey, opts.WorkerID, time.Now().Add(defaultInventoryRetryBackoff)); retryErr != nil {
 			return retryErr
 		}
 		return fmt.Errorf("%s", message)
@@ -618,7 +618,7 @@ func scanClaimedInventory(ctx context.Context, store *meta.IcebergMaintenanceSto
 	cancel()
 	if err != nil {
 		_ = store.RecordStateError(ctx, state.TableKey, err.Error())
-		if retryErr := store.RetryInventoryClaim(ctx, state.TableKey, opts.WorkerID, now.Add(defaultInventoryRetryBackoff)); retryErr != nil {
+		if retryErr := store.RetryInventoryClaim(ctx, state.TableKey, opts.WorkerID, time.Now().Add(defaultInventoryRetryBackoff)); retryErr != nil {
 			return retryErr
 		}
 		return err

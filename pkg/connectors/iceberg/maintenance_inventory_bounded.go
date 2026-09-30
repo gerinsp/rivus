@@ -26,7 +26,7 @@ func scanOnePendingInventoryBounded(
 	if err != nil || state == nil {
 		return false, err
 	}
-	return true, scanClaimedInventory(ctx, store, jobStore, jobs, opts, now, *state)
+	return true, scanClaimedInventory(ctx, store, jobStore, jobs, opts, *state)
 }
 
 // scanPriorityInventoryBatchBounded drains explicit and commit-triggered
@@ -70,7 +70,7 @@ func scanPriorityInventoryBatchBounded(
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := scanClaimedInventory(ctx, store, jobStore, jobs, opts, now, item.state); err != nil {
+			if err := scanClaimedInventory(ctx, store, jobStore, jobs, opts, item.state); err != nil {
 				log.Printf("[maintenance-worker %s] priority inventory table=%s error: %v", opts.WorkerID, item.state.TableKey, err)
 				errMu.Lock()
 				if firstErr == nil {

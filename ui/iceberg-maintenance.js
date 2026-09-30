@@ -232,6 +232,8 @@ export function renderIcebergMaintenance(job, options = {}) {
   const scanned = `${fmtWholeNumber(maintenance.tables_scanned || 0)} / ${fmtWholeNumber(maintenance.tables_total || 0)} tables scanned`;
   const visibleStart = tables.length === 0 ? 0 : pageStart + 1;
   const visibleEnd = Math.min(pageStart + pageSize, tables.length);
+  const totalTables = Number(maintenance.tables_total || 0);
+  const listLimited = totalTables > tables.length;
   const pagination = tables.length > pageSize
     ? `<div class="flex items-center gap-2">
         <button type="button" data-maintenance-page="${currentPage - 1}" class="brand-outline-btn rounded-md px-3 py-1.5 text-xs font-semibold disabled:cursor-not-allowed disabled:opacity-50" ${currentPage === 1 ? 'disabled' : ''}>Previous</button>
@@ -280,14 +282,14 @@ export function renderIcebergMaintenance(job, options = {}) {
       ${maintenanceMetric('Equality-delete files', fmtWholeNumber(maintenance.active_equality_delete_files || 0))}
       ${maintenanceMetric('Eligible small files', fmtWholeNumber(maintenance.eligible_small_files || 0), `Below ${fmtBytes(Number(maintenance.small_file_size_bytes || 0))}`)}
       ${maintenanceMetric('Eligible small bytes', fmtBytes(Number(maintenance.eligible_small_bytes || 0)), `Minimum ${fmtBytes(Number(maintenance.small_files_min_total_bytes || 0))}`)}
-      ${maintenanceMetric('Tables ready', fmtWholeNumber(maintenance.tables_ready || 0), `${fmtWholeNumber(maintenance.active_runs || 0)} maintenance run(s) active`)}
+      ${maintenanceMetric(listLimited ? 'Tables ready (shown)' : 'Tables ready', fmtWholeNumber(maintenance.tables_ready || 0), `${fmtWholeNumber(maintenance.active_runs || 0)} maintenance run(s) active`)}
     </div>
 
     ${inventoryNotice ? `<div class="mx-5 mt-4 rounded-[16px] border px-4 py-3 text-sm ${inventoryTone} sm:mx-6">${escapeHtml(inventoryNotice)}</div>` : ''}
 
     <div class="px-5 pb-5 pt-4 sm:px-6 sm:pb-6">
       <div class="mb-3 flex flex-wrap items-center justify-between gap-2">
-        <div class="text-xs text-slate-500">Rows ${fmtWholeNumber(visibleStart)}–${fmtWholeNumber(visibleEnd)} of ${fmtWholeNumber(tables.length)}</div>
+        <div class="text-xs text-slate-500">Rows ${fmtWholeNumber(visibleStart)}–${fmtWholeNumber(visibleEnd)} of ${fmtWholeNumber(tables.length)}${listLimited ? ` shown (${fmtWholeNumber(totalTables)} total)` : ''}</div>
         ${pagination}
       </div>
       <div class="overflow-hidden rounded-[16px] border border-slate-200">

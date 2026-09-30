@@ -12,6 +12,14 @@ import (
 // state rather than worker process memory.
 type IcebergMaintenanceOwnerSummary struct {
 	Tables             int        `json:"tables"`
+	InventoriedTables  int        `json:"inventoried_tables"`
+	InventoryErrors    int        `json:"inventory_errors"`
+	LatestInventoryAt  *time.Time `json:"latest_inventory_at,omitempty"`
+	ActiveDataFiles    int        `json:"active_data_files"`
+	ActiveSmallFiles   int        `json:"active_small_files"`
+	ActiveSmallBytes   int64      `json:"active_small_bytes"`
+	EqualityDeletes    int        `json:"active_equality_delete_files"`
+	PositionDeletes    int        `json:"active_position_delete_files"`
 	Blocked            int        `json:"snapshot_blocked"`
 	QueuedTasks        int        `json:"queued_tasks"`
 	RetryTasks         int        `json:"retry_tasks"`
@@ -30,6 +38,8 @@ func (s *IcebergMaintenanceStore) ListStatesForOwner(ctx context.Context, ownerJ
 	if limit <= 0 || limit > 5000 {
 		limit = 5000
 	}
+	// Prioritize current errors when the owner has more tables than the detail
+	// response limit. Aggregate counts below still cover all tables.
 	rows, err := s.db.QueryContext(ctx, `SELECT table_key, catalog, namespace_name, table_name, owner_type, owner_job_id,
 	 snapshot_complete, last_snapshot_id, inventory_snapshot_id, last_inventory_at, last_write_at, new_data_files, new_equality_delete_files,
 	 active_data_files, active_small_files, active_small_bytes, active_equality_delete_files,
@@ -39,7 +49,7 @@ func (s *IcebergMaintenanceStore) ListStatesForOwner(ctx context.Context, ownerJ
 	 attempt_count, last_error, created_at, updated_at
 	FROM iceberg_maintenance_state
 	WHERE owner_job_id=?
-	ORDER BY namespace_name, table_name
+	ORDER BY (last_error IS NOT NULL AND last_error<>'') DESC, namespace_name, table_name
 	LIMIT ?`, ownerJobID, limit)
 	if err != nil {
 		return nil, err
@@ -64,9 +74,26 @@ func (s *IcebergMaintenanceStore) SummaryForOwner(ctx context.Context, ownerJobI
 		return out, nil
 	}
 
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(snapshot_complete=0),0)
-	FROM iceberg_maintenance_state WHERE owner_job_id=?`, ownerJobID).Scan(&out.Tables, &out.Blocked); err != nil {
+	var latestInventory sql.NullTime
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*),
+	 COALESCE(SUM(last_inventory_at IS NOT NULL),0),
+	 COALESCE(SUM(last_error IS NOT NULL AND last_error<>''),0),
+	 COALESCE(SUM(snapshot_complete=0),0),
+	 MAX(last_inventory_at),
+	 COALESCE(SUM(active_data_files),0),
+	 COALESCE(SUM(active_small_files),0),
+	 COALESCE(SUM(active_small_bytes),0),
+	 COALESCE(SUM(active_equality_delete_files),0),
+	 COALESCE(SUM(active_position_delete_files),0)
+	FROM iceberg_maintenance_state WHERE owner_job_id=?`, ownerJobID).Scan(
+		&out.Tables, &out.InventoriedTables, &out.InventoryErrors, &out.Blocked, &latestInventory,
+		&out.ActiveDataFiles, &out.ActiveSmallFiles, &out.ActiveSmallBytes,
+		&out.EqualityDeletes, &out.PositionDeletes,
+	); err != nil {
 		return out, err
+	}
+	if latestInventory.Valid {
+		out.LatestInventoryAt = &latestInventory.Time
 	}
 
 	var oldest sql.NullTime
