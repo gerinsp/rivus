@@ -170,6 +170,40 @@ func TestCatalogInitializationErrorReportsUnauthorizedEmptyResponse(t *testing.T
 	}
 }
 
+func TestCatalogInitializationRetriesTransientFailure(t *testing.T) {
+	attempts := 0
+	cat, err := retryCatalogInitialization(context.Background(), config.IcebergConfig{}, func(context.Context, config.IcebergConfig) (icecatalog.Catalog, error) {
+		attempts++
+		if attempts < 3 {
+			return nil, context.DeadlineExceeded
+		}
+		return nil, nil
+	})
+	if err != nil {
+		t.Fatalf("retryCatalogInitialization returned error: %v", err)
+	}
+	if cat != nil {
+		t.Fatalf("catalog = %#v, want nil test catalog", cat)
+	}
+	if attempts != 3 {
+		t.Fatalf("attempts = %d, want 3", attempts)
+	}
+}
+
+func TestCatalogInitializationDoesNotRetryUnauthorized(t *testing.T) {
+	attempts := 0
+	_, err := retryCatalogInitialization(context.Background(), config.IcebergConfig{}, func(context.Context, config.IcebergConfig) (icecatalog.Catalog, error) {
+		attempts++
+		return nil, icerest.ErrUnauthorized
+	})
+	if !errors.Is(err, icerest.ErrUnauthorized) {
+		t.Fatalf("error = %v, want unauthorized", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", attempts)
+	}
+}
+
 func TestStateOperationErrorIdentifiesCatalogAndTarget(t *testing.T) {
 	sink := &Sink{cfg: config.IcebergConfig{Warehouse: "scraping"}}
 	state := &tableState{

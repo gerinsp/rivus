@@ -38,6 +38,8 @@ import (
 const (
 	defaultIcebergRESTURI     = "http://gravitino:9001/iceberg"
 	defaultIcebergCatalogName = "raw"
+	catalogInitTimeout        = time.Minute
+	catalogInitAttemptTimeout = 15 * time.Second
 )
 
 type Sink struct {
@@ -263,9 +265,9 @@ func NewSink(jobID, stateKey, jobName string, cfg config.IcebergConfig, retry co
 
 	// Catalog setup performs network discovery. Bound it so an unreachable REST
 	// endpoint fails the job instead of occupying a snapshot slot indefinitely.
-	catalogCtx, cancelCatalog := context.WithTimeout(context.Background(), time.Minute)
+	catalogCtx, cancelCatalog := context.WithTimeout(context.Background(), catalogInitTimeout)
 	defer cancelCatalog()
-	cat, err := newCatalog(catalogCtx, cfg)
+	cat, err := newCatalogWithRetry(catalogCtx, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -634,6 +636,45 @@ func newCatalog(ctx context.Context, cfg config.IcebergConfig) (icecatalog.Catal
 	cat, err := icerest.NewCatalog(ctx, "rivus", uri, opts...)
 	if err != nil {
 		return nil, catalogInitializationError(uri, warehouse, err)
+	}
+	return cat, nil
+}
+
+type catalogOpener func(context.Context, config.IcebergConfig) (icecatalog.Catalog, error)
+
+func newCatalogWithRetry(ctx context.Context, cfg config.IcebergConfig) (icecatalog.Catalog, error) {
+	return retryCatalogInitialization(ctx, cfg, newCatalog)
+}
+
+func retryCatalogInitialization(ctx context.Context, cfg config.IcebergConfig, open catalogOpener) (icecatalog.Catalog, error) {
+	if open == nil {
+		return nil, errors.New("iceberg catalog opener is nil")
+	}
+
+	policy := config.RetryPolicy{
+		MaxAttempts: 3,
+		BaseBackoff: 500 * time.Millisecond,
+		MaxBackoff:  2 * time.Second,
+	}
+	var cat icecatalog.Catalog
+	attempt := 0
+	err := util.RetryWithBackoff(ctx, policy, func() error {
+		attempt++
+		attemptCtx, cancel := context.WithTimeout(ctx, catalogInitAttemptTimeout)
+		candidate, err := open(attemptCtx, cfg)
+		cancel()
+		if err == nil {
+			cat = candidate
+			return nil
+		}
+		if errors.Is(err, icerest.ErrUnauthorized) {
+			return util.Permanent(err)
+		}
+		log.Printf("[iceberg] catalog initialization attempt=%d failed: %v", attempt, err)
+		return err
+	})
+	if err != nil {
+		return nil, err
 	}
 	return cat, nil
 }

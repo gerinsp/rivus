@@ -168,7 +168,7 @@ func discoverMaintenanceMonitorTargets(ctx context.Context, iceCfg config.Iceber
 }
 
 func discoverMaintenanceMonitorTargetsFiltered(ctx context.Context, iceCfg config.IcebergConfig, selectors []config.IcebergTarget, excludedNamespace func(string) bool) ([]config.IcebergTarget, error) {
-	cat, err := newCatalog(ctx, iceCfg)
+	cat, err := newCatalogWithRetry(ctx, iceCfg)
 	if err != nil {
 		return nil, err
 	}
