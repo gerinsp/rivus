@@ -71,7 +71,8 @@ func (s *IcebergMaintenanceStore) ClaimPendingInventoryStateForMaintenance(
 	row := tx.QueryRowContext(ctx, `SELECT table_key, catalog, namespace_name, table_name, owner_type, owner_job_id,
 	 snapshot_complete, last_snapshot_id, inventory_snapshot_id, last_inventory_at, last_write_at, new_data_files, new_equality_delete_files,
 	 active_data_files, active_small_files, active_small_bytes, active_equality_delete_files,
-	 active_position_delete_files, next_compaction_check_at, next_expire_check_at, next_orphan_check_at,
+	 active_position_delete_files, active_compactable_files, active_compactable_bytes, active_compaction_groups,
+	 next_compaction_check_at, next_expire_check_at, next_orphan_check_at,
 	 last_compaction_at, last_expire_at, last_orphan_at, inventory_lease_owner, inventory_lease_until, lease_owner, lease_until,
 	 attempt_count, last_error, created_at, updated_at
 	FROM iceberg_maintenance_state

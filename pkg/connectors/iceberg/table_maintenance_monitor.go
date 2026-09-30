@@ -253,6 +253,9 @@ func (m *tableMaintenanceMonitor) publishDurableStatus(parent context.Context, s
 			ActivePositionDeleteFiles: state.ActivePositionDeleteFiles,
 			EligibleSmallFiles:        state.ActiveSmallFiles,
 			EligibleSmallBytes:        state.ActiveSmallBytes,
+			CompactableFiles:          state.ActiveCompactableFiles,
+			CompactableBytes:          state.ActiveCompactableBytes,
+			CompactionGroups:          state.ActiveCompactionGroups,
 			NewDataFiles:              state.NewDataFiles,
 			NewEqualityDeleteFiles:    state.NewEqualityDeleteFiles,
 			CheckedAt:                 checkedAt,
@@ -354,12 +357,16 @@ func DurableMaintenanceTableStateAt(state meta.IcebergMaintenanceState, cfg conf
 		smallMinBytes = defaultNativeMinSmallBytes
 	}
 
-	dataReady := state.ActiveSmallFiles >= dataThreshold
+	dataPressure := state.ActiveSmallFiles >= dataThreshold
+	dataReady := dataPressure && state.ActiveCompactionGroups > 0
 	deleteReady := state.ActiveEqualityDeleteFiles >= deleteThreshold
 	positionDeleteReady := state.ActivePositionDeleteFiles >= positionDeleteThreshold
-	smallBytesReady := state.ActiveSmallFiles >= smallMinCount && state.ActiveSmallBytes >= smallMinBytes
+	smallBytesReady := state.ActiveCompactableFiles >= smallMinCount && state.ActiveCompactableBytes >= smallMinBytes
 	if dataReady || deleteReady || positionDeleteReady || smallBytesReady {
 		return "ready"
+	}
+	if dataPressure && state.ActiveCompactionGroups == 0 {
+		return "partitioned"
 	}
 	return "healthy"
 }

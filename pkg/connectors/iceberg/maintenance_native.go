@@ -86,12 +86,15 @@ type nativeTaskOutcome struct {
 }
 
 type activeFileInventory struct {
-	SnapshotID      int64
-	DataFiles       int
-	SmallFiles      int
-	SmallBytes      int64
-	EqualityDeletes int
-	PositionDeletes int
+	SnapshotID       int64
+	DataFiles        int
+	SmallFiles       int
+	SmallBytes       int64
+	EqualityDeletes  int
+	PositionDeletes  int
+	CompactableFiles int
+	CompactableBytes int64
+	CompactionGroups int
 }
 
 type compactionWorkload struct {
@@ -184,7 +187,7 @@ func executeNativeMaintenanceTask(
 		result.Error = err.Error()
 		return finish(nativeTaskOutcome{Result: result})
 	}
-	cat, err := newCatalog(setupCtx, iceCfg)
+	cat, err := newCatalogWithRetry(setupCtx, iceCfg)
 	if err != nil {
 		setupCancel()
 		result.Error = err.Error()
@@ -208,7 +211,7 @@ func executeNativeMaintenanceTask(
 		return finish(nativeTaskOutcome{Result: result, Retryable: true})
 	}
 	if task.Operation == "compact" {
-		inventory, inventoryErr := scanActiveFileInventory(setupCtx, tbl, settings.SmallFileSizeBytes)
+		inventory, inventoryErr := scanActiveFileInventory(setupCtx, tbl, settings)
 		if inventoryErr != nil {
 			setupCancel()
 			result.Error = fmt.Sprintf("scan active file inventory: %v", inventoryErr)
@@ -244,7 +247,7 @@ func executeNativeMaintenanceTask(
 	if task.Operation == "compact" && outcome.Result.Status == "succeeded" {
 		refreshCtx, refreshCancel := context.WithTimeout(ctx, settings.Timeout)
 		if refreshedTable, err := loadNativeMaintenanceTable(refreshCtx, iceCfg, state); err == nil {
-			if inventory, inventoryErr := scanActiveFileInventory(refreshCtx, refreshedTable, settings.SmallFileSizeBytes); inventoryErr == nil {
+			if inventory, inventoryErr := scanActiveFileInventory(refreshCtx, refreshedTable, settings); inventoryErr == nil {
 				if saveErr := saveActiveFileInventory(refreshCtx, store, state.TableKey, inventory); saveErr != nil {
 					addInventoryWarning(&outcome.Result, saveErr)
 				} else {
@@ -277,7 +280,7 @@ func executeAfterMaintenanceSetup(setupCancel context.CancelFunc, execute func()
 }
 
 func loadNativeMaintenanceTable(ctx context.Context, iceCfg config.IcebergConfig, state meta.IcebergMaintenanceState) (*icetable.Table, error) {
-	cat, err := newCatalog(ctx, iceCfg)
+	cat, err := newCatalogWithRetry(ctx, iceCfg)
 	if err != nil {
 		return nil, fmt.Errorf("create catalog: %w", err)
 	}
@@ -293,7 +296,7 @@ func refreshPendingInventory(ctx context.Context, store *meta.IcebergMaintenance
 	if err != nil {
 		return err
 	}
-	cat, err := newCatalog(ctx, iceCfg)
+	cat, err := newCatalogWithRetry(ctx, iceCfg)
 	if err != nil {
 		return err
 	}
@@ -304,7 +307,7 @@ func refreshPendingInventory(ctx context.Context, store *meta.IcebergMaintenance
 		}
 		return fmt.Errorf("load table: %w", err)
 	}
-	inventory, err := scanActiveFileInventory(ctx, tbl, settings.SmallFileSizeBytes)
+	inventory, err := scanActiveFileInventory(ctx, tbl, settings)
 	if err != nil {
 		return err
 	}
@@ -319,7 +322,7 @@ func refreshPendingInventory(ctx context.Context, store *meta.IcebergMaintenance
 	return store.ScheduleCompactionCheck(ctx, state.TableKey, now, compactionTaskPriority(observed, settings, now))
 }
 
-func scanActiveFileInventory(ctx context.Context, tbl *icetable.Table, smallFileSizeBytes int64) (activeFileInventory, error) {
+func scanActiveFileInventory(ctx context.Context, tbl *icetable.Table, settings nativeMaintenanceSettings) (activeFileInventory, error) {
 	var inventory activeFileInventory
 	if tbl == nil || tbl.CurrentSnapshot() == nil {
 		return inventory, nil
@@ -333,6 +336,7 @@ func scanActiveFileInventory(ctx context.Context, tbl *icetable.Table, smallFile
 	if err != nil {
 		return inventory, fmt.Errorf("read current manifest list: %w", err)
 	}
+	dataTasks := make([]icetable.FileScanTask, 0)
 	for _, manifest := range manifests {
 		if err := ctx.Err(); err != nil {
 			return inventory, err
@@ -344,10 +348,43 @@ func scanActiveFileInventory(ctx context.Context, tbl *icetable.Table, smallFile
 			if entry == nil || entry.DataFile() == nil {
 				continue
 			}
-			accumulateActiveFile(&inventory, entry.DataFile(), smallFileSizeBytes)
+			file := entry.DataFile()
+			accumulateActiveFile(&inventory, file, settings.SmallFileSizeBytes)
+			if file.ContentType() == iceberglib.EntryContentData {
+				dataTasks = append(dataTasks, icetable.FileScanTask{File: file, Length: file.FileSizeBytes()})
+			}
 		}
 	}
+	if err := addCompactableInventory(&inventory, dataTasks, settings); err != nil {
+		return inventory, err
+	}
 	return inventory, nil
+}
+
+// addCompactableInventory records only files that the real Iceberg planner can
+// rewrite together. Global small-file counts are not sufficient for
+// partitioned tables: ten files in ten different partitions form zero legal
+// compaction groups.
+func addCompactableInventory(inventory *activeFileInventory, tasks []icetable.FileScanTask, settings nativeMaintenanceSettings) error {
+	if inventory == nil || len(tasks) == 0 {
+		return nil
+	}
+	cfg := compaction.DefaultConfig()
+	cfg.TargetFileSizeBytes = settings.TargetFileSizeBytes
+	cfg.MinFileSizeBytes = settings.SmallFileSizeBytes
+	cfg.MaxFileSizeBytes = maxInt64(settings.TargetFileSizeBytes*9/5, settings.SmallFileSizeBytes+1)
+	cfg.MinInputFiles = uint(settings.MinSmallFiles)
+	cfg.DeleteFileThreshold = 1
+	plan, err := cfg.PlanCompaction(tasks)
+	if err != nil {
+		return fmt.Errorf("plan compactable inventory: %w", err)
+	}
+	for _, group := range plan.Groups {
+		inventory.CompactionGroups++
+		inventory.CompactableFiles += len(group.Tasks)
+		inventory.CompactableBytes += group.TotalSizeBytes
+	}
+	return nil
 }
 
 func accumulateActiveFile(inventory *activeFileInventory, file iceberglib.DataFile, smallFileSizeBytes int64) {
@@ -370,7 +407,8 @@ func accumulateActiveFile(inventory *activeFileInventory, file iceberglib.DataFi
 
 func saveActiveFileInventory(ctx context.Context, store *meta.IcebergMaintenanceStore, tableKey string, inventory activeFileInventory) error {
 	return store.UpdateInventory(ctx, tableKey, inventory.SnapshotID, inventory.DataFiles, inventory.SmallFiles,
-		inventory.SmallBytes, inventory.EqualityDeletes, inventory.PositionDeletes)
+		inventory.SmallBytes, inventory.EqualityDeletes, inventory.PositionDeletes,
+		inventory.CompactableFiles, inventory.CompactableBytes, inventory.CompactionGroups)
 }
 
 func inventoryTriggersCompaction(inventory activeFileInventory, settings nativeMaintenanceSettings) bool {
@@ -379,14 +417,17 @@ func inventoryTriggersCompaction(inventory activeFileInventory, settings nativeM
 		ActiveSmallBytes:          inventory.SmallBytes,
 		ActiveEqualityDeleteFiles: inventory.EqualityDeletes,
 		ActivePositionDeleteFiles: inventory.PositionDeletes,
+		ActiveCompactableFiles:    inventory.CompactableFiles,
+		ActiveCompactableBytes:    inventory.CompactableBytes,
+		ActiveCompactionGroups:    inventory.CompactionGroups,
 	}, settings).Any()
 }
 
 func compactionTriggersFor(state meta.IcebergMaintenanceState, settings nativeMaintenanceSettings) compactionTriggers {
 	return compactionTriggers{
-		SmallFileCount: settings.DataFilesThreshold > 0 && state.ActiveSmallFiles >= settings.DataFilesThreshold,
+		SmallFileCount: settings.DataFilesThreshold > 0 && state.ActiveSmallFiles >= settings.DataFilesThreshold && state.ActiveCompactionGroups > 0,
 		SmallFileBytes: settings.MinSmallFiles > 0 && settings.MinSmallBytes > 0 &&
-			state.ActiveSmallFiles >= settings.MinSmallFiles && state.ActiveSmallBytes >= settings.MinSmallBytes,
+			state.ActiveCompactableFiles >= settings.MinSmallFiles && state.ActiveCompactableBytes >= settings.MinSmallBytes,
 		EqualityDelete: settings.EqualityDeleteThreshold > 0 && state.ActiveEqualityDeleteFiles >= settings.EqualityDeleteThreshold,
 		// Trino snapshot replacement intentionally leaves a small number of
 		// position-delete files while it replaces the recent history window.

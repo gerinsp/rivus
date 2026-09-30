@@ -32,6 +32,7 @@ function maintenanceStateLabel(state) {
     running: 'Maintenance running',
     inventory_pending: 'Waiting for inventory scan',
     stale: 'Inventory stale',
+    partitioned: 'No compactable group',
     healthy: 'Healthy',
     paused: 'Paused',
     error: 'Inventory error',
@@ -50,6 +51,8 @@ function maintenanceStateClass(state) {
       return 'border-amber-200 bg-amber-50 text-amber-700';
     case 'ready':
       return 'border-amber-200 bg-amber-50 text-amber-700';
+    case 'partitioned':
+      return 'border-slate-200 bg-slate-50 text-slate-600';
     case 'paused':
       return 'border-violet-200 bg-violet-50 text-violet-700';
     case 'error':
@@ -154,7 +157,7 @@ export function renderIcebergMaintenance(job, options = {}) {
   const state = String(maintenance.state || 'watching');
   const paused = state.toLowerCase() === 'paused' || maintenance.paused === true;
   const tables = Array.isArray(maintenance.tables) ? [...maintenance.tables] : [];
-  const stateOrder = { running: 0, ready: 1, error: 2, stale: 3, accumulating: 4, scanning: 5, inventory_pending: 6, waiting_for_snapshot: 7, healthy: 8 };
+  const stateOrder = { running: 0, ready: 1, error: 2, stale: 3, accumulating: 4, scanning: 5, inventory_pending: 6, waiting_for_snapshot: 7, partitioned: 8, healthy: 9 };
   tables.sort((left, right) => {
     const stateDelta = (stateOrder[left?.state] ?? 9) - (stateOrder[right?.state] ?? 9);
     if (stateDelta !== 0) return stateDelta;
@@ -193,6 +196,8 @@ export function renderIcebergMaintenance(job, options = {}) {
       ? '<div class="mt-1 text-[11px] text-rose-600">Needs retry</div>'
       : String(table?.state || '').toLowerCase() === 'stale'
         ? '<div class="mt-1 text-[11px] text-amber-700">Refresh required</div>'
+        : String(table?.state || '').toLowerCase() === 'partitioned'
+          ? '<div class="mt-1 text-[11px] text-slate-500">Small files are split across partitions</div>'
         : '';
     return `
       <tr class="border-b border-slate-100 align-top last:border-0">
@@ -208,7 +213,7 @@ export function renderIcebergMaintenance(job, options = {}) {
         <td class="mono px-4 py-3 text-right text-xs font-semibold text-slate-800">${fmtWholeNumber(table?.active_equality_delete_files || 0)}</td>
         <td class="mono px-4 py-3 text-right text-xs font-semibold text-slate-800">${fmtWholeNumber(table?.active_position_delete_files || 0)}</td>
         <td class="px-4 py-3 text-xs text-slate-600">
-          <div>Small: <span class="mono font-semibold text-slate-800">${fmtWholeNumber(table?.eligible_small_files || 0)} / ${fmtWholeNumber(dataThreshold)}</span></div>
+          <div>Small: <span class="mono font-semibold text-slate-800">${fmtWholeNumber(table?.eligible_small_files || 0)} / ${fmtWholeNumber(dataThreshold)}</span> <span class="text-slate-400">·</span> ${fmtWholeNumber(table?.compactable_files || 0)} compactable</div>
           <div class="mt-1">Equality: <span class="mono font-semibold text-slate-800">${fmtWholeNumber(table?.active_equality_delete_files || 0)} / ${fmtWholeNumber(deleteThreshold)}</span></div>
           <div class="mt-1">Position: <span class="mono font-semibold text-slate-800">${fmtWholeNumber(table?.active_position_delete_files || 0)} / ${fmtWholeNumber(positionDeleteThreshold)}</span></div>
         </td>

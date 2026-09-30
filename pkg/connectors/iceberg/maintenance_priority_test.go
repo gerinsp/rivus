@@ -46,7 +46,7 @@ func TestProactiveCompactionFollowsFastGrowth(t *testing.T) {
 		NewDataFiles: 40,
 		CreatedAt:    now.Add(-30 * time.Minute),
 	}
-	inventory := activeFileInventory{DataFiles: 40, SmallFiles: 40}
+	inventory := activeFileInventory{DataFiles: 40, SmallFiles: 40, CompactableFiles: 40, CompactableBytes: 40, CompactionGroups: 1}
 
 	if !proactiveCompactionDue(inventory, state, settings, now) {
 		t.Fatal("fast-growing table should be scheduled before reaching its hard threshold")
@@ -66,7 +66,7 @@ func TestProactiveCompactionDoesNotChaseSlowGrowth(t *testing.T) {
 		NewDataFiles: 10,
 		CreatedAt:    now.Add(-10 * time.Hour),
 	}
-	inventory := activeFileInventory{DataFiles: 40, SmallFiles: 40}
+	inventory := activeFileInventory{DataFiles: 40, SmallFiles: 40, CompactableFiles: 40, CompactableBytes: 40, CompactionGroups: 1}
 
 	if proactiveCompactionDue(inventory, state, settings, now) {
 		t.Fatal("slow-growing table should remain on the normal maintenance schedule")
@@ -80,14 +80,14 @@ func TestFollowUpCompactionContinuesUntilBacklogIsHealthy(t *testing.T) {
 	state := meta.IcebergMaintenanceState{CreatedAt: now.Add(-time.Hour)}
 
 	followUp, priority := followUpCompactionForInventory(activeFileInventory{
-		DataFiles: 5000, SmallFiles: 5000,
+		DataFiles: 5000, SmallFiles: 5000, CompactableFiles: 5000, CompactableBytes: 5000, CompactionGroups: 20,
 	}, state, settings, now)
 	if !followUp || priority != 1 {
 		t.Fatalf("severe remaining backlog follow-up = (%v, %d), want (true, 1)", followUp, priority)
 	}
 
 	followUp, priority = followUpCompactionForInventory(activeFileInventory{
-		DataFiles: 20, SmallFiles: 20,
+		DataFiles: 20, SmallFiles: 20, CompactableFiles: 20, CompactableBytes: 20, CompactionGroups: 1,
 	}, state, settings, now)
 	if followUp || priority != 0 {
 		t.Fatalf("healthy inventory follow-up = (%v, %d), want (false, 0)", followUp, priority)

@@ -63,6 +63,8 @@ func scanPriorityInventoryBatchBounded(
 	}
 
 	var wg sync.WaitGroup
+	var errMu sync.Mutex
+	var firstErr error
 	for _, item := range claimed {
 		item := item
 		wg.Add(1)
@@ -70,9 +72,14 @@ func scanPriorityInventoryBatchBounded(
 			defer wg.Done()
 			if err := scanClaimedInventory(ctx, store, jobStore, jobs, opts, now, item.state); err != nil {
 				log.Printf("[maintenance-worker %s] priority inventory table=%s error: %v", opts.WorkerID, item.state.TableKey, err)
+				errMu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				errMu.Unlock()
 			}
 		}()
 	}
 	wg.Wait()
-	return len(claimed), nil
+	return len(claimed), firstErr
 }

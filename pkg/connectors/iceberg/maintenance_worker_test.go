@@ -2,10 +2,12 @@ package iceberg
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
 	iceberg "github.com/apache/iceberg-go"
+	icetable "github.com/apache/iceberg-go/table"
 	"github.com/gerinsp/rivus/pkg/config"
 	"github.com/gerinsp/rivus/pkg/meta"
 )
@@ -363,8 +365,10 @@ func TestCompactionTriggersFor(t *testing.T) {
 		{
 			name: "200 active small files trigger below byte floor",
 			state: meta.IcebergMaintenanceState{
-				ActiveSmallFiles: 200,
-				ActiveSmallBytes: 14 * megabyte,
+				ActiveSmallFiles:       200,
+				ActiveSmallBytes:       14 * megabyte,
+				ActiveCompactableFiles: 20,
+				ActiveCompactionGroups: 1,
 			},
 			want: compactionTriggers{SmallFileCount: true},
 		},
@@ -387,8 +391,11 @@ func TestCompactionTriggersFor(t *testing.T) {
 		{
 			name: "10 small files trigger at byte floor",
 			state: meta.IcebergMaintenanceState{
-				ActiveSmallFiles: 10,
-				ActiveSmallBytes: 256 * megabyte,
+				ActiveSmallFiles:       10,
+				ActiveSmallBytes:       256 * megabyte,
+				ActiveCompactableFiles: 10,
+				ActiveCompactableBytes: 256 * megabyte,
+				ActiveCompactionGroups: 1,
 			},
 			want: compactionTriggers{SmallFileBytes: true},
 		},
@@ -414,12 +421,23 @@ func TestDurableMaintenanceTableStateUsesSmallFileAndDeleteTriggers(t *testing.T
 	}
 
 	if got := durableMaintenanceTableState(meta.IcebergMaintenanceState{
-		SnapshotComplete: true,
-		LastInventoryAt:  &now,
-		ActiveSmallFiles: 200,
-		ActiveSmallBytes: 14 * 1024 * 1024,
+		SnapshotComplete:       true,
+		LastInventoryAt:        &now,
+		ActiveSmallFiles:       200,
+		ActiveSmallBytes:       14 * 1024 * 1024,
+		ActiveCompactableFiles: 20,
+		ActiveCompactionGroups: 1,
 	}, cfg); got != "ready" {
 		t.Fatalf("200 small files below 256 MiB state=%q, want ready", got)
+	}
+	if got := durableMaintenanceTableState(meta.IcebergMaintenanceState{
+		SnapshotComplete:       true,
+		LastInventoryAt:        &now,
+		ActiveSmallFiles:       636,
+		ActiveSmallBytes:       6 * 1024 * 1024,
+		ActiveCompactionGroups: 0,
+	}, cfg); got != "partitioned" {
+		t.Fatalf("636 files split across partitions state=%q, want partitioned", got)
 	}
 	if got := durableMaintenanceTableState(meta.IcebergMaintenanceState{
 		SnapshotComplete:          true,
@@ -441,6 +459,68 @@ func TestDurableMaintenanceTableStateUsesSmallFileAndDeleteTriggers(t *testing.T
 		ActivePositionDeleteFiles: 24,
 	}, cfg); got != "healthy" {
 		t.Fatalf("24 position deletes state=%q, want healthy", got)
+	}
+}
+
+func TestCompactableInventoryRespectsPartitionBoundaries(t *testing.T) {
+	const fileSize = int64(1024 * 1024)
+	settings := defaultNativeMaintenanceSettings()
+	settings.MinSmallFiles = 10
+	settings.SmallFileSizeBytes = 64 * 1024 * 1024
+	settings.TargetFileSizeBytes = 128 * 1024 * 1024
+
+	spec := iceberg.NewPartitionSpecID(1, iceberg.PartitionField{
+		SourceIDs: []int{1},
+		FieldID:   1000,
+		Name:      "date",
+		Transform: iceberg.IdentityTransform{},
+	})
+	makeTask := func(path, partition string) icetable.FileScanTask {
+		builder, err := iceberg.NewDataFileBuilder(
+			spec,
+			iceberg.EntryContentData,
+			path,
+			iceberg.ParquetFile,
+			map[int]any{1000: partition},
+			map[int]string{},
+			map[int]int{},
+			1,
+			fileSize,
+		)
+		if err != nil {
+			t.Fatalf("build data file %s: %v", path, err)
+		}
+		return icetable.FileScanTask{File: builder.Build(), Length: fileSize}
+	}
+
+	uniquePartitions := make([]icetable.FileScanTask, 0, settings.MinSmallFiles)
+	for i := 0; i < settings.MinSmallFiles; i++ {
+		uniquePartitions = append(uniquePartitions, makeTask(
+			fmt.Sprintf("s3://bucket/unique-%d.parquet", i),
+			fmt.Sprintf("2026-09-%02d", i+1),
+		))
+	}
+	var split activeFileInventory
+	if err := addCompactableInventory(&split, uniquePartitions, settings); err != nil {
+		t.Fatalf("plan unique partitions: %v", err)
+	}
+	if split.CompactionGroups != 0 || split.CompactableFiles != 0 || split.CompactableBytes != 0 {
+		t.Fatalf("files in separate partitions must not form a compaction group: %#v", split)
+	}
+
+	samePartition := make([]icetable.FileScanTask, 0, settings.MinSmallFiles)
+	for i := 0; i < settings.MinSmallFiles; i++ {
+		samePartition = append(samePartition, makeTask(
+			fmt.Sprintf("s3://bucket/same-%d.parquet", i),
+			"2026-09-30",
+		))
+	}
+	var grouped activeFileInventory
+	if err := addCompactableInventory(&grouped, samePartition, settings); err != nil {
+		t.Fatalf("plan same partition: %v", err)
+	}
+	if grouped.CompactionGroups != 1 || grouped.CompactableFiles != settings.MinSmallFiles || grouped.CompactableBytes != int64(settings.MinSmallFiles)*fileSize {
+		t.Fatalf("files in the same partition must form one compaction group: %#v", grouped)
 	}
 }
 

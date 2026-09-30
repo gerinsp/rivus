@@ -68,6 +68,9 @@ func proactiveCompactionStateDue(state meta.IcebergMaintenanceState, settings na
 	if compactionTriggersFor(state, settings).Any() {
 		return true
 	}
+	if state.ActiveCompactionGroups == 0 {
+		return false
+	}
 	if state.ActiveSmallFiles < settings.MinSmallFiles {
 		return false
 	}
@@ -137,5 +140,8 @@ func stateWithActiveInventory(state meta.IcebergMaintenanceState, inventory acti
 	state.ActiveSmallBytes = inventory.SmallBytes
 	state.ActiveEqualityDeleteFiles = inventory.EqualityDeletes
 	state.ActivePositionDeleteFiles = inventory.PositionDeletes
+	state.ActiveCompactableFiles = inventory.CompactableFiles
+	state.ActiveCompactableBytes = inventory.CompactableBytes
+	state.ActiveCompactionGroups = inventory.CompactionGroups
 	return state
 }

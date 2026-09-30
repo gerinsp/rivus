@@ -49,6 +49,9 @@ type IcebergMaintenanceState struct {
 	ActiveSmallBytes          int64      `json:"active_small_bytes"`
 	ActiveEqualityDeleteFiles int        `json:"active_equality_delete_files"`
 	ActivePositionDeleteFiles int        `json:"active_position_delete_files"`
+	ActiveCompactableFiles    int        `json:"active_compactable_files"`
+	ActiveCompactableBytes    int64      `json:"active_compactable_bytes"`
+	ActiveCompactionGroups    int        `json:"active_compaction_groups"`
 	NextCompactionCheckAt     *time.Time `json:"next_compaction_check_at,omitempty"`
 	NextExpireCheckAt         *time.Time `json:"next_expire_check_at,omitempty"`
 	NextOrphanCheckAt         *time.Time `json:"next_orphan_check_at,omitempty"`
@@ -262,6 +265,9 @@ func (s *IcebergMaintenanceStore) Init(ctx context.Context) error {
 		  active_small_bytes BIGINT NOT NULL DEFAULT 0,
 		  active_equality_delete_files INT NOT NULL DEFAULT 0,
 		  active_position_delete_files INT NOT NULL DEFAULT 0,
+		  active_compactable_files INT NOT NULL DEFAULT 0,
+		  active_compactable_bytes BIGINT NOT NULL DEFAULT 0,
+		  active_compaction_groups INT NOT NULL DEFAULT 0,
 		  next_compaction_check_at DATETIME(6) NULL,
 		  next_expire_check_at DATETIME(6) NULL,
 		  next_orphan_check_at DATETIME(6) NULL,
@@ -382,6 +388,15 @@ func (s *IcebergMaintenanceStore) Init(ctx context.Context) error {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "iceberg_maintenance_state", "inventory_lease_until", "DATETIME(6) NULL AFTER inventory_lease_owner"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "iceberg_maintenance_state", "active_compactable_files", "INT NOT NULL DEFAULT 0 AFTER active_position_delete_files"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "iceberg_maintenance_state", "active_compactable_bytes", "BIGINT NOT NULL DEFAULT 0 AFTER active_compactable_files"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "iceberg_maintenance_state", "active_compaction_groups", "INT NOT NULL DEFAULT 0 AFTER active_compactable_bytes"); err != nil {
 		return err
 	}
 	if err := s.ensureIndex(ctx, "iceberg_maintenance_tasks", "idx_maintenance_task_owner_status", "(owner_job_id, status, created_at, id)"); err != nil {
@@ -602,7 +617,8 @@ func (s *IcebergMaintenanceStore) DueStates(ctx context.Context, operation strin
 	query := fmt.Sprintf(`SELECT table_key, catalog, namespace_name, table_name, owner_type, owner_job_id,
 	 snapshot_complete, last_snapshot_id, inventory_snapshot_id, last_inventory_at, last_write_at, new_data_files, new_equality_delete_files,
 	 active_data_files, active_small_files, active_small_bytes, active_equality_delete_files,
-	 active_position_delete_files, next_compaction_check_at, next_expire_check_at, next_orphan_check_at,
+	 active_position_delete_files, active_compactable_files, active_compactable_bytes, active_compaction_groups,
+	 next_compaction_check_at, next_expire_check_at, next_orphan_check_at,
 	 last_compaction_at, last_expire_at, last_orphan_at, inventory_lease_owner, inventory_lease_until, lease_owner, lease_until,
 	 attempt_count, last_error, created_at, updated_at
 	FROM iceberg_maintenance_state AS state
@@ -648,7 +664,8 @@ func (s *IcebergMaintenanceStore) ClaimPendingInventoryState(ctx context.Context
 	row := tx.QueryRowContext(ctx, `SELECT table_key, catalog, namespace_name, table_name, owner_type, owner_job_id,
 	 snapshot_complete, last_snapshot_id, inventory_snapshot_id, last_inventory_at, last_write_at, new_data_files, new_equality_delete_files,
 	 active_data_files, active_small_files, active_small_bytes, active_equality_delete_files,
-	 active_position_delete_files, next_compaction_check_at, next_expire_check_at, next_orphan_check_at,
+	 active_position_delete_files, active_compactable_files, active_compactable_bytes, active_compaction_groups,
+	 next_compaction_check_at, next_expire_check_at, next_orphan_check_at,
 	 last_compaction_at, last_expire_at, last_orphan_at, inventory_lease_owner, inventory_lease_until, lease_owner, lease_until,
 	 attempt_count, last_error, created_at, updated_at
 	FROM iceberg_maintenance_state
@@ -863,11 +880,22 @@ func (s *IcebergMaintenanceStore) FinishTask(ctx context.Context, taskID int64, 
 	return nil
 }
 
-func (s *IcebergMaintenanceStore) UpdateInventory(ctx context.Context, tableKey string, snapshotID int64, dataFiles, smallFiles int, smallBytes int64, equalityDeletes, positionDeletes int) error {
+func (s *IcebergMaintenanceStore) UpdateInventory(
+	ctx context.Context,
+	tableKey string,
+	snapshotID int64,
+	dataFiles, smallFiles int,
+	smallBytes int64,
+	equalityDeletes, positionDeletes, compactableFiles int,
+	compactableBytes int64,
+	compactionGroups int,
+) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE iceberg_maintenance_state SET
 	 inventory_snapshot_id=?, last_inventory_at=UTC_TIMESTAMP(6), active_data_files=?, active_small_files=?, active_small_bytes=?,
-	 active_equality_delete_files=?, active_position_delete_files=?, last_error=NULL, updated_at=UTC_TIMESTAMP(6)
-	WHERE table_key=?`, snapshotID, dataFiles, smallFiles, smallBytes, equalityDeletes, positionDeletes, tableKey)
+	 active_equality_delete_files=?, active_position_delete_files=?, active_compactable_files=?,
+	 active_compactable_bytes=?, active_compaction_groups=?, last_error=NULL, updated_at=UTC_TIMESTAMP(6)
+	WHERE table_key=?`, snapshotID, dataFiles, smallFiles, smallBytes, equalityDeletes, positionDeletes,
+		compactableFiles, compactableBytes, compactionGroups, tableKey)
 	return err
 }
 
@@ -908,7 +936,8 @@ func (s *IcebergMaintenanceStore) MarkInventoryMissing(ctx context.Context, tabl
 	_, err := s.db.ExecContext(ctx, `UPDATE iceberg_maintenance_state SET
 	 inventory_snapshot_id=0, last_inventory_at=UTC_TIMESTAMP(6), active_data_files=0,
 	 active_small_files=0, active_small_bytes=0, active_equality_delete_files=0,
-	 active_position_delete_files=0, last_error=NULL, updated_at=UTC_TIMESTAMP(6)
+	 active_position_delete_files=0, active_compactable_files=0, active_compactable_bytes=0,
+	 active_compaction_groups=0, last_error=NULL, updated_at=UTC_TIMESTAMP(6)
 	WHERE table_key=?`, tableKey)
 	return err
 }
@@ -1280,7 +1309,8 @@ func (s *IcebergMaintenanceStore) GetState(ctx context.Context, tableKey string)
 	row := s.db.QueryRowContext(ctx, `SELECT table_key, catalog, namespace_name, table_name, owner_type, owner_job_id,
 	 snapshot_complete, last_snapshot_id, inventory_snapshot_id, last_inventory_at, last_write_at, new_data_files, new_equality_delete_files,
 	 active_data_files, active_small_files, active_small_bytes, active_equality_delete_files,
-	 active_position_delete_files, next_compaction_check_at, next_expire_check_at, next_orphan_check_at,
+	 active_position_delete_files, active_compactable_files, active_compactable_bytes, active_compaction_groups,
+	 next_compaction_check_at, next_expire_check_at, next_orphan_check_at,
 	 last_compaction_at, last_expire_at, last_orphan_at, inventory_lease_owner, inventory_lease_until, lease_owner, lease_until,
 	 attempt_count, last_error, created_at, updated_at FROM iceberg_maintenance_state WHERE table_key=?`, tableKey)
 	state, err := scanMaintenanceState(row)
@@ -1305,7 +1335,8 @@ func scanMaintenanceState(row rowScanner) (IcebergMaintenanceState, error) {
 	err := row.Scan(&state.TableKey, &state.Catalog, &state.Namespace, &state.Table, &state.OwnerType, &state.OwnerJobID,
 		&snapshotComplete, &state.LastSnapshotID, &state.InventorySnapshotID, &lastInventory, &lastWrite, &state.NewDataFiles, &state.NewEqualityDeleteFiles,
 		&state.ActiveDataFiles, &state.ActiveSmallFiles, &state.ActiveSmallBytes, &state.ActiveEqualityDeleteFiles,
-		&state.ActivePositionDeleteFiles, &nextCompaction, &nextExpire, &nextOrphan,
+		&state.ActivePositionDeleteFiles, &state.ActiveCompactableFiles, &state.ActiveCompactableBytes, &state.ActiveCompactionGroups,
+		&nextCompaction, &nextExpire, &nextOrphan,
 		&lastCompaction, &lastExpire, &lastOrphan, &inventoryLeaseOwner, &inventoryLeaseUntil, &leaseOwner, &leaseUntil,
 		&state.AttemptCount, &lastError, &state.CreatedAt, &state.UpdatedAt)
 	if err != nil {

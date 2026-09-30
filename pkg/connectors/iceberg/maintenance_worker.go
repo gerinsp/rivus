@@ -584,18 +584,27 @@ func scanClaimedInventory(ctx context.Context, store *meta.IcebergMaintenanceSto
 	if err != nil {
 		message := fmt.Sprintf("load owner job configuration for inventory scan: %v", err)
 		_ = store.RecordStateError(ctx, state.TableKey, message)
-		return store.RetryInventoryClaim(ctx, state.TableKey, opts.WorkerID, now.Add(defaultInventoryRetryBackoff))
+		if retryErr := store.RetryInventoryClaim(ctx, state.TableKey, opts.WorkerID, now.Add(defaultInventoryRetryBackoff)); retryErr != nil {
+			return retryErr
+		}
+		return fmt.Errorf("%s", message)
 	}
 	if !ok || job.Job.Config == nil {
 		message := "owner job configuration is unavailable for inventory scan"
 		_ = store.RecordStateError(ctx, state.TableKey, message)
-		return store.RetryInventoryClaim(ctx, state.TableKey, opts.WorkerID, now.Add(defaultInventoryRetryBackoff))
+		if retryErr := store.RetryInventoryClaim(ctx, state.TableKey, opts.WorkerID, now.Add(defaultInventoryRetryBackoff)); retryErr != nil {
+			return retryErr
+		}
+		return fmt.Errorf("%s", message)
 	}
 	stateConfig, err := maintenanceWorkerConfigForState(job.Job.Config, state)
 	if err != nil {
 		message := fmt.Sprintf("resolve catalog configuration for inventory scan: %v", err)
 		_ = store.RecordStateError(ctx, state.TableKey, message)
-		return store.RetryInventoryClaim(ctx, state.TableKey, opts.WorkerID, now.Add(defaultInventoryRetryBackoff))
+		if retryErr := store.RetryInventoryClaim(ctx, state.TableKey, opts.WorkerID, now.Add(defaultInventoryRetryBackoff)); retryErr != nil {
+			return retryErr
+		}
+		return fmt.Errorf("%s", message)
 	}
 
 	scanCtx, cancel := context.WithTimeout(ctx, job.Settings.Timeout)
@@ -606,7 +615,7 @@ func scanClaimedInventory(ctx context.Context, store *meta.IcebergMaintenanceSto
 		if retryErr := store.RetryInventoryClaim(ctx, state.TableKey, opts.WorkerID, now.Add(defaultInventoryRetryBackoff)); retryErr != nil {
 			return retryErr
 		}
-		return nil
+		return err
 	}
 	return store.FinishInventoryClaim(ctx, state.TableKey, opts.WorkerID, state.LastSnapshotID)
 }

@@ -85,6 +85,13 @@ func RunMaintenanceWorkerBounded(ctx context.Context, dsn string, opts Maintenan
 	queueAlerts := newMaintenanceQueueAlertManager(opts.WorkerID)
 	registry := &maintenanceWorkerRegistry{}
 	executorsStarted := false
+	inventoryBatchesPerCycle := intEnv("RIVUS_MAINTENANCE_INVENTORY_BATCHES_PER_CYCLE", 4)
+	if inventoryBatchesPerCycle < 1 {
+		inventoryBatchesPerCycle = 1
+	}
+	if inventoryBatchesPerCycle > 32 {
+		inventoryBatchesPerCycle = 32
+	}
 
 	log.Printf(
 		"[maintenance-worker %s] started queue=%t poll=%s lease=%s task_page=%d due_page=%d compact_concurrency=%d expire_concurrency=%d orphan_concurrency=%d",
@@ -133,37 +140,42 @@ func RunMaintenanceWorkerBounded(ctx context.Context, dsn string, opts Maintenan
 			}
 		}
 
-		for {
+		inventoryScanFailed := false
+		for batch := 0; batch < inventoryBatchesPerCycle; batch++ {
 			claimed, err := scanPriorityInventoryBatchBounded(workerCtx, store, jobStore, jobs, opts, now, 100, interactiveInventoryBatchSize)
 			if err != nil {
 				if workerCtx.Err() != nil {
 					return nil
 				}
 				log.Printf("[maintenance-worker %s] interactive inventory scan error: %v", opts.WorkerID, err)
+				inventoryScanFailed = true
 				break
 			}
 			if claimed == 0 {
 				break
 			}
 		}
-		for {
+		for batch := 0; !inventoryScanFailed && batch < inventoryBatchesPerCycle; batch++ {
 			claimed, err := scanPriorityInventoryBatchBounded(workerCtx, store, jobStore, jobs, opts, now, 1, interactiveInventoryBatchSize)
 			if err != nil {
 				if workerCtx.Err() != nil {
 					return nil
 				}
 				log.Printf("[maintenance-worker %s] commit inventory scan error: %v", opts.WorkerID, err)
+				inventoryScanFailed = true
 				break
 			}
 			if claimed == 0 {
 				break
 			}
 		}
-		if _, err := scanOnePendingInventoryBounded(workerCtx, store, jobStore, jobs, opts, now, 0); err != nil {
-			if workerCtx.Err() != nil {
-				return nil
+		if !inventoryScanFailed {
+			if _, err := scanOnePendingInventoryBounded(workerCtx, store, jobStore, jobs, opts, now, 0); err != nil {
+				if workerCtx.Err() != nil {
+					return nil
+				}
+				log.Printf("[maintenance-worker %s] pending inventory scan error: %v", opts.WorkerID, err)
 			}
-			log.Printf("[maintenance-worker %s] pending inventory scan error: %v", opts.WorkerID, err)
 		}
 
 		if err := enqueueDueMaintenance(workerCtx, store, jobs, now, opts.DuePageSize); err != nil {

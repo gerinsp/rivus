@@ -115,6 +115,9 @@ type TableMaintenanceTableStatus struct {
 	ActivePositionDeleteFiles int      `json:"active_position_delete_files"`
 	EligibleSmallFiles        int      `json:"eligible_small_files"`
 	EligibleSmallBytes        int64    `json:"eligible_small_bytes"`
+	CompactableFiles          int      `json:"compactable_files"`
+	CompactableBytes          int64    `json:"compactable_bytes"`
+	CompactionGroups          int      `json:"compaction_groups"`
 	NewDataFiles              int      `json:"new_data_files"`
 	NewEqualityDeleteFiles    int      `json:"new_equality_delete_files"`
 	CheckedAt                 string   `json:"checked_at,omitempty"`
