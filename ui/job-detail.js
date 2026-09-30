@@ -106,6 +106,7 @@ function renderGraphProgress(graph) {
   const completedTables = Number(progress.completed_tables);
   const totalTables = Number(progress.total_tables);
   const currentTableRows = Number(progress.current_table_rows);
+  const phase = String(progress.phase || '').trim().toLowerCase();
   const healthStatus = String(graph?.health_status || '').trim().toUpperCase();
   const shownStatus = healthStatus && healthStatus !== 'HEALTHY' ? healthStatus : (graph?.status || '-');
 
@@ -118,7 +119,7 @@ function renderGraphProgress(graph) {
   const rowsValue = Number.isFinite(currentTableRows) && currentTableRows >= 0
     ? fmtWholeNumber(currentTableRows)
     : '-';
-  const showSnapshotStats = !!currentTable || (Number.isFinite(totalTables) && totalTables > 0 && completedTables < totalTables);
+  const showSnapshotStats = phase === 'snapshot';
   const detailLower = detail.toLowerCase();
   const currentTableLower = currentTable.toLowerCase();
   const showDetail = !!detail && (
@@ -356,6 +357,7 @@ function compactGraphMetrics(node, limit = 3) {
 function shouldRenderNodeDetail(node, detail) {
   const value = String(detail || '').trim().toLowerCase();
   if (!value) return false;
+  if (graphStateKind(node?.state) === 'error') return true;
   const nodeType = String(node?.type || '').toLowerCase();
   if (nodeType === 'source') {
     return value.includes('waiting') || value.includes('flush') || value.includes('slower') || value.includes('blocked') || value.includes('failed') || value.includes('error');
