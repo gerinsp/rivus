@@ -100,9 +100,7 @@ function renderGraphProgress(graph) {
   const sinkDetail = String(progress.sink_detail || '').trim();
   const sinkRows = Number(progress.sink_rows);
   const checkpointPending = !!progress.checkpoint_pending;
-  const checkpointReason = String(progress.checkpoint_reason || '').trim();
   const checkpointPositionText = String(progress.checkpoint_position || '').trim();
-  const checkpointPendingTables = String(progress.checkpoint_pending_tables || '').trim();
   const currentTable = String(progress.current_table || '').trim();
   const currentTableIndex = Number(progress.current_table_index);
   const completedTables = Number(progress.completed_tables);
@@ -120,6 +118,7 @@ function renderGraphProgress(graph) {
   const rowsValue = Number.isFinite(currentTableRows) && currentTableRows >= 0
     ? fmtWholeNumber(currentTableRows)
     : '-';
+  const showSnapshotStats = !!currentTable || (Number.isFinite(totalTables) && totalTables > 0 && completedTables < totalTables);
   const detailLower = detail.toLowerCase();
   const currentTableLower = currentTable.toLowerCase();
   const showDetail = !!detail && (
@@ -150,14 +149,13 @@ function renderGraphProgress(graph) {
         </div>
       ` : ''}
       ${checkpointPending ? `
-        <div class="mt-3 rounded-[14px] border border-amber-200 bg-amber-50 px-4 py-3 text-sm leading-6 text-amber-900">
-          <div class="font-semibold">Checkpoint pending</div>
-          <div class="mt-1">Reason: <span class="mono">${escapeHtml(checkpointReason || 'pending_events')}</span>${checkpointPositionText ? ` | Position: <span class="mono">${escapeHtml(checkpointPositionText)}</span>` : ''}</div>
-          ${checkpointPendingTables ? `<div class="mono mt-1 text-xs text-amber-800 break-words">${escapeHtml(checkpointPendingTables)}</div>` : ''}
+        <div class="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 rounded-[14px] border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+          <span class="font-semibold">Checkpoint waiting for sink</span>
+          ${checkpointPositionText ? `<span class="mono text-xs text-amber-800">${escapeHtml(checkpointPositionText)}</span>` : ''}
         </div>
       ` : ''}
       ${renderGraphAlert(graph)}
-      <div class="mt-5 grid gap-3 sm:grid-cols-3">
+      ${showSnapshotStats ? `<div class="mt-5 grid gap-3 sm:grid-cols-3">
         <div class="rounded-[18px] border border-slate-200 bg-slate-50 px-4 py-3">
           <div class="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">Current Table</div>
           <div class="mono mt-2 text-xs font-semibold text-slate-800 break-all">${escapeHtml(currentTable || '-')}</div>
@@ -171,7 +169,7 @@ function renderGraphProgress(graph) {
           <div class="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">Rows on Current Table</div>
           <div class="mono mt-2 text-sm font-semibold text-slate-900">${escapeHtml(rowsValue)}</div>
         </div>
-      </div>
+      </div>` : ''}
     </div>
   `;
 }
@@ -260,7 +258,7 @@ function renderGraphNodeDetail(node, detail) {
       <div class="graph-node-detail-preview">${escapeHtml(preview)}</div>
       ${isLong ? `
         <details class="graph-node-detail-full mt-2">
-          <summary class="cursor-pointer text-xs font-semibold text-current">Full error</summary>
+          <summary class="cursor-pointer text-xs font-semibold text-current">Details</summary>
           <pre class="mono mt-2 max-h-56 overflow-auto whitespace-pre-wrap rounded-md border border-current/10 bg-white/80 p-3 text-xs leading-5">${escapeHtml(text)}</pre>
         </details>
       ` : ''}
@@ -365,7 +363,10 @@ function shouldRenderNodeDetail(node, detail) {
   if (nodeType === 'buffer') {
     return value.includes('waiting') || value.includes('drain') || value.includes('blocked') || value.includes('failed');
   }
-  return true;
+  if (nodeType === 'sink') {
+    return value.includes('blocked') || value.includes('failed') || value.includes('error');
+  }
+  return false;
 }
 
 function renderGraphNodeCard(node) {
