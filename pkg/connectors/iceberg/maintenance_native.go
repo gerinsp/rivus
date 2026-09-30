@@ -543,6 +543,11 @@ func executeHybridCompaction(
 		"max_native_input_files":           settings.MaxSelectedFiles,
 		"max_native_equality_delete_files": settings.MaxEqualityDeleteFiles,
 	}
+	if deleteOnlyCompactionHasNoApplicableDeletes(triggers, work) {
+		result.Status = "skipped"
+		result.RoutingReason = "delete threshold reached, but planner found no applicable delete files"
+		return nativeTaskOutcome{Result: result}
+	}
 
 	// The safety route is deliberately evaluated before the normal byte-based
 	// eligibility check. A table with 5,000 delete files must go to Spark even
@@ -678,6 +683,16 @@ func executeHybridCompaction(
 		result.Details["committed_snapshot_id"] = committed.CurrentSnapshot().SnapshotID
 	}
 	return nativeTaskOutcome{Result: result}
+}
+
+// A table-wide delete count can remain high even when none of those delete
+// files apply to the data files selected by the planner. Rewriting a single
+// unrelated data file would make no progress and immediately trigger another
+// compaction from the unchanged inventory.
+func deleteOnlyCompactionHasNoApplicableDeletes(triggers compactionTriggers, work compactionWorkload) bool {
+	return (triggers.EqualityDelete || triggers.PositionDelete) &&
+		!triggers.SmallFileCount && !triggers.SmallFileBytes &&
+		work.SelectedDeleteFiles == 0
 }
 
 func buildCompactionWorkload(plan compaction.Plan) compactionWorkload {

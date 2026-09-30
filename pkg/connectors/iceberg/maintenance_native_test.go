@@ -20,6 +20,49 @@ func TestCompactionReleasesSetupFilesystemContextBeforeExecution(t *testing.T) {
 	}
 }
 
+func TestDeleteOnlyCompactionRequiresApplicableDeleteFiles(t *testing.T) {
+	cases := []struct {
+		name     string
+		triggers compactionTriggers
+		work     compactionWorkload
+		wantSkip bool
+	}{
+		{
+			name:     "position deletes remain globally but planner selects none",
+			triggers: compactionTriggers{PositionDelete: true},
+			work:     compactionWorkload{SelectedDataFiles: 1},
+			wantSkip: true,
+		},
+		{
+			name:     "equality deletes remain globally but planner selects none",
+			triggers: compactionTriggers{EqualityDelete: true},
+			work:     compactionWorkload{SelectedDataFiles: 1},
+			wantSkip: true,
+		},
+		{
+			name:     "applicable position delete is selected",
+			triggers: compactionTriggers{PositionDelete: true},
+			work:     compactionWorkload{SelectedDataFiles: 1, SelectedDeleteFiles: 1, PositionDeletes: 1},
+		},
+		{
+			name:     "small files independently require compaction",
+			triggers: compactionTriggers{PositionDelete: true, SmallFileCount: true},
+			work:     compactionWorkload{SelectedDataFiles: 50},
+		},
+		{
+			name: "no delete trigger",
+			work: compactionWorkload{SelectedDataFiles: 1},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := deleteOnlyCompactionHasNoApplicableDeletes(tc.triggers, tc.work); got != tc.wantSkip {
+				t.Fatalf("skip=%v, want %v", got, tc.wantSkip)
+			}
+		})
+	}
+}
+
 func TestCleanupReleasesSetupContextBeforeExecution(t *testing.T) {
 	setupCtx, setupCancel := context.WithCancel(context.Background())
 	contextWasCancelled := false
