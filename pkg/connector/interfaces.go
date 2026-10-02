@@ -171,6 +171,12 @@ type SnapshotTableSkipper interface {
 	SkipSnapshotTables(tables []TableRef)
 }
 
+// SnapshotFilterProvider reports source tables whose initial snapshot reads
+// only a subset of rows. A full target reset is unsafe for those tables.
+type SnapshotFilterProvider interface {
+	HasSnapshotFilter(schema, table string) bool
+}
+
 type SnapshotPrimaryKeySkipper interface {
 	SkipSnapshotTableWithoutPrimaryKey(schema, table string, sourceSchema *model.TableSchema) bool
 }

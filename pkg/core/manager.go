@@ -236,6 +236,9 @@ func (m *JobManager) Submit(cfg *config.JobConfig) (*Job, error) {
 	if cfg.Mode == config.JobModeMaintenanceOnly {
 		return nil, errors.New("maintenance-only configs must be submitted through Maintenance Monitors")
 	}
+	if err := validateSnapshotOnlyCountResume(cfg); err != nil {
+		return nil, err
+	}
 
 	job := NewJob(cfg, m.reg)
 	m.mu.Lock()

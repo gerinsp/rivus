@@ -32,6 +32,24 @@ func TestSubmitRejectsMaintenanceOnlyMonitorConfig(t *testing.T) {
 	}
 }
 
+func TestSubmitRejectsSnapshotOnlyCountResumeOutsideSnapshotOnly(t *testing.T) {
+	for _, mode := range []config.JobMode{config.JobModeInitial, config.JobModeSnapshotHandoff} {
+		t.Run(string(mode), func(t *testing.T) {
+			manager := NewJobManager(connector.NewRegistry())
+			cfg := newTestJobConfig("count-resume-wrong-mode")
+			cfg.Mode = mode
+			cfg.Metadata = map[string]string{"snapshot_only_count_resume": "true"}
+
+			if _, err := manager.Submit(cfg); err == nil || !strings.Contains(err.Error(), "only supported for mode: snapshot-only") {
+				t.Fatalf("Submit() error = %v, want snapshot-only mode error", err)
+			}
+			if manager.HasJob(cfg.ID) {
+				t.Fatal("rejected config must not register a job")
+			}
+		})
+	}
+}
+
 func TestRestorePersistedJobsLoadsStoppedAndResumesRunning(t *testing.T) {
 	store := newMemoryJobStore()
 	store.jobs["job-running"] = meta.PersistedJob{
@@ -1640,7 +1658,7 @@ func TestPreflightSnapshotOnlyCountResumePerformsSafeFullReload(t *testing.T) {
 	}
 }
 
-func TestPreflightInitialCountResumePerformsSafeFullReload(t *testing.T) {
+func TestPreflightInitialCountResumeRejectsUnsafeConfig(t *testing.T) {
 	cfg := newTestJobConfig("job-initial-count-resume")
 	cfg.Mode = config.JobModeInitial
 	cfg.Metadata = map[string]string{"snapshot_only_count_resume": "true"}
@@ -1663,24 +1681,46 @@ func TestPreflightInitialCountResumePerformsSafeFullReload(t *testing.T) {
 		},
 	}
 
+	if err := job.preflight(context.Background(), src, sink, config.JobModeInitial); err == nil || !strings.Contains(err.Error(), "only supported for mode: snapshot-only") {
+		t.Fatalf("preflight error = %v, want snapshot-only mode error", err)
+	}
+	if len(sink.resetTargets) != 0 {
+		t.Fatalf("rejected config reset targets: %#v", sink.resetTargets)
+	}
+}
+
+func TestPreflightSnapshotOnlyCountResumeRejectsFilteredSource(t *testing.T) {
+	cfg := newTestJobConfig("job-filtered-count-resume")
+	cfg.Mode = config.JobModeSnapshotOnly
+	cfg.Metadata = map[string]string{"snapshot_only_count_resume": "true"}
+	job := NewJob(cfg, connector.NewRegistry())
+
+	src := &countResumeSource{
+		tables:   []connector.TableRef{{Schema: "app", Table: "tbl_reservasi"}},
+		filtered: map[string]bool{"app.tbl_reservasi": true},
+	}
+	sink := &countResumeSink{}
+	if err := job.preflight(context.Background(), src, sink, config.JobModeSnapshotOnly); err == nil || !strings.Contains(err.Error(), "snapshot filter") {
+		t.Fatalf("preflight error = %v, want snapshot filter safety error", err)
+	}
+	if len(sink.resetTargets) != 0 {
+		t.Fatalf("filtered source reset targets: %#v", sink.resetTargets)
+	}
+}
+
+func TestPreflightInitialFilteredSourceWithoutCountResumeDoesNotReset(t *testing.T) {
+	cfg := newTestJobConfig("job-initial-filtered")
+	job := NewJob(cfg, connector.NewRegistry())
+	src := &countResumeSource{
+		tables:   []connector.TableRef{{Schema: "app", Table: "tbl_reservasi"}},
+		filtered: map[string]bool{"app.tbl_reservasi": true},
+	}
+	sink := &countResumeSink{}
 	if err := job.preflight(context.Background(), src, sink, config.JobModeInitial); err != nil {
 		t.Fatalf("preflight returned error: %v", err)
 	}
-
-	if got := len(src.skipped); got != 0 {
-		t.Fatalf("skipped tables = %d, want 0", got)
-	}
-	if got := len(sink.resetTargets); got != 2 {
-		t.Fatalf("reset targets = %d, want 2", got)
-	}
-	reset := map[string]bool{}
-	for _, target := range sink.resetTargets {
-		reset[target] = true
-	}
-	for _, target := range []string{"target.matched", "target.partial"} {
-		if !reset[target] {
-			t.Fatalf("target %q was not reset: %#v", target, sink.resetTargets)
-		}
+	if len(sink.resetTargets) != 0 {
+		t.Fatalf("initial filtered source reset targets: %#v", sink.resetTargets)
 	}
 }
 
@@ -2265,7 +2305,12 @@ type countResumeSource struct {
 	tables       []connector.TableRef
 	schemas      map[string]*model.TableSchema
 	sourceCounts map[string]int64
+	filtered     map[string]bool
 	skipped      []connector.TableRef
+}
+
+func (s *countResumeSource) HasSnapshotFilter(schema, table string) bool {
+	return s.filtered[strings.ToLower(schema+"."+table)]
 }
 
 func (s *countResumeSource) Run(context.Context, chan<- model.Event) error {

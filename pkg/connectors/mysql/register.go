@@ -84,6 +84,10 @@ func (a *sourceAdapter) Tables() []connector.TableRef {
 	return cp
 }
 
+func (a *sourceAdapter) HasSnapshotFilter(schema, table string) bool {
+	return strings.TrimSpace(a.inner.snapshotFilterForTable(schema, table)) != ""
+}
+
 func (a *sourceAdapter) FetchSchema(ctx context.Context, schema, table string) (*model.TableSchema, error) {
 	return a.inner.FetchSchemaFor(ctx, schema, table)
 }

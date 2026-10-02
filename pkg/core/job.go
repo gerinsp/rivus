@@ -1326,6 +1326,9 @@ func (j *Job) pickSink() (typ string, cfg any) {
 // ---- preflight generic (capability-based) ----
 
 func (j *Job) preflight(ctx context.Context, src connector.Source, sink connector.Sink, mode config.JobMode) error {
+	if err := validateSnapshotOnlyCountResume(j.Config); err != nil {
+		return err
+	}
 	lister, hasLister := src.(connector.TableLister)
 	sp, hasSP := src.(connector.SchemaProvider)
 	tm, hasTM := sink.(connector.TableManager)
@@ -1334,7 +1337,7 @@ func (j *Job) preflight(ctx context.Context, src connector.Source, sink connecto
 	freshAuthoritativeSnapshot := hasAuthoritativeInitialSnapshot && authoritativeSink.RequiresInitialSnapshotReset() &&
 		(mode == config.JobModeInitial || mode == config.JobModeSnapshotHandoff)
 	safeSnapshotReload := freshAuthoritativeSnapshot ||
-		(snapshotCountResumeSupported(mode) && snapshotOnlyCountResumeEnabled(j.Config.Metadata))
+		(mode == config.JobModeSnapshotOnly && snapshotOnlyCountResumeEnabled(j.Config.Metadata))
 	pkSkipper, skipMissingPK := sink.(connector.SnapshotPrimaryKeySkipper)
 	skipMissingPK = mode == config.JobModeSnapshotOnly && skipMissingPK
 
@@ -1371,6 +1374,11 @@ func (j *Job) preflight(ctx context.Context, src connector.Source, sink connecto
 	reloadTargets := make(map[string]*snapshotReloadTarget)
 	skipTables := make([]connector.TableRef, 0)
 	for _, t := range lister.Tables() {
+		if safeSnapshotReload {
+			if filtered, ok := src.(connector.SnapshotFilterProvider); ok && filtered.HasSnapshotFilter(t.Schema, t.Table) {
+				return fmt.Errorf("full target reset is unsafe for source table %s.%s with a snapshot filter; disable the full reset or remove the source filter", t.Schema, t.Table)
+			}
+		}
 		fetchCtx, fetchCancel := context.WithTimeout(ctx, 45*time.Second)
 		schema, err := sp.FetchSchema(fetchCtx, t.Schema, t.Table)
 		fetchCancel()
@@ -1475,6 +1483,9 @@ func (j *Job) startWithMode(mode config.JobMode) (err error) {
 
 	if j.registry == nil {
 		err := fmt.Errorf("job registry is nil (JobManager must pass registry to NewJob)")
+		return j.failStart("system", err, nil)
+	}
+	if err := validateSnapshotOnlyCountResume(j.Config); err != nil {
 		return j.failStart("system", err, nil)
 	}
 
@@ -1678,8 +1689,14 @@ func snapshotOnlyCountResumeEnabled(metadata map[string]string) bool {
 	return metadataBool(metadata, "snapshot_only_count_resume")
 }
 
-func snapshotCountResumeSupported(mode config.JobMode) bool {
-	return mode == config.JobModeInitial || mode == config.JobModeSnapshotOnly || mode == config.JobModeSnapshotHandoff
+func validateSnapshotOnlyCountResume(cfg *config.JobConfig) error {
+	if cfg == nil || !snapshotOnlyCountResumeEnabled(cfg.Metadata) {
+		return nil
+	}
+	if normalizeMode(cfg.Mode) != config.JobModeSnapshotOnly {
+		return fmt.Errorf("metadata.snapshot_only_count_resume is only supported for mode: snapshot-only (got %s)", cfg.Mode)
+	}
+	return nil
 }
 
 func metadataBool(metadata map[string]string, key string) bool {

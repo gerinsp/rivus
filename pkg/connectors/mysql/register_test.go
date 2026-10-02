@@ -1,6 +1,24 @@
 package mysql
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/gerinsp/rivus/pkg/config"
+)
+
+func TestSourceAdapterReportsWildcardSnapshotFilter(t *testing.T) {
+	adapter := &sourceAdapter{inner: &Source{cfg: config.NormalizeMySQLConfig(config.MySQLConfig{
+		TableConfigs: map[string]config.MySQLTableConfig{
+			"asmat_*.tbl_reservasi": {Filter: "`WaktuPesan` >= '2026-09-01 00:00:00'"},
+		},
+	})}}
+	if !adapter.HasSnapshotFilter("asmat_aragon", "tbl_reservasi") {
+		t.Fatal("wildcard source filter was not detected")
+	}
+	if adapter.HasSnapshotFilter("asmat_aragon", "other_table") {
+		t.Fatal("unfiltered source table was reported as filtered")
+	}
+}
 
 func TestSinkUsesAcknowledgedSnapshotBatches(t *testing.T) {
 	for _, sinkType := range []string{"doris", "iceberg_native", " DORIS "} {
