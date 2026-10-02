@@ -568,6 +568,155 @@ func TestCDCHandlerOnRowEmitsTraceIDAndSourceOffset(t *testing.T) {
 	}
 }
 
+func TestCDCHandlerArchiveStrategies(t *testing.T) {
+	const database = "asmat_wbshuttle"
+	for _, liveTable := range []string{"tbl_paket", "tbl_penjadwalan_kendaraan"} {
+		t.Run(liveTable, func(t *testing.T) {
+			backupTable := liveTable + "_backup"
+			datedTable := backupTable + "_20261001"
+			row := func(table, action string) *canal.RowsEvent {
+				return &canal.RowsEvent{
+					Table: &schema.Table{
+						Schema:    database,
+						Name:      table,
+						Columns:   []schema.TableColumn{{Name: "id"}},
+						PKColumns: []int{0},
+					},
+					Action: action,
+					Rows:   [][]interface{}{{int64(42)}},
+				}
+			}
+			newHandler := func() (*cdcHandler, chan model.Event) {
+				out := make(chan model.Event, 4)
+				return &cdcHandler{
+					jobID:   "archive-test",
+					allowed: map[string]bool{database + "." + liveTable: true},
+					out:     out,
+					ctx:     context.Background(),
+					schemaFetcher: func(_ context.Context, db, table string) (*model.TableSchema, error) {
+						return &model.TableSchema{
+							SchemaName: db,
+							TableName:  table,
+							Columns:    []model.TableColumn{{Name: "id", DataType: "bigint", IsPK: true}},
+						}, nil
+					},
+				}, out
+			}
+
+			t.Run("copy_to_backup_then_delete_live", func(t *testing.T) {
+				handler, out := newHandler()
+				if err := handler.OnRow(row(backupTable, canal.InsertAction)); err != nil {
+					t.Fatal(err)
+				}
+				if err := handler.OnRow(row(liveTable, canal.DeleteAction)); err != nil {
+					t.Fatal(err)
+				}
+				if got := len(out); got != 1 {
+					t.Fatalf("emitted %d events, want one live-table delete", got)
+				}
+				if got := <-out; got.Type != model.EventTypeDelete || got.Table != liveTable {
+					t.Fatalf("emitted %#v, want live-table delete", got)
+				}
+			})
+
+			t.Run("rename_recreate_then_copy_to_backup", func(t *testing.T) {
+				handler, out := newHandler()
+				for _, ddl := range []string{
+					fmt.Sprintf("RENAME TABLE `%s` TO `%s`", liveTable, datedTable),
+					fmt.Sprintf("CREATE TABLE `%s` LIKE `%s`", liveTable, datedTable),
+				} {
+					if err := handler.OnDDL(nil, gomysql.Position{}, &replication.QueryEvent{
+						Schema: []byte(database),
+						Query:  []byte(ddl),
+					}); err != nil {
+						t.Fatalf("OnDDL(%q): %v", ddl, err)
+					}
+				}
+				for _, table := range []string{datedTable, backupTable} {
+					if err := handler.OnRow(row(table, canal.InsertAction)); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if got := len(out); got != 1 {
+					t.Fatalf("emitted %d events, want only live-table CREATE DDL", got)
+				}
+				if got := <-out; got.Type != model.EventTypeDDL || got.Table != liveTable || got.SourceSchema == nil {
+					t.Fatalf("emitted %#v, want live-table CREATE DDL with refreshed schema", got)
+				}
+				if err := handler.OnRow(row(liveTable, canal.InsertAction)); err != nil {
+					t.Fatal(err)
+				}
+				if got := <-out; got.Type != model.EventTypeInsert || got.Table != liveTable {
+					t.Fatalf("new live table emitted %#v, want live-table insert", got)
+				}
+			})
+		})
+	}
+}
+
+func TestCDCHandlerCheckpointAcrossRenameRecreateGap(t *testing.T) {
+	const database = "asmat_wbshuttle"
+	const liveTable = "tbl_paket"
+	out := make(chan model.Event, 3)
+	handler := &cdcHandler{
+		jobID:   "archive-gap-test",
+		allowed: map[string]bool{database + "." + liveTable: true},
+		out:     out,
+		ctx:     context.Background(),
+		schemaFetcher: func(_ context.Context, db, table string) (*model.TableSchema, error) {
+			return &model.TableSchema{
+				SchemaName: db,
+				TableName:  table,
+				Columns:    []model.TableColumn{{Name: "id", DataType: "bigint", IsPK: true}},
+			}, nil
+		},
+	}
+	ddl := func(query string) error {
+		return handler.OnDDL(nil, gomysql.Position{}, &replication.QueryEvent{
+			Schema: []byte(database),
+			Query:  []byte(query),
+		})
+	}
+
+	if err := ddl("RENAME TABLE `tbl_paket` TO `tbl_paket_backup_20261001`"); err != nil {
+		t.Fatalf("rename stopped CDC handler: %v", err)
+	}
+	if got := len(out); got != 0 {
+		t.Fatalf("rename emitted %d events, want none", got)
+	}
+
+	// Simulate the gap before CREATE TABLE arrives. This tests the handler's
+	// checkpoint path, not whether a real MySQL table can be absent safely.
+	if err := handler.OnPosSynced(nil, gomysql.Position{Name: "mysql-bin.000123", Pos: 456}, nil, true); err != nil {
+		t.Fatalf("checkpoint during rename/create gap failed: %v", err)
+	}
+	if got := <-out; got.Type != model.EventTypeCheckpoint {
+		t.Fatalf("gap emitted %#v, want checkpoint", got)
+	}
+
+	if err := ddl("CREATE TABLE `tbl_paket` LIKE `tbl_paket_backup_20261001`"); err != nil {
+		t.Fatalf("recreate stopped CDC handler: %v", err)
+	}
+	if got := <-out; got.Type != model.EventTypeDDL || got.Table != liveTable {
+		t.Fatalf("recreate emitted %#v, want live-table DDL", got)
+	}
+	if err := handler.OnRow(&canal.RowsEvent{
+		Table: &schema.Table{
+			Schema:    database,
+			Name:      liveTable,
+			Columns:   []schema.TableColumn{{Name: "id"}},
+			PKColumns: []int{0},
+		},
+		Action: canal.InsertAction,
+		Rows:   [][]interface{}{{int64(42)}},
+	}); err != nil {
+		t.Fatalf("new live-table insert stopped CDC handler: %v", err)
+	}
+	if got := <-out; got.Type != model.EventTypeInsert || got.Table != liveTable {
+		t.Fatalf("new live table emitted %#v, want insert", got)
+	}
+}
+
 func TestBuildSnapshotCursorPredicateUsesLexicographicKeyset(t *testing.T) {
 	cursor := &snapshotCursor{
 		Columns: []string{"tenant_id", "id"},
