@@ -3,6 +3,7 @@ package iceberg
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"math/rand"
 	"os"
 	"strconv"
@@ -152,6 +153,106 @@ func TestRolledSnapshotCombinesSourceBatchesIntoOneDataFile(t *testing.T) {
 	}
 	if rowCount != 4 {
 		t.Fatalf("visible rows = %d, want 4", rowCount)
+	}
+}
+
+func TestRolledSnapshotRetriesConcurrentCommitConflict(t *testing.T) {
+	ctx := context.Background()
+	tbl, catalog := newEqualityDeltaTestTable(t)
+	spoolDir, err := prepareSnapshotSpoolDirectory(t.TempDir(), "job-1", "state-1")
+	if err != nil {
+		t.Fatalf("prepareSnapshotSpoolDirectory: %v", err)
+	}
+	sink := &Sink{
+		jobID:            "job-1",
+		cfg:              normalizeIcebergConfig(config.IcebergConfig{SnapshotWriteMode: snapshotWriteModeAppend, SnapshotTargetFileSizeBytes: 1024 * 1024}),
+		retry:            config.RetryPolicy{MaxAttempts: 3, BaseBackoff: time.Millisecond},
+		snapshotSpoolDir: spoolDir,
+		states:           make(map[string]*tableState),
+	}
+	state := &tableState{
+		sourceKey:       "app.orders",
+		targetNamespace: "bronze",
+		targetTable:     "orders",
+		sourceSchema: &model.TableSchema{
+			SchemaName: "app", TableName: "orders",
+			Columns: []model.TableColumn{
+				{Name: "id", DataType: "bigint", IsPK: true},
+				{Name: "status", DataType: "varchar"},
+			},
+		},
+		table:              tbl,
+		snapshotAppendSafe: true,
+	}
+	sink.states[state.sourceKey] = state
+	if err := sink.appendSnapshotSpool(ctx, state, []map[string]interface{}{{"id": int64(1), "status": "new"}}, time.Now(), 0); err != nil {
+		t.Fatalf("appendSnapshotSpool: %v", err)
+	}
+	// The property update succeeds, then the first data commit loses the race.
+	catalog.failCommitAt = 2
+	if err := sink.finalizeSnapshotSpool(ctx, state); err != nil {
+		t.Fatalf("finalizeSnapshotSpool after conflict: %v", err)
+	}
+	if got, want := catalog.commitAttempts, 3; got != want {
+		t.Fatalf("commit attempts = %d, want %d", got, want)
+	}
+	if got, want := catalog.commits, 2; got != want {
+		t.Fatalf("successful commits = %d, want %d", got, want)
+	}
+	_, records, err := state.table.Scan(icetable.WithSelectedFields("id")).ToArrowRecords(ctx)
+	if err != nil {
+		t.Fatalf("scan rolled snapshot: %v", err)
+	}
+	rowCount := 0
+	for record, recordErr := range records {
+		if recordErr != nil {
+			t.Fatalf("read rolled snapshot: %v", recordErr)
+		}
+		rowCount += int(record.NumRows())
+		record.Release()
+	}
+	if rowCount != 1 {
+		t.Fatalf("visible rows = %d, want 1", rowCount)
+	}
+}
+
+func TestRollingWritePropertiesRetriesConcurrentCommitConflict(t *testing.T) {
+	tbl, catalog := newEqualityDeltaTestTable(t)
+	catalog.failCommitAt = 1
+	sink := &Sink{
+		cfg:   normalizeIcebergConfig(config.IcebergConfig{}),
+		retry: config.RetryPolicy{MaxAttempts: 3, BaseBackoff: time.Millisecond},
+	}
+	state := &tableState{
+		sourceKey:       "app.orders",
+		targetNamespace: "bronze",
+		targetTable:     "orders",
+		table:           tbl,
+	}
+	got, err := sink.ensureSnapshotRollingWriteProperties(context.Background(), state, 500)
+	if err != nil {
+		t.Fatalf("ensureSnapshotRollingWriteProperties after conflict: %v", err)
+	}
+	if got != 500 || catalog.commitAttempts != 2 || catalog.commits != 1 {
+		t.Fatalf("effective rows = %d, commit attempts = %d, successful commits = %d; want 500, 2, 1", got, catalog.commitAttempts, catalog.commits)
+	}
+}
+
+func TestRollingWritePropertiesDoesNotRetryUnknownCommit(t *testing.T) {
+	tbl, catalog := newEqualityDeltaTestTable(t)
+	unknown := errors.New("commit outcome unknown")
+	catalog.commitErr = unknown
+	sink := &Sink{
+		cfg:   normalizeIcebergConfig(config.IcebergConfig{}),
+		retry: config.RetryPolicy{MaxAttempts: 3, BaseBackoff: time.Millisecond},
+	}
+	state := &tableState{sourceKey: "app.orders", targetNamespace: "bronze", targetTable: "orders", table: tbl}
+	_, err := sink.ensureSnapshotRollingWriteProperties(context.Background(), state, 500)
+	if !errors.Is(err, unknown) {
+		t.Fatalf("commit error = %v, want unknown outcome", err)
+	}
+	if catalog.commitAttempts != 1 {
+		t.Fatalf("commit attempts = %d, want 1 for an unknown outcome", catalog.commitAttempts)
 	}
 }
 

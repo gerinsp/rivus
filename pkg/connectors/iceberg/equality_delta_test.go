@@ -14,18 +14,25 @@ import (
 )
 
 type equalityDeltaTestCatalog struct {
-	metadata  icetable.Metadata
-	commits   int
-	commitErr error
+	metadata       icetable.Metadata
+	commits        int
+	commitAttempts int
+	commitErr      error
+	failCommitAt   int
 }
 
-func (c *equalityDeltaTestCatalog) LoadTable(context.Context, icetable.Identifier) (*icetable.Table, error) {
-	return nil, nil
+func (c *equalityDeltaTestCatalog) LoadTable(_ context.Context, ident icetable.Identifier) (*icetable.Table, error) {
+	return icetable.New(ident, c.metadata, filepath.Join(c.metadata.Location(), "metadata", "v0.metadata.json"),
+		func(context.Context) (iceio.IO, error) { return iceio.LocalFS{}, nil }, c), nil
 }
 
 func (c *equalityDeltaTestCatalog) CommitTable(_ context.Context, _ icetable.Identifier, _ []icetable.Requirement, updates []icetable.Update) (icetable.Metadata, string, error) {
+	c.commitAttempts++
 	if c.commitErr != nil {
 		return nil, "", c.commitErr
+	}
+	if c.commitAttempts == c.failCommitAt {
+		return nil, "", icetable.ErrCommitFailed
 	}
 	metadata, err := icetable.UpdateTableMetadata(c.metadata, updates, "")
 	if err != nil {

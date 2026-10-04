@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -252,29 +253,42 @@ func (s *Sink) ensureSnapshotRollingWriteProperties(ctx context.Context, state *
 	if desired <= 0 || state == nil || state.table == nil {
 		return desired, nil
 	}
-	current := state.table.Metadata().Properties().GetInt(icetable.ParquetRowGroupLimitKey, icetable.ParquetRowGroupLimitDefault)
-	if current <= desired {
-		return current, nil
-	}
 	var updated *icetable.Table
-	err := s.withCommitSlot(ctx, commitProgress{
-		operation:       "snapshot-rolling-properties",
-		sourceKey:       state.sourceKey,
-		targetNamespace: state.targetNamespace,
-		targetTable:     state.targetTable,
-	}, func() error {
-		txn := state.table.NewTransaction()
-		if err := txn.SetProperties(iceberglib.Properties{
-			icetable.ParquetRowGroupLimitKey: strconv.Itoa(desired),
-		}); err != nil {
+	var effective int
+	err := util.RetryWithBackoff(ctx, s.retry, func() error {
+		if err := s.refreshStateTable(ctx, state); err != nil {
 			return err
 		}
-		var err error
-		updated, err = txn.Commit(ctx)
+		effective = state.table.Metadata().Properties().GetInt(icetable.ParquetRowGroupLimitKey, icetable.ParquetRowGroupLimitDefault)
+		if effective <= desired {
+			return nil
+		}
+		err := s.withCommitSlot(ctx, commitProgress{
+			operation:       "snapshot-rolling-properties",
+			sourceKey:       state.sourceKey,
+			targetNamespace: state.targetNamespace,
+			targetTable:     state.targetTable,
+		}, func() error {
+			txn := state.table.NewTransaction()
+			if err := txn.SetProperties(iceberglib.Properties{
+				icetable.ParquetRowGroupLimitKey: strconv.Itoa(desired),
+			}); err != nil {
+				return err
+			}
+			committed, commitErr := txn.Commit(ctx)
+			updated = committed
+			return commitErr
+		})
+		if err != nil && (updated != nil || !errors.Is(err, icetable.ErrCommitFailed)) {
+			return util.Permanent(err)
+		}
 		return err
 	})
 	if err != nil {
 		return 0, s.stateOperationError("snapshot-rolling-properties", state, err)
+	}
+	if updated == nil {
+		return effective, nil
 	}
 	s.mu.Lock()
 	state.table = updated
@@ -381,19 +395,28 @@ func (s *Sink) finalizeSnapshotSpool(ctx context.Context, state *tableState) err
 	var updated *icetable.Table
 	var startedAt time.Time
 	var duration time.Duration
-	err = s.withCommitSlot(ctx, commitProgress{
-		operation:       result.operation,
-		sourceKey:       state.sourceKey,
-		targetNamespace: state.targetNamespace,
-		targetTable:     state.targetTable,
-		rowCount:        result.rowCount,
-	}, func() error {
-		startedAt = time.Now()
-		var commitErr error
-		updated, commitErr = s.commitSnapshotSpool(ctx, state, spool, sizing.readBatchRows)
-		duration = time.Since(startedAt)
-		return commitErr
+	startedAt = time.Now()
+	err = util.RetryWithBackoff(ctx, s.retry, func() error {
+		if err := s.refreshStateTable(ctx, state); err != nil {
+			return err
+		}
+		err := s.withCommitSlot(ctx, commitProgress{
+			operation:       result.operation,
+			sourceKey:       state.sourceKey,
+			targetNamespace: state.targetNamespace,
+			targetTable:     state.targetTable,
+			rowCount:        result.rowCount,
+		}, func() error {
+			var commitErr error
+			updated, commitErr = s.commitSnapshotSpool(ctx, state, spool, sizing.readBatchRows)
+			return commitErr
+		})
+		if err != nil && (updated != nil || !errors.Is(err, icetable.ErrCommitFailed)) {
+			return util.Permanent(err)
+		}
+		return err
 	})
+	duration = time.Since(startedAt)
 	s.logWriteTiming(state, result, err, startedAt, duration)
 	if err != nil {
 		return s.stateOperationError(result.operation, state, err)
@@ -486,7 +509,13 @@ func (s *Sink) commitSnapshotSpool(ctx context.Context, state *tableState, spool
 	// snapshot. Normal orphan-file maintenance can safely remove them later if
 	// the catalog did not accept the commit.
 	cleanupStaged = false
-	return txn.Commit(ctx)
+	updated, err := txn.Commit(ctx)
+	if updated == nil && errors.Is(err, icetable.ErrCommitFailed) {
+		// A rejected commit cannot reference these data files. Other errors
+		// can have an unknown outcome, so leave their files for orphan cleanup.
+		cleanupStaged = true
+	}
+	return updated, err
 }
 
 func (s *Sink) resetSnapshotSpool(state *tableState) {
