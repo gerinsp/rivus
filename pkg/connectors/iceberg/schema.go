@@ -318,6 +318,67 @@ func isCreateTableDDL(ddl string) bool {
 	return strings.HasPrefix(strings.TrimSpace(low), "create table")
 }
 
+// A replayed DDL may already be present in a target table, especially when
+// another writer committed the same schema change while this job was waiting.
+func ddlActionsAlreadyApplied(current *iceberglib.Schema, actions []ddlAction, cfg config.IcebergConfig) bool {
+	if current == nil {
+		return false
+	}
+	for _, action := range actions {
+		switch action.Kind {
+		case ddlActionAddColumn, ddlActionUpdateColumn:
+			field, ok := current.FindFieldByNameCaseInsensitive(action.Column.Name)
+			if !ok {
+				return false
+			}
+			typ, err := icebergTypeForColumn(action.Column)
+			if err != nil || !field.Type.Equals(typ) || !ddlPositionApplied(current, action) {
+				return false
+			}
+			if action.Kind == ddlActionAddColumn && field.Required {
+				return false
+			}
+			if action.Kind == ddlActionUpdateColumn && cfg.AllowUnsafeTypeChanges && field.Required != !action.Column.IsNullable {
+				return false
+			}
+		case ddlActionDropColumn:
+			if _, ok := current.FindFieldByNameCaseInsensitive(action.OldName); ok {
+				return false
+			}
+		case ddlActionRenameColumn:
+			if _, oldExists := current.FindFieldByNameCaseInsensitive(action.OldName); oldExists {
+				return false
+			}
+			if _, newExists := current.FindFieldByNameCaseInsensitive(action.NewName); !newExists {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func ddlPositionApplied(current *iceberglib.Schema, action ddlAction) bool {
+	fields := current.Fields()
+	switch action.Position {
+	case model.ColumnPositionFirst:
+		return len(fields) > 0 && strings.EqualFold(fields[0].Name, action.Column.Name)
+	case model.ColumnPositionAfter:
+		if action.AfterColumn == "" {
+			return true
+		}
+		for idx := 0; idx+1 < len(fields); idx++ {
+			if strings.EqualFold(fields[idx].Name, action.AfterColumn) {
+				return strings.EqualFold(fields[idx+1].Name, action.Column.Name)
+			}
+		}
+		return false
+	default:
+		return true
+	}
+}
+
 func applyDDLToSourceSchema(schema *model.TableSchema, actions []ddlAction) *model.TableSchema {
 	out := copyTableSchema(schema)
 	if out == nil {
@@ -327,7 +388,9 @@ func applyDDLToSourceSchema(schema *model.TableSchema, actions []ddlAction) *mod
 	for _, action := range actions {
 		switch action.Kind {
 		case ddlActionAddColumn:
-			out.Columns = append(out.Columns, action.Column)
+			if _, exists := findSourceColumn(out, action.Column.Name); !exists {
+				out.Columns = append(out.Columns, action.Column)
+			}
 			moveSourceSchemaColumn(out, action.Column.Name, action.Position, action.AfterColumn)
 		case ddlActionDropColumn:
 			filtered := out.Columns[:0]

@@ -3086,32 +3086,42 @@ func (s *Sink) applyDDL(ctx context.Context, state *tableState, ev model.Event) 
 		return nil
 	}
 
-	if err := s.refreshStateTable(ctx, state); err != nil {
-		return err
-	}
+	desiredSourceSchema := applyDDLToSourceSchema(state.sourceSchema, plan)
+	var updated *icetable.Table
+	alreadyApplied := false
+	err = util.RetryWithBackoff(ctx, s.retry, func() error {
+		if err := s.refreshStateTable(ctx, state); err != nil {
+			return err
+		}
+		if ddlActionsAlreadyApplied(state.table.Schema(), plan, s.cfg) {
+			updated = state.table
+			alreadyApplied = true
+			return nil
+		}
 
-	txn := state.table.NewTransaction()
-	updater := txn.UpdateSchema(false, s.cfg.AllowUnsafeTypeChanges)
-
-	for _, action := range plan {
-		if err := applyDDLAction(updater, action, s.cfg); err != nil {
+		txn := state.table.NewTransaction()
+		updater := txn.UpdateSchema(false, s.cfg.AllowUnsafeTypeChanges)
+		for _, action := range plan {
+			if err := applyDDLAction(updater, action, s.cfg); err != nil {
+				return util.Permanent(err)
+			}
+		}
+		if err := updater.Commit(); err != nil {
 			return util.Permanent(err)
 		}
-	}
-
-	if err := updater.Commit(); err != nil {
-		return err
-	}
-
-	var updated *icetable.Table
-	err = s.withCommitSlot(ctx, commitProgress{
-		operation:       "schema",
-		sourceKey:       state.sourceKey,
-		targetNamespace: state.targetNamespace,
-		targetTable:     state.targetTable,
-	}, func() error {
-		var commitErr error
-		updated, commitErr = txn.Commit(ctx)
+		commitErr := s.withCommitSlot(ctx, commitProgress{
+			operation:       "schema",
+			sourceKey:       state.sourceKey,
+			targetNamespace: state.targetNamespace,
+			targetTable:     state.targetTable,
+		}, func() error {
+			var err error
+			updated, err = txn.Commit(ctx)
+			return err
+		})
+		if commitErr != nil && (updated != nil || !errors.Is(commitErr, icetable.ErrCommitFailed)) {
+			return util.Permanent(commitErr)
+		}
 		return commitErr
 	})
 	if err != nil {
@@ -3119,13 +3129,18 @@ func (s *Sink) applyDDL(ctx context.Context, state *tableState, ev model.Event) 
 	}
 
 	s.mu.Lock()
+	s.updateTargetTableStatesLocked(state.targetNamespace, state.targetTable, updated, time.Now())
 	state.table = updated
-	state.sourceSchema = applyDDLToSourceSchema(state.sourceSchema, plan)
+	state.sourceSchema = desiredSourceSchema
 	s.sourceSchemas[state.sourceKey] = copyTableSchema(state.sourceSchema)
 	state.lastTouchedAt = time.Now()
 	s.mu.Unlock()
 
-	log.Printf("[iceberg][job %s] ddl-applied table=%s actions=%d", s.jobID, state.sourceKey, len(plan))
+	if alreadyApplied {
+		log.Printf("[iceberg][job %s] ddl-already-applied table=%s actions=%d", s.jobID, state.sourceKey, len(plan))
+	} else {
+		log.Printf("[iceberg][job %s] ddl-applied table=%s actions=%d", s.jobID, state.sourceKey, len(plan))
+	}
 
 	return nil
 }

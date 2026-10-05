@@ -19,6 +19,7 @@ type equalityDeltaTestCatalog struct {
 	commitAttempts int
 	commitErr      error
 	failCommitAt   int
+	onConflict     func(*equalityDeltaTestCatalog)
 }
 
 func (c *equalityDeltaTestCatalog) LoadTable(_ context.Context, ident icetable.Identifier) (*icetable.Table, error) {
@@ -32,6 +33,9 @@ func (c *equalityDeltaTestCatalog) CommitTable(_ context.Context, _ icetable.Ide
 		return nil, "", c.commitErr
 	}
 	if c.commitAttempts == c.failCommitAt {
+		if c.onConflict != nil {
+			c.onConflict(c)
+		}
 		return nil, "", icetable.ErrCommitFailed
 	}
 	metadata, err := icetable.UpdateTableMetadata(c.metadata, updates, "")

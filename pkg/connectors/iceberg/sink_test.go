@@ -190,6 +190,108 @@ func TestCatalogInitializationRetriesTransientFailure(t *testing.T) {
 	}
 }
 
+func TestApplyDDLRefreshesAfterSchemaCommitConflict(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		otherColumn  string
+		wantAttempts int
+	}{
+		{name: "unrelated schema change", otherColumn: "external_note", wantAttempts: 2},
+		{name: "same DDL already applied", otherColumn: "service_type", wantAttempts: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tbl, catalog := newEqualityDeltaTestTable(t)
+			catalog.failCommitAt = 1
+			catalog.onConflict = func(c *equalityDeltaTestCatalog) {
+				fields := c.metadata.CurrentSchema().Fields()
+				fields = append(fields, iceberglib.NestedField{ID: 3, Name: tc.otherColumn, Type: iceberglib.PrimitiveTypes.String})
+				changed := iceberglib.NewSchema(2, fields...)
+				meta, err := table.UpdateTableMetadata(c.metadata, []table.Update{
+					table.NewAddSchemaUpdate(changed),
+					table.NewSetCurrentSchemaUpdate(changed.ID),
+				}, "")
+				if err != nil {
+					t.Fatalf("simulate external schema change: %v", err)
+				}
+				c.metadata = meta
+			}
+			sourceSchema := &model.TableSchema{
+				SchemaName: "app", TableName: "orders",
+				Columns: []model.TableColumn{
+					{Name: "id", DataType: "bigint", IsPK: true},
+					{Name: "status", DataType: "varchar"},
+				},
+			}
+			state := &tableState{
+				sourceKey: "app.orders", targetNamespace: "bronze", targetTable: "orders",
+				sourceSchema: sourceSchema, table: tbl,
+			}
+			sink := &Sink{
+				jobID: "job-1", cfg: normalizeIcebergConfig(config.IcebergConfig{}),
+				retry:         config.RetryPolicy{MaxAttempts: 3, BaseBackoff: time.Millisecond},
+				states:        map[string]*tableState{state.sourceKey: state},
+				sourceSchemas: map[string]*model.TableSchema{state.sourceKey: sourceSchema},
+			}
+			column := model.TableColumn{Name: "service_type", DataType: "varchar"}
+			ev := model.Event{Type: model.EventTypeDDL, SchemaChanges: []model.SchemaChange{{
+				Type: model.SchemaChangeAddColumn, Column: &column,
+			}}}
+			if err := sink.applyDDL(context.Background(), state, ev); err != nil {
+				t.Fatalf("applyDDL after schema conflict: %v", err)
+			}
+			if catalog.commitAttempts != tc.wantAttempts {
+				t.Fatalf("commit attempts = %d, want %d", catalog.commitAttempts, tc.wantAttempts)
+			}
+			if _, ok := state.table.Schema().FindFieldByNameCaseInsensitive(tc.otherColumn); !ok {
+				t.Fatalf("concurrent column %q missing", tc.otherColumn)
+			}
+			if _, ok := state.table.Schema().FindFieldByNameCaseInsensitive("service_type"); !ok {
+				t.Fatal("DDL column missing")
+			}
+			count := 0
+			for _, col := range state.sourceSchema.Columns {
+				if strings.EqualFold(col.Name, "service_type") {
+					count++
+				}
+			}
+			if count != 1 {
+				t.Fatalf("source schema has %d service_type columns, want 1", count)
+			}
+		})
+	}
+}
+
+func TestApplyDDLDoesNotRetryUnknownCommitOutcome(t *testing.T) {
+	tbl, catalog := newEqualityDeltaTestTable(t)
+	unknown := errors.New("commit outcome unknown")
+	catalog.commitErr = unknown
+	state := &tableState{sourceKey: "app.orders", targetNamespace: "bronze", targetTable: "orders", table: tbl}
+	sink := &Sink{
+		cfg:   normalizeIcebergConfig(config.IcebergConfig{}),
+		retry: config.RetryPolicy{MaxAttempts: 3, BaseBackoff: time.Millisecond},
+	}
+	column := model.TableColumn{Name: "service_type", DataType: "varchar"}
+	ev := model.Event{Type: model.EventTypeDDL, SchemaChanges: []model.SchemaChange{{
+		Type: model.SchemaChangeAddColumn, Column: &column,
+	}}}
+	err := sink.applyDDL(context.Background(), state, ev)
+	if !errors.Is(err, unknown) {
+		t.Fatalf("applyDDL error = %v, want unknown outcome", err)
+	}
+	if catalog.commitAttempts != 1 {
+		t.Fatalf("commit attempts = %d, want 1", catalog.commitAttempts)
+	}
+}
+
+func TestApplyDDLToSourceSchemaDoesNotDuplicateExistingColumn(t *testing.T) {
+	column := model.TableColumn{Name: "service_type", DataType: "varchar"}
+	source := &model.TableSchema{Columns: []model.TableColumn{column}}
+	updated := applyDDLToSourceSchema(source, []ddlAction{{Kind: ddlActionAddColumn, Column: column}})
+	if len(updated.Columns) != 1 {
+		t.Fatalf("source columns = %d, want 1 after replayed ADD COLUMN", len(updated.Columns))
+	}
+}
+
 func TestCatalogInitializationDoesNotRetryUnauthorized(t *testing.T) {
 	attempts := 0
 	_, err := retryCatalogInitialization(context.Background(), config.IcebergConfig{}, func(context.Context, config.IcebergConfig) (icecatalog.Catalog, error) {
