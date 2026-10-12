@@ -160,23 +160,30 @@ func (s *Source) resumeOffset(ctx context.Context) (*meta.Offset, error) {
 	if err := s.offsetSto.SaveOffset(ctx, key, *legacy); err != nil {
 		return nil, fmt.Errorf("migrate legacy checkpoint failed: %w", err)
 	}
-	_ = s.offsetSto.DeleteJobState(ctx, s.jobID)
+	if err := s.offsetSto.DeleteJobState(ctx, s.jobID); err != nil {
+		return nil, fmt.Errorf("cleanup legacy checkpoint failed: %w", err)
+	}
 	log.Printf("[mysql][job %s] migrated legacy CDC checkpoint to internal state key", s.jobID)
 	return legacy, nil
 }
 
-func (s *Source) clearLegacyCheckpoint(ctx context.Context) {
+func (s *Source) clearLegacyCheckpoint(ctx context.Context) error {
 	if s.offsetSto == nil || s.checkpointKey() == s.jobID {
-		return
+		return nil
 	}
-	_ = s.offsetSto.DeleteJobState(ctx, s.jobID)
+	if err := s.offsetSto.DeleteJobState(ctx, s.jobID); err != nil {
+		return fmt.Errorf("cleanup legacy checkpoint failed: %w", err)
+	}
+	return nil
 }
 
 func (s *Source) resetInitialCheckpoint(ctx context.Context) error {
 	if s.offsetSto == nil {
 		return nil
 	}
-	s.clearLegacyCheckpoint(ctx)
+	if err := s.clearLegacyCheckpoint(ctx); err != nil {
+		return err
+	}
 	if err := s.offsetSto.DeleteJobState(ctx, s.checkpointKey()); err != nil {
 		return fmt.Errorf("reset initial checkpoint failed: %w", err)
 	}
@@ -287,7 +294,10 @@ func (s *Source) emitSnapshotBatch(ctx context.Context, out chan<- model.Event, 
 
 	for {
 		select {
-		case err := <-ack:
+		case err, ok := <-ack:
+			if !ok {
+				return fmt.Errorf("snapshot batch ACK closed without result")
+			}
 			return err
 		case <-warnC:
 			warnC = nil
@@ -318,10 +328,6 @@ func (s *Source) emitSnapshotBatch(ctx context.Context, out chan<- model.Event, 
 }
 
 func (s *Source) emitSnapshotBarrier(ctx context.Context, out chan<- model.Event, eventType model.EventType) error {
-	if !s.snapshotBatchEvents {
-		return nil
-	}
-
 	ack := make(chan error, 1)
 	ev := model.Event{
 		Type:      eventType,
@@ -337,7 +343,10 @@ func (s *Source) emitSnapshotBarrier(ctx context.Context, out chan<- model.Event
 	}
 
 	select {
-	case err := <-ack:
+	case err, ok := <-ack:
+		if !ok {
+			return fmt.Errorf("snapshot barrier ACK closed without result")
+		}
 		return err
 	case <-ctx.Done():
 		return ctx.Err()
@@ -367,7 +376,10 @@ func (s *Source) emitSnapshotTableComplete(ctx context.Context, out chan<- model
 	defer warnTimer.Stop()
 	for {
 		select {
-		case err := <-ack:
+		case err, ok := <-ack:
+			if !ok {
+				return fmt.Errorf("snapshot table ACK closed without result")
+			}
 			return err
 		case <-warnTimer.C:
 			log.Printf("[WARN][mysql][job %s] waiting for rolled snapshot commit table=%s.%s rows=%d", s.jobID, dbName, tableName, rowsEmitted)
@@ -376,6 +388,27 @@ func (s *Source) emitSnapshotTableComplete(ctx context.Context, out chan<- model
 			return ctx.Err()
 		}
 	}
+}
+
+// Completion is recorded by the sink after its data barrier, before ACK. This
+// handshake can be repeated after a crash without replaying a completed load.
+func (s *Source) completeSnapshot(ctx context.Context, out chan<- model.Event) error {
+	if err := s.emitSnapshotBarrier(ctx, out, model.EventTypeSnapshotComplete); err != nil {
+		return fmt.Errorf("complete snapshot barrier failed: %w", err)
+	}
+	if s.offsetSto != nil {
+		st, err := s.offsetSto.GetSnapshotState(ctx, s.checkpointKey())
+		if err != nil {
+			return fmt.Errorf("read snapshot completion failed: %w", err)
+		}
+		if !st.CompletionConfirmed() {
+			return fmt.Errorf("snapshot completion BLOCKED: ACK has no confirmed durable completion")
+		}
+		if err := s.offsetSto.ClearSnapshotProgress(ctx, s.checkpointKey()); err != nil {
+			return fmt.Errorf("clear completed snapshot progress failed: %w", err)
+		}
+	}
+	return nil
 }
 
 func clearSnapshotRows(rows []map[string]interface{}) {
@@ -894,6 +927,13 @@ func (h *cdcHandler) OnDDL(header *replication.EventHeader, nextPos gomysql.Posi
 		Timestamp:     time.Now(),
 		Origin:        model.EventOriginCDC,
 		SchemaChanges: schemaChanges,
+	}
+	ddlFile := strings.TrimSpace(nextPos.Name)
+	if ddlFile == "" {
+		ddlFile = h.currentBinlogFile
+	}
+	if ddlFile != "" && nextPos.Pos > 0 {
+		ddlEvent.SourceOffset = &model.SourceOffset{BinlogFile: ddlFile, BinlogPos: nextPos.Pos}
 	}
 	if isCreateTableDDL(stmt) && h.schemaFetcher != nil {
 		schema, err := h.schemaFetcher(h.ctx, db, tbl)
@@ -1511,6 +1551,11 @@ func (s *Source) resumeSnapshotOnlyProgress(ctx context.Context, out chan<- mode
 	if progress == nil {
 		return false, nil
 	}
+	// Legacy snapshot-only jobs had progress but no job_snapshots row. Preserve
+	// their cursor while creating an incomplete state for the new handshake.
+	if err := s.offsetSto.SaveSnapshotStart(ctx, s.checkpointKey(), meta.Offset{}); err != nil {
+		return true, fmt.Errorf("save snapshot-only start failed: %w", err)
+	}
 
 	tableName := strings.TrimSpace(progress.TableName)
 	detail := "Continuing snapshot-only load from saved table progress"
@@ -1535,9 +1580,8 @@ func (s *Source) resumeSnapshotOnlyProgress(ctx context.Context, out chan<- mode
 		return true, err
 	}
 
-	_ = s.offsetSto.ClearSnapshotProgress(ctx, s.checkpointKey())
-	if err := s.emitSnapshotBarrier(ctx, out, model.EventTypeSnapshotComplete); err != nil {
-		return true, fmt.Errorf("complete snapshot barrier failed: %w", err)
+	if err := s.completeSnapshot(ctx, out); err != nil {
+		return true, err
 	}
 	s.reportProgress(connector.ProgressInfo{
 		Phase:           "snapshot_complete",
@@ -2280,7 +2324,7 @@ func runMySQLBackground(jobID, operation string, run func() error) (err error) {
 }
 
 func (s *Source) monitorCDCLag(ctx context.Context) {
-	if s.progress == nil {
+	if s.progress == nil || ctx.Err() != nil {
 		return
 	}
 
@@ -2827,14 +2871,8 @@ func (s *Source) runFull(ctx context.Context, out chan<- model.Event, mode confi
 			return err
 		}
 
-		if s.offsetSto != nil {
-			if err := s.offsetSto.MarkSnapshotDone(ctx, s.checkpointKey()); err != nil {
-				return fmt.Errorf("mark snapshot done failed: %w", err)
-			}
-			_ = s.offsetSto.ClearSnapshotProgress(ctx, s.checkpointKey())
-		}
-		if err := s.emitSnapshotBarrier(ctx, out, model.EventTypeSnapshotComplete); err != nil {
-			return fmt.Errorf("complete snapshot barrier failed: %w", err)
+		if err := s.completeSnapshot(ctx, out); err != nil {
+			return err
 		}
 		completeDetail := fmt.Sprintf("Starting CDC for %d table(s)", len(s.cfg.Tables))
 		if snapshotHandoff {
@@ -2865,9 +2903,12 @@ func (s *Source) runFull(ctx context.Context, out chan<- model.Event, mode confi
 			TotalTables: len(s.cfg.Tables),
 		})
 		if s.offsetSto != nil {
-			s.clearLegacyCheckpoint(ctx)
-			_ = s.offsetSto.DeleteJobState(ctx, s.checkpointKey())
-			_ = s.offsetSto.ClearSnapshotProgress(ctx, s.checkpointKey())
+			if err := s.resetInitialCheckpoint(ctx); err != nil {
+				return err
+			}
+			if err := s.offsetSto.SaveSnapshotStart(ctx, s.checkpointKey(), meta.Offset{}); err != nil {
+				return fmt.Errorf("save snapshot-only start failed: %w", err)
+			}
 		}
 		if err := s.emitSnapshotBarrier(ctx, out, model.EventTypeSnapshotStart); err != nil {
 			return fmt.Errorf("start snapshot barrier failed: %w", err)
@@ -2879,11 +2920,8 @@ func (s *Source) runFull(ctx context.Context, out chan<- model.Event, mode confi
 			return err
 		}
 
-		if s.offsetSto != nil {
-			_ = s.offsetSto.ClearSnapshotProgress(ctx, s.checkpointKey())
-		}
-		if err := s.emitSnapshotBarrier(ctx, out, model.EventTypeSnapshotComplete); err != nil {
-			return fmt.Errorf("complete snapshot barrier failed: %w", err)
+		if err := s.completeSnapshot(ctx, out); err != nil {
+			return err
 		}
 		s.reportProgress(connector.ProgressInfo{
 			Phase:           "snapshot_complete",
@@ -2917,6 +2955,15 @@ func (s *Source) runFull(ctx context.Context, out chan<- model.Event, mode confi
 
 		if st != nil {
 			if st.Done {
+				if !st.CompletionConfirmed() {
+					return fmt.Errorf("snapshot completion BLOCKED: legacy done state has no sink confirmation for job_id=%s", s.jobID)
+				}
+				if err := s.completeSnapshot(ctx, out); err != nil {
+					return err
+				}
+				if storedMode == config.JobModeSnapshotOnly {
+					return nil
+				}
 				if snapshotHandoff {
 					s.reportProgress(connector.ProgressInfo{
 						Phase:           "snapshot_complete",
@@ -2944,7 +2991,7 @@ func (s *Source) runFull(ctx context.Context, out chan<- model.Event, mode confi
 				return fmt.Errorf("resume requested but no saved CDC checkpoint found for job_id=%s", s.jobID)
 			}
 
-			if st.StartFile == "" || st.StartPos == 0 {
+			if storedMode != config.JobModeSnapshotOnly && (st.StartFile == "" || st.StartPos == 0) {
 				return fmt.Errorf("resume requested but snapshot start checkpoint is incomplete for job_id=%s", s.jobID)
 			}
 			if err := s.emitSnapshotBarrier(ctx, out, model.EventTypeSnapshotStart); err != nil {
@@ -2957,12 +3004,8 @@ func (s *Source) runFull(ctx context.Context, out chan<- model.Event, mode confi
 				return err
 			}
 
-			if err := s.offsetSto.MarkSnapshotDone(ctx, s.checkpointKey()); err != nil {
-				return fmt.Errorf("mark snapshot done failed: %w", err)
-			}
-			_ = s.offsetSto.ClearSnapshotProgress(ctx, s.checkpointKey())
-			if err := s.emitSnapshotBarrier(ctx, out, model.EventTypeSnapshotComplete); err != nil {
-				return fmt.Errorf("complete snapshot barrier failed: %w", err)
+			if err := s.completeSnapshot(ctx, out); err != nil {
+				return err
 			}
 			completeDetail := fmt.Sprintf("Starting CDC for %d table(s)", len(s.cfg.Tables))
 			if snapshotHandoff {
@@ -2975,7 +3018,7 @@ func (s *Source) runFull(ctx context.Context, out chan<- model.Event, mode confi
 				CompletedTables: len(s.cfg.Tables),
 				TotalTables:     len(s.cfg.Tables),
 			})
-			if snapshotHandoff {
+			if snapshotHandoff || storedMode == config.JobModeSnapshotOnly {
 				return nil
 			}
 
@@ -3027,7 +3070,9 @@ func (s *Source) runFull(ctx context.Context, out chan<- model.Event, mode confi
 	// ignore snapshot & offset
 	// =========================
 	case config.JobModeLatest:
-		s.clearLegacyCheckpoint(ctx)
+		if err := s.clearLegacyCheckpoint(ctx); err != nil {
+			return err
+		}
 		return s.runBinlogCanal(ctx, out, nil)
 
 	default:

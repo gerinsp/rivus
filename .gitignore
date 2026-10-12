@@ -13,3 +13,4 @@
 compose.local.yml
 /rivus
 *.log
+.serena/

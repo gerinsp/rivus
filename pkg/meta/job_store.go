@@ -117,7 +117,8 @@ type FailureNotificationStore interface {
 }
 
 type MySQLJobStore struct {
-	db *sql.DB
+	db     *sql.DB
+	target string
 }
 
 func normalizeJobStoreDSN(dsn string) (string, error) {
@@ -133,6 +134,10 @@ func normalizeJobStoreDSN(dsn string) (string, error) {
 }
 
 func NewMySQLJobStore(dsn string) (*MySQLJobStore, error) {
+	target, err := mysqlStoreTarget(dsn)
+	if err != nil {
+		return nil, err
+	}
 	normalizedDSN, err := normalizeJobStoreDSN(dsn)
 	if err != nil {
 		return nil, err
@@ -146,7 +151,7 @@ func NewMySQLJobStore(dsn string) (*MySQLJobStore, error) {
 	db.SetConnMaxIdleTime(time.Minute)
 	db.SetConnMaxLifetime(30 * time.Minute)
 
-	return &MySQLJobStore{db: db}, nil
+	return &MySQLJobStore{db: db, target: target}, nil
 }
 
 func (s *MySQLJobStore) Close() error {

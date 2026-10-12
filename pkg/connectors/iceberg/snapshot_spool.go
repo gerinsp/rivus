@@ -265,19 +265,21 @@ func (s *Sink) ensureSnapshotRollingWriteProperties(ctx context.Context, state *
 		}
 		err := s.withCommitSlot(ctx, commitProgress{
 			operation:       "snapshot-rolling-properties",
+			icebergCommit:   true,
+			recoveredTable:  &updated,
 			sourceKey:       state.sourceKey,
 			targetNamespace: state.targetNamespace,
 			targetTable:     state.targetTable,
-		}, func() error {
+		}, func(ctx context.Context) error {
 			txn := state.table.NewTransaction()
-			if err := txn.SetProperties(iceberglib.Properties{
+			if err := txn.SetProperties(icebergCommitProperties(ctx, iceberglib.Properties{
 				icetable.ParquetRowGroupLimitKey: strconv.Itoa(desired),
-			}); err != nil {
+			})); err != nil {
 				return err
 			}
 			committed, commitErr := txn.Commit(ctx)
 			updated = committed
-			return commitErr
+			return classifyCatalogCommitError(committed, commitErr)
 		})
 		if err != nil && (updated != nil || !errors.Is(err, icetable.ErrCommitFailed)) {
 			return util.Permanent(err)
@@ -338,6 +340,7 @@ func (s *Sink) handleSnapshotTableComplete(ctx context.Context, ev model.Event) 
 	if !ev.SnapshotRolling || !snapshotRollingEnabled(s.cfg) {
 		return nil
 	}
+	ctx = withIcebergBatch(ctx, snapshotIcebergBatch(tableKey(ev.Schema, ev.Table), 0, ev.SnapshotStartOffset))
 	state := s.states[tableKey(ev.Schema, ev.Table)]
 	if state == nil || state.snapshotSpool == nil {
 		return nil
@@ -402,11 +405,13 @@ func (s *Sink) finalizeSnapshotSpool(ctx context.Context, state *tableState) err
 		}
 		err := s.withCommitSlot(ctx, commitProgress{
 			operation:       result.operation,
+			icebergCommit:   true,
+			recoveredTable:  &updated,
 			sourceKey:       state.sourceKey,
 			targetNamespace: state.targetNamespace,
 			targetTable:     state.targetTable,
 			rowCount:        result.rowCount,
-		}, func() error {
+		}, func(ctx context.Context) error {
 			var commitErr error
 			updated, commitErr = s.commitSnapshotSpool(ctx, state, spool, sizing.readBatchRows)
 			return commitErr
@@ -498,7 +503,7 @@ func (s *Sink) commitSnapshotSpool(ctx context.Context, state *tableState, spool
 	}
 
 	txn := state.table.NewTransaction()
-	delta := txn.NewRowDelta(s.snapshotProps(state))
+	delta := txn.NewRowDelta(icebergCommitProperties(ctx, s.snapshotProps(state)))
 	delta.AddRows(stagedFiles...)
 	if err := delta.Commit(ctx); err != nil {
 		return nil, err
@@ -515,7 +520,7 @@ func (s *Sink) commitSnapshotSpool(ctx context.Context, state *tableState, spool
 		// can have an unknown outcome, so leave their files for orphan cleanup.
 		cleanupStaged = true
 	}
-	return updated, err
+	return updated, classifyCatalogCommitError(updated, err)
 }
 
 func (s *Sink) resetSnapshotSpool(state *tableState) {

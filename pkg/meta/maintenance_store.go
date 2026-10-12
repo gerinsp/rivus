@@ -490,7 +490,7 @@ func (s *IcebergMaintenanceStore) ensureIndex(ctx context.Context, table, index,
 
 func (s *IcebergMaintenanceStore) SnapshotDone(ctx context.Context, metaKey string) (bool, bool, error) {
 	var done int
-	err := s.db.QueryRowContext(ctx, `SELECT done FROM job_snapshots WHERE job_id = ?`, metaKey).Scan(&done)
+	err := s.db.QueryRowContext(ctx, `SELECT CASE WHEN done = 1 AND completion_version = 1 THEN 1 ELSE 0 END FROM job_snapshots WHERE job_id = ?`, metaKey).Scan(&done)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, false, nil
 	}

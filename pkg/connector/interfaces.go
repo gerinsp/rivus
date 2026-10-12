@@ -2,6 +2,7 @@ package connector
 
 import (
 	"context"
+	"time"
 
 	"github.com/gerinsp/rivus/pkg/config"
 	"github.com/gerinsp/rivus/pkg/meta"
@@ -47,6 +48,12 @@ type Sink interface {
 }
 
 type ProgressInfo struct {
+	RecoveryStatus          string
+	RecoveryOperationID     string
+	RecoveryAttempts        int
+	RecoveryLastError       string
+	RecoveryCheckpoint      string
+	RecoveryStartedAt       time.Time
 	Phase                   string
 	Summary                 string
 	Detail                  string

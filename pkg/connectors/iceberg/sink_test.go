@@ -2229,6 +2229,22 @@ type testOffsetStore struct {
 	saveCount  int
 }
 
+func (s *testOffsetStore) BeginIcebergCommit(context.Context, meta.IcebergCommitIntent) error {
+	return nil
+}
+
+func (s *testOffsetStore) MarkIcebergCommitCommitted(context.Context, string, string) error {
+	return nil
+}
+
+func (s *testOffsetStore) DeleteIcebergCommit(context.Context, string, string) error {
+	return nil
+}
+
+func (s *testOffsetStore) ListIcebergCommits(context.Context, string) ([]meta.IcebergCommitIntent, error) {
+	return nil, nil
+}
+
 func (s *testOffsetStore) GetOffset(context.Context, string) (*meta.Offset, error) {
 	return s.offset, nil
 }

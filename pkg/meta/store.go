@@ -3,6 +3,7 @@ package meta
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"strings"
 	"time"
 
@@ -21,6 +22,13 @@ type SnapshotState struct {
 	StartPos  uint32
 	Done      bool
 	UpdatedAt time.Time
+	// Version 1 proves the sink saved completion after all required writes.
+	// Legacy done=1 rows have version 0 and cannot safely authorize CDC.
+	CompletionVersion int
+}
+
+func (s *SnapshotState) CompletionConfirmed() bool {
+	return s != nil && s.Done && s.CompletionVersion == 1
 }
 
 type SnapshotProgress struct {
@@ -37,6 +45,8 @@ type OffsetStore interface {
 
 	GetSnapshotState(ctx context.Context, jobID string) (*SnapshotState, error)
 	SaveSnapshotStart(ctx context.Context, jobID string, start Offset) error
+	// Sink-only: call after all required snapshot writes are committed, before
+	// completion ACK. Missing/legacy state must fail; confirmed calls repeat safely.
 	MarkSnapshotDone(ctx context.Context, jobID string) error
 	GetSnapshotProgress(ctx context.Context, jobID string) (*SnapshotProgress, error)
 	SaveSnapshotProgress(ctx context.Context, jobID string, tableName string, nextOffset int64, cursorJSON string) error
@@ -47,10 +57,16 @@ type OffsetStore interface {
 }
 
 type MySQLOffsetStore struct {
-	db *sql.DB
+	db     *sql.DB
+	runner sqlRunner
+	target string
 }
 
 func NewMySQLOffsetStore(dsn string) (*MySQLOffsetStore, error) {
+	target, err := mysqlStoreTarget(dsn)
+	if err != nil {
+		return nil, err
+	}
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return nil, err
@@ -60,7 +76,7 @@ func NewMySQLOffsetStore(dsn string) (*MySQLOffsetStore, error) {
 	db.SetConnMaxIdleTime(time.Minute)
 	db.SetConnMaxLifetime(30 * time.Minute)
 
-	return &MySQLOffsetStore{db: db}, nil
+	return &MySQLOffsetStore{db: db, target: target}, nil
 }
 
 func (s *MySQLOffsetStore) Close() error {
@@ -78,7 +94,7 @@ CREATE TABLE IF NOT EXISTS job_offsets (
   binlog_pos  BIGINT NOT NULL,
   updated_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 );`
-	if _, err := s.db.ExecContext(ctx, ddl); err != nil {
+	if _, err := s.sqlRunner().ExecContext(ctx, ddl); err != nil {
 		return err
 	}
 
@@ -90,7 +106,10 @@ CREATE TABLE IF NOT EXISTS job_snapshots (
   done        TINYINT(1) NOT NULL DEFAULT 0,
   updated_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 );`
-	if _, err := s.db.ExecContext(ctx, ddl2); err != nil {
+	if _, err := s.sqlRunner().ExecContext(ctx, ddl2); err != nil {
+		return err
+	}
+	if _, err := s.sqlRunner().ExecContext(ctx, `ALTER TABLE job_snapshots ADD COLUMN completion_version TINYINT NOT NULL DEFAULT 0 AFTER done`); err != nil && !isDuplicateColumnError(err) {
 		return err
 	}
 
@@ -101,11 +120,41 @@ CREATE TABLE IF NOT EXISTS job_snapshot_progress (
   next_offset  BIGINT NOT NULL,
   updated_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 );`
-	if _, err := s.db.ExecContext(ctx, ddl3); err != nil {
+	if _, err := s.sqlRunner().ExecContext(ctx, ddl3); err != nil {
 		return err
 	}
 
-	if _, err := s.db.ExecContext(ctx, `ALTER TABLE job_snapshot_progress ADD COLUMN cursor_json LONGTEXT NULL AFTER next_offset`); err != nil && !isDuplicateColumnError(err) {
+	if _, err := s.sqlRunner().ExecContext(ctx, `ALTER TABLE job_snapshot_progress ADD COLUMN cursor_json LONGTEXT NULL AFTER next_offset`); err != nil && !isDuplicateColumnError(err) {
+		return err
+	}
+	if _, err := s.sqlRunner().ExecContext(ctx, `CREATE TABLE IF NOT EXISTS iceberg_commit_intents (
+		operation_id CHAR(36) NOT NULL PRIMARY KEY,
+		job_id VARCHAR(255) NOT NULL,
+		state_key VARCHAR(255) NOT NULL,
+		batch_id VARCHAR(512) NOT NULL,
+		kind VARCHAR(16) NOT NULL,
+		source_start_file VARCHAR(255) NOT NULL DEFAULT '',
+		source_start_pos BIGINT NOT NULL DEFAULT 0,
+		source_end_file VARCHAR(255) NOT NULL DEFAULT '',
+		source_end_pos BIGINT NOT NULL DEFAULT 0,
+		snapshot_table VARCHAR(255) NOT NULL DEFAULT '',
+		snapshot_start_offset BIGINT NOT NULL DEFAULT 0,
+		snapshot_end_offset BIGINT NOT NULL DEFAULT 0,
+		status VARCHAR(16) NOT NULL,
+		created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		INDEX idx_iceberg_commit_state (state_key(191), status)
+	)`); err != nil {
+		return err
+	}
+
+	// Defaults preserve old intents; absent identity must continue to fail closed.
+	for _, column := range []string{"source_table", "target_namespace", "target_table", "operation"} {
+		if _, err := s.sqlRunner().ExecContext(ctx, "ALTER TABLE iceberg_commit_intents ADD COLUMN "+column+" VARCHAR(255) NOT NULL DEFAULT ''"); err != nil && !isDuplicateColumnError(err) {
+			return err
+		}
+	}
+
+	if _, err := s.sqlRunner().ExecContext(ctx, "ALTER TABLE iceberg_commit_intents ADD COLUMN replay_keys LONGTEXT NULL"); err != nil && !isDuplicateColumnError(err) {
 		return err
 	}
 
@@ -114,7 +163,7 @@ CREATE TABLE IF NOT EXISTS job_snapshot_progress (
 
 func (s *MySQLOffsetStore) GetOffset(ctx context.Context, jobID string) (*Offset, error) {
 	const q = `SELECT binlog_file, binlog_pos, updated_at FROM job_offsets WHERE job_id = ?`
-	row := s.db.QueryRowContext(ctx, q, jobID)
+	row := s.sqlRunner().QueryRowContext(ctx, q, jobID)
 
 	var off Offset
 	if err := row.Scan(&off.BinlogFile, &off.BinlogPos, &off.UpdatedAt); err != nil {
@@ -135,17 +184,17 @@ ON DUPLICATE KEY UPDATE
   binlog_pos = VALUES(binlog_pos),
   updated_at = NOW();
 `
-	_, err := s.db.ExecContext(ctx, stmt, jobID, off.BinlogFile, off.BinlogPos)
+	_, err := s.sqlRunner().ExecContext(ctx, stmt, jobID, off.BinlogFile, off.BinlogPos)
 	return err
 }
 
 func (s *MySQLOffsetStore) GetSnapshotState(ctx context.Context, jobID string) (*SnapshotState, error) {
-	const q = `SELECT job_id, start_file, start_pos, done, updated_at FROM job_snapshots WHERE job_id = ?`
-	row := s.db.QueryRowContext(ctx, q, jobID)
+	const q = `SELECT job_id, start_file, start_pos, done, updated_at, completion_version FROM job_snapshots WHERE job_id = ?`
+	row := s.sqlRunner().QueryRowContext(ctx, q, jobID)
 
 	var st SnapshotState
 	var doneInt int
-	if err := row.Scan(&st.JobID, &st.StartFile, &st.StartPos, &doneInt, &st.UpdatedAt); err != nil {
+	if err := row.Scan(&st.JobID, &st.StartFile, &st.StartPos, &doneInt, &st.UpdatedAt, &st.CompletionVersion); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}
@@ -163,25 +212,47 @@ ON DUPLICATE KEY UPDATE
   start_file = VALUES(start_file),
   start_pos = VALUES(start_pos),
   done = 0,
+  completion_version = 0,
   updated_at = NOW();
 `
-	_, err := s.db.ExecContext(ctx, stmt, jobID, start.BinlogFile, start.BinlogPos)
+	_, err := s.sqlRunner().ExecContext(ctx, stmt, jobID, start.BinlogFile, start.BinlogPos)
 	return err
 }
 
 func (s *MySQLOffsetStore) MarkSnapshotDone(ctx context.Context, jobID string) error {
+	// Called by the sink only after its completion barrier succeeds. Keep
+	// progress intact until the source receives the ACK. Do not upgrade an
+	// unsafe legacy done=1 row by merely flushing an empty restarted sink.
 	const stmt = `
 UPDATE job_snapshots
-SET done = 1, updated_at = NOW()
-WHERE job_id = ?;
+SET done = 1, completion_version = 1, updated_at = NOW()
+WHERE job_id = ? AND done = 0
+  AND NOT EXISTS (SELECT 1 FROM iceberg_commit_intents WHERE state_key = ? AND status <> 'COMMITTED');
 `
-	_, err := s.db.ExecContext(ctx, stmt, jobID)
-	return err
+	result, err := s.sqlRunner().ExecContext(ctx, stmt, jobID, jobID)
+	if err != nil {
+		return fmt.Errorf("mark snapshot done: %w", err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("snapshot completion affected rows: %w", err)
+	}
+	if count == 1 {
+		return nil
+	}
+	st, err := s.GetSnapshotState(ctx, jobID)
+	if err != nil {
+		return fmt.Errorf("verify snapshot completion: %w", err)
+	}
+	if st.CompletionConfirmed() {
+		return nil
+	}
+	return fmt.Errorf("snapshot completion BLOCKED for state=%s: missing start, legacy completion, or unresolved commit intent", jobID)
 }
 
 func (s *MySQLOffsetStore) GetSnapshotProgress(ctx context.Context, jobID string) (*SnapshotProgress, error) {
 	const q = `SELECT job_id, table_name, next_offset, cursor_json, updated_at FROM job_snapshot_progress WHERE job_id = ?`
-	row := s.db.QueryRowContext(ctx, q, jobID)
+	row := s.sqlRunner().QueryRowContext(ctx, q, jobID)
 
 	var st SnapshotProgress
 	var cursorJSON sql.NullString
@@ -207,20 +278,57 @@ ON DUPLICATE KEY UPDATE
   cursor_json = VALUES(cursor_json),
   updated_at = NOW();
 `
-	_, err := s.db.ExecContext(ctx, stmt, jobID, tableName, nextOffset, nullableString(cursorJSON))
+	_, err := s.sqlRunner().ExecContext(ctx, stmt, jobID, tableName, nextOffset, nullableString(cursorJSON))
+	if err != nil {
+		return err
+	}
+	// An ACKed Iceberg batch is safe to forget only after this durable
+	// snapshot progress covers its full row range. If cleanup fails, startup
+	// can still compare the retained COMMITTED intent with saved progress.
+	_, err = s.sqlRunner().ExecContext(ctx, `DELETE FROM iceberg_commit_intents WHERE state_key = ? AND kind = 'snapshot' AND status = 'COMMITTED' AND snapshot_table = ? AND snapshot_end_offset <= ?`, jobID, tableName, nextOffset)
 	return err
 }
 
 func (s *MySQLOffsetStore) ClearSnapshotProgress(ctx context.Context, jobID string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM job_snapshot_progress WHERE job_id = ?`, jobID)
+	_, err := s.sqlRunner().ExecContext(ctx, `DELETE FROM job_snapshot_progress WHERE job_id = ?`, jobID)
 	return err
 }
 
 func (s *MySQLOffsetStore) DeleteJobState(ctx context.Context, jobID string) error {
-	// best-effort: hapus snapshot & offset
-	_, _ = s.db.ExecContext(ctx, `DELETE FROM job_snapshots WHERE job_id = ?`, jobID)
-	_, _ = s.db.ExecContext(ctx, `DELETE FROM job_snapshot_progress WHERE job_id = ?`, jobID)
-	_, _ = s.db.ExecContext(ctx, `DELETE FROM job_offsets WHERE job_id = ?`, jobID)
+	if s.runner != nil {
+		return deleteJobState(ctx, s.runner, jobID)
+	}
+	// Serializable + locking read prevents an intent INSERT from racing the reset.
+	// All retained intents protect their checkpoints, including COMMITTED intents
+	// whose source acknowledgement has not yet become durable.
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	if err != nil {
+		return fmt.Errorf("begin job state cleanup %s: %w", jobID, err)
+	}
+	defer tx.Rollback()
+	if err := deleteJobState(ctx, tx, jobID); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit job state cleanup %s: %w", jobID, err)
+	}
+	return nil
+}
+
+func deleteJobState(ctx context.Context, tx sqlRunner, jobID string) error {
+	var operationID string
+	err := tx.QueryRowContext(ctx, `SELECT operation_id FROM iceberg_commit_intents WHERE state_key = ? OR job_id = ? LIMIT 1 FOR UPDATE`, jobID, jobID).Scan(&operationID)
+	if err == nil {
+		return fmt.Errorf("job state cleanup BLOCKED key=%s: retained Iceberg commit intent operation=%s requires recovery", jobID, operationID)
+	}
+	if err != sql.ErrNoRows {
+		return fmt.Errorf("check Iceberg intents before cleanup %s: %w", jobID, err)
+	}
+	for _, table := range []string{"job_snapshots", "job_snapshot_progress", "job_offsets"} {
+		if _, err := tx.ExecContext(ctx, "DELETE FROM "+table+" WHERE job_id = ?", jobID); err != nil {
+			return fmt.Errorf("delete %s key=%s: %w", table, jobID, err)
+		}
+	}
 	return nil
 }
 

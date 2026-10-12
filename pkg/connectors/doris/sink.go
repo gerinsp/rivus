@@ -1169,6 +1169,9 @@ func (state *dorisRunState) handleEvent(procCtx context.Context, ev model.Event)
 		var err error
 		if ev.Type == model.EventTypeSnapshotComplete {
 			err = state.flushAll(procCtx)
+			if err == nil {
+				err = connector.ConfirmSnapshotCompletion(procCtx, state.sink.offsetSto, state.sink.checkpointKey())
+			}
 		}
 		if ev.Ack != nil {
 			ev.Ack <- err

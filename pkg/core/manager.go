@@ -637,6 +637,7 @@ func (m *JobManager) Delete(id string) error {
 		m.mu.Unlock()
 		return ErrJobNotFound
 	}
+	executionRole := m.executionRoles[id]
 	delete(m.jobs, id)
 	delete(m.executionRoles, id)
 	delete(m.workerLeases, id)
@@ -667,10 +668,27 @@ func (m *JobManager) Delete(id string) error {
 			}
 		}
 		m.applyMaintenanceOwnershipStatus(job, job.GetStatus(), true)
+		if err := job.CleanupMeta(); err != nil {
+			// A retained intent must keep its job configuration available for recovery.
+			// Delete is asynchronous, so surface the failure by restoring a FAILED job.
+			job.mu.Lock()
+			job.persistenceDeleted = false
+			job.mu.Unlock()
+			job.addError("metadata cleanup", err)
+			job.setStatus(JobStatusFailed)
+			m.mu.Lock()
+			m.jobs[id] = job
+			m.executionRoles[id] = executionRole
+			m.mu.Unlock()
+			m.attachStatusListener(job)
+			if saveErr := m.saveManagedJobRecord(context.Background(), job, meta.DesiredStateStopped, JobStatusFailed); saveErr != nil {
+				log.Printf("[job-manager] persist cleanup failure job=%s: %v", id, saveErr)
+			}
+			return
+		}
 		if err := m.deletePersistedJobForJob(context.Background(), job, id); err != nil {
 			log.Printf("[job-manager] delete persisted job failed job=%s: %v", id, err)
 		}
-		job.CleanupMeta()
 	}()
 	return nil
 }
@@ -921,6 +939,8 @@ func (m *JobManager) Shutdown(ctx context.Context) error {
 		status := job.GetStatus()
 		if err := m.saveManagedJobRecordIfCurrent(ctx, job, status, meta.DesiredStateRunning, status); err != nil {
 			persistErrs = append(persistErrs, fmt.Errorf("persist drained job=%s: %w", job.Config.ID, err))
+		} else if m.workerRole != WorkerRoleAll {
+			m.releaseWorkerLeaseAfterDrain(job.Config.ID, job.SubmissionID(), true)
 		}
 	}
 
@@ -1810,6 +1830,21 @@ func (m *JobManager) startClaimedWorkerJob(record meta.PersistedJob) error {
 		return nil
 	}
 	m.restoreJobSnapshot(job, record, true)
+	sinkType, _ := job.pickSink()
+	job.mu.Lock()
+	job.runtimeFence = nil
+	if strings.EqualFold(sinkType, "iceberg_native") {
+		fencer, capable := m.jobStore.(meta.WorkerOffsetFencer)
+		token := meta.WorkerOwnership{JobID: cfg.ID, SubmissionID: record.SubmissionID, Owner: m.workerID}
+		job.runtimeFence = func(store meta.OffsetStore, stateKey string) (meta.OffsetStore, error) {
+			if !capable {
+				return nil, errors.New("Iceberg split worker requires transactional checkpoint ownership fencing")
+			}
+			token.StateKey = stateKey
+			return fencer.FenceWorkerOffsets(store, token)
+		}
+	}
+	job.mu.Unlock()
 
 	mode := config.JobModeResume
 	if m.workerRole == WorkerRoleSnapshot {
@@ -1871,7 +1906,17 @@ func snapshotFirstAttempt(lastStatus string, checkpointExists bool) bool {
 }
 
 func (m *JobManager) releaseWorkerLease(jobID, submissionID string) {
+	m.releaseWorkerLeaseAfterDrain(jobID, submissionID, false)
+}
+
+func (m *JobManager) releaseWorkerLeaseAfterDrain(jobID, submissionID string, shutdownDrainComplete bool) {
 	m.mu.Lock()
+	if _, restarting := m.restartResumeJobs[jobID]; !shutdownDrainComplete && m.shuttingDown && restarting {
+		// Shutdown must persist its final drained state while it still owns
+		// the lease. PAUSED callbacks used to release it before that write.
+		m.mu.Unlock()
+		return
+	}
 	if currentSubmissionID, ok := m.workerLeases[jobID]; ok && currentSubmissionID == submissionID {
 		delete(m.workerLeases, jobID)
 	}
@@ -2051,7 +2096,7 @@ func (m *JobManager) resumeCanBypassSnapshotGate(job *Job) bool {
 		return false
 	}
 	if st != nil {
-		return st.Done
+		return st.CompletionConfirmed()
 	}
 
 	off, err := store.GetOffset(ctx, metaKey)

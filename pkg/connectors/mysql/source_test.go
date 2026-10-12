@@ -717,6 +717,28 @@ func TestCDCHandlerCheckpointAcrossRenameRecreateGap(t *testing.T) {
 	}
 }
 
+func TestCDCHandlerDDLIncludesCommitGuardSourceOffset(t *testing.T) {
+	out := make(chan model.Event, 1)
+	handler := &cdcHandler{
+		jobID: "ddl-offset-test", currentBinlogFile: "mysql-bin.000007",
+		allowed: map[string]bool{"app.orders": true}, out: out, ctx: context.Background(),
+	}
+	err := handler.OnDDL(nil, gomysql.Position{Name: "mysql-bin.000007", Pos: 123}, &replication.QueryEvent{
+		Schema: []byte("app"), Query: []byte("ALTER TABLE orders ADD COLUMN note VARCHAR(10)"),
+	})
+	if err != nil {
+		t.Fatalf("OnDDL: %v", err)
+	}
+	select {
+	case ev := <-out:
+		if ev.Type != model.EventTypeDDL || !ev.SourceOffset.Valid() || ev.SourceOffset.BinlogFile != "mysql-bin.000007" || ev.SourceOffset.BinlogPos != 123 {
+			t.Fatalf("DDL source offset = %#v, want mysql-bin.000007:123", ev.SourceOffset)
+		}
+	default:
+		t.Fatal("expected DDL event")
+	}
+}
+
 func TestBuildSnapshotCursorPredicateUsesLexicographicKeyset(t *testing.T) {
 	cursor := &snapshotCursor{
 		Columns: []string{"tenant_id", "id"},
@@ -1119,7 +1141,15 @@ func TestResumeSnapshotOnlyProgressUsesSavedSnapshotProgress(t *testing.T) {
 	}
 
 	resumeCalled := false
-	resumed, err := src.resumeSnapshotOnlyProgress(context.Background(), nil, func(ctx context.Context, out chan<- model.Event) error {
+	out := make(chan model.Event)
+	go func() {
+		start := <-out
+		start.Ack <- nil
+		complete := <-out
+		_ = store.MarkSnapshotDone(context.Background(), src.checkpointKey())
+		complete.Ack <- nil
+	}()
+	resumed, err := src.resumeSnapshotOnlyProgress(context.Background(), out, func(ctx context.Context, out chan<- model.Event) error {
 		resumeCalled = true
 		return nil
 	})
@@ -1314,6 +1344,7 @@ func (s *testOffsetStore) SaveSnapshotStart(_ context.Context, jobID string, sta
 func (s *testOffsetStore) MarkSnapshotDone(context.Context, string) error {
 	if s.snapshot != nil {
 		s.snapshot.Done = true
+		s.snapshot.CompletionVersion = 1
 	}
 	return nil
 }
@@ -1396,5 +1427,45 @@ func fakeMasterPosQuery(queries *[]string, responses *[]masterPosRow) masterPosQ
 		row := (*responses)[0]
 		*responses = (*responses)[1:]
 		return row
+	}
+}
+
+type cleanupErrorStore struct {
+	*testOffsetStore
+	failKey string
+	err     error
+}
+
+func (s *cleanupErrorStore) DeleteJobState(ctx context.Context, key string) error {
+	if key == s.failKey {
+		return s.err
+	}
+	return s.testOffsetStore.DeleteJobState(ctx, key)
+}
+func TestResetInitialCheckpointPropagatesCleanupFailure(t *testing.T) {
+	for _, key := range []string{"job", "state"} {
+		t.Run(key, func(t *testing.T) {
+			injected := errors.New("injected metadata cleanup failure")
+			store := &cleanupErrorStore{testOffsetStore: &testOffsetStore{}, failKey: key, err: injected}
+			source := &Source{jobID: "job", stateKey: "state", offsetSto: store}
+			if err := source.resetInitialCheckpoint(context.Background()); !errors.Is(err, injected) {
+				t.Fatalf("reset returned %v", err)
+			}
+			if key == "job" && len(store.deletedJobIDs) > 0 {
+				t.Fatal("internal cleanup continued after failed legacy cleanup")
+			}
+		})
+	}
+}
+func TestSnapshotOnlyPropagatesCleanupFailureBeforeBarrier(t *testing.T) {
+	injected := errors.New("injected metadata cleanup failure")
+	store := &cleanupErrorStore{testOffsetStore: &testOffsetStore{}, failKey: "state", err: injected}
+	source := &Source{jobID: "job", stateKey: "state", offsetSto: store}
+	out := make(chan model.Event, 1)
+	if err := source.RunFull(context.Background(), out, config.JobModeSnapshotOnly); !errors.Is(err, injected) {
+		t.Fatalf("snapshot-only returned %v", err)
+	}
+	if len(out) > 0 {
+		t.Fatal("snapshot started after failed cleanup")
 	}
 }

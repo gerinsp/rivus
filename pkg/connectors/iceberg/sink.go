@@ -48,6 +48,9 @@ type Sink struct {
 	jobName              string
 	cfg                  config.IcebergConfig
 	retry                config.RetryPolicy
+	recoveryPolicy       *config.RetryPolicy
+	recoveryWait         func(context.Context, time.Duration) error
+	recoveryOperation    string
 	offsetSto            meta.OffsetStore
 	progress             connector.ProgressReporter
 	catalog              icecatalog.Catalog
@@ -62,6 +65,10 @@ type Sink struct {
 	sourceSchemas              map[string]*model.TableSchema
 	states                     map[string]*tableState
 	pendingOffset              *model.SourceOffset
+	recoveryIntents            []meta.IcebergCommitIntent
+	recoveryLoaded             map[string]bool
+	recoveryEvents             map[string]int
+	recoveryEventPayloads      map[string]string
 	lastCheckpointCommitAt     time.Time
 	lastCheckpointBlockedLogAt time.Time
 }
@@ -103,7 +110,11 @@ type reducedBatch struct {
 }
 
 type commitProgress struct {
+	// The proven table replaces a lost catalog response; the write callback
+	// must never be called again merely to recover its return value.
+	recoveredTable  **icetable.Table
 	operation       string
+	icebergCommit   bool
 	sourceKey       string
 	targetNamespace string
 	targetTable     string
@@ -284,6 +295,15 @@ func NewSink(jobID, stateKey, jobName string, cfg config.IcebergConfig, retry co
 		sourceSchemas: make(map[string]*model.TableSchema),
 		states:        make(map[string]*tableState),
 	}
+	if strings.TrimSpace(stateKey) != "" || offsetSto != nil {
+		sink.recoveryPolicy = automaticRecoveryPolicy(retry)
+	}
+	recoveryCtx, cancelRecovery := context.WithTimeout(context.Background(), catalogInitTimeout)
+	recoveryErr := sink.reconcileAutomatically(recoveryCtx)
+	cancelRecovery()
+	if recoveryErr != nil {
+		return nil, recoveryErr
+	}
 	sink.equalityCommitter = rivusEqualityCommitter{sink: sink}
 	sink.maintenance = newTableMaintenanceMonitor(jobID, sink.jobName, cfg, sink)
 	sink.maintenanceSignals, err = newNativeMaintenanceSignaler(jobID, cfg)
@@ -314,7 +334,7 @@ func (s *Sink) SetTableMaintenanceStatusReporter(reporter connector.TableMainten
 	s.maintenance.setStatusReporter(reporter)
 }
 
-func (s *Sink) withCommitSlot(ctx context.Context, progress commitProgress, fn func() error) error {
+func (s *Sink) withCommitSlot(ctx context.Context, progress commitProgress, fn func(context.Context) error) error {
 	release, err := acquireGlobalCommitSlot(ctx, s.cfg.MaxConcurrentCommits, func() func() {
 		return s.startCommitProgressHeartbeat(ctx, "sink_commit_wait", "Waiting for Iceberg commit slot", progress)
 	})
@@ -326,7 +346,10 @@ func (s *Sink) withCommitSlot(ctx context.Context, progress commitProgress, fn f
 	stop := s.startCommitProgressHeartbeat(ctx, "sink_commit", fmt.Sprintf("Committing Iceberg %s", progress.operation), progress)
 	defer stop()
 
-	return fn()
+	if progress.icebergCommit && (strings.TrimSpace(s.stateKey) != "" || s.offsetSto != nil) {
+		return s.guardedIcebergCommit(ctx, progress, fn)
+	}
+	return fn(ctx)
 }
 
 func acquireGlobalCommitSlot(ctx context.Context, configured int, onWait func() func()) (func(), error) {
@@ -550,13 +573,23 @@ func (s *Sink) commitPendingOffset(ctx context.Context, force bool) error {
 	off := *s.pendingOffset
 	s.mu.Unlock()
 
+	if err := s.checkRecoveryReplayComplete(&off); err != nil {
+		return util.Permanent(err)
+	}
+
 	saveCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
 	checkpointKey := s.checkpointKey()
 	if err := connector.SaveSourceOffset(saveCtx, s.offsetSto, checkpointKey, &off); err != nil {
+		if errors.Is(err, meta.ErrWorkerOwnershipLost) {
+			return util.Permanent(err)
+		}
 		log.Printf("[iceberg][job %s] save offset error key=%s pos=%s:%d: %v", s.jobID, checkpointKey, off.BinlogFile, off.BinlogPos, err)
 		return nil
+	}
+	if err := s.checkIcebergRecovery(saveCtx); err != nil {
+		return err
 	}
 
 	s.mu.Lock()
@@ -1426,11 +1459,13 @@ func (s *Sink) ResetTargetTable(ctx context.Context, targetSchema, targetTable s
 	var updated *icetable.Table
 	err = s.withCommitSlot(ctx, commitProgress{
 		operation:       "reset",
+		icebergCommit:   true,
+		recoveredTable:  &updated,
 		targetNamespace: targetSchema,
 		targetTable:     targetTable,
-	}, func() error {
+	}, func(ctx context.Context) error {
 		var commitErr error
-		updated, commitErr = tbl.Delete(ctx, iceberglib.AlwaysTrue{}, props, icetable.WithDeleteConcurrency(s.cfg.DeleteConcurrency))
+		updated, commitErr = commitDelete(ctx, tbl, iceberglib.AlwaysTrue{}, icebergCommitProperties(ctx, props), icetable.WithDeleteConcurrency(s.cfg.DeleteConcurrency))
 		return commitErr
 	})
 	if err != nil {
@@ -1450,6 +1485,10 @@ func (s *Sink) ResetTargetTable(ctx context.Context, targetSchema, targetTable s
 
 func (s *Sink) Run(ctx context.Context, in <-chan model.Event) error {
 	defer s.cleanupSnapshotSpoolDirectory()
+	if err := s.reconcileAutomatically(ctx); err != nil {
+		log.Printf("[iceberg][job %s] %v", s.jobID, err)
+		return err
+	}
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	if s.maintenance != nil {
@@ -1464,6 +1503,9 @@ func (s *Sink) Run(ctx context.Context, in <-chan model.Event) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case ev, ok := <-in:
+			if err := meta.CheckOwnership(ctx, s.offsetSto); err != nil {
+				return util.Permanent(err)
+			}
 			if !ok {
 				return s.flushAll(ctx)
 			}
@@ -1492,6 +1534,15 @@ func (s *Sink) handleEvent(ctx context.Context, ev model.Event) error {
 	}
 	if ev.Type == model.EventTypeSnapshotTableEnd {
 		return s.handleSnapshotTableComplete(ctx, ev)
+	}
+	if ev.Type == model.EventTypeDDL || ev.SourceOffset.Valid() {
+		ctx = withIcebergBatch(ctx, cdcIcebergBatch(tableKey(ev.Schema, ev.Table), []model.Event{ev}))
+	}
+
+	if skipped, err := s.skipRecoveredCDCEvent(ev); err != nil {
+		return util.Permanent(err)
+	} else if skipped {
+		return nil
 	}
 
 	sourceKey := tableKey(ev.Schema, ev.Table)
@@ -1542,7 +1593,17 @@ func (s *Sink) handleSnapshotBarrier(ctx context.Context, ev model.Event) (err e
 			s.maintenance.pauseSubmissions()
 		}
 	case model.EventTypeSnapshotComplete:
+		// A rolling batch ACK confirms only local spool durability. Completion
+		// must not bypass the table-end catalog commit, even with no pending rows.
+		for _, state := range s.states {
+			if state != nil && state.snapshotSpool != nil {
+				return fmt.Errorf("snapshot completion BLOCKED: uncommitted rolling spool for %s", state.sourceKey)
+			}
+		}
 		if err := s.flushAll(ctx); err != nil {
+			return err
+		}
+		if err := connector.ConfirmSnapshotCompletion(ctx, s.offsetSto, s.checkpointKey()); err != nil {
 			return err
 		}
 		if s.maintenance != nil {
@@ -1567,6 +1628,7 @@ func (s *Sink) handleSnapshotBatch(ctx context.Context, ev model.Event) (err err
 	}
 
 	sourceKey := tableKey(ev.Schema, ev.Table)
+	ctx = withIcebergBatch(ctx, snapshotIcebergBatch(sourceKey, ev.SnapshotStartOffset, ev.SnapshotStartOffset+int64(len(ev.Rows))))
 	state, err := s.ensureOperationalState(ctx, sourceKey)
 	if err != nil {
 		return err
@@ -1576,6 +1638,9 @@ func (s *Sink) handleSnapshotBatch(ctx context.Context, ev model.Event) (err err
 	}
 	if err := s.flushState(ctx, state); err != nil {
 		return err
+	}
+	if ev.SnapshotRolling && len(s.unrecoveredSnapshotRows(sourceKey, ev.SnapshotStartOffset, ev.Rows)) == 0 {
+		return nil
 	}
 	if ev.SnapshotRolling && snapshotRollingEnabled(s.cfg) && supportsRollingSnapshotMode(s.snapshotWriteModeForTableState(state)) {
 		if ev.SnapshotStartOffset == 0 {
@@ -1590,24 +1655,27 @@ func (s *Sink) handleSnapshotBatch(ctx context.Context, ev model.Event) (err err
 
 	startedAt := time.Now()
 	result := flushResult{operation: "snapshot-batch"}
-	rowOffset := 0
-	for _, rows := range splitRowsByLimits(ev.Rows, s.cfg.SnapshotBatchSize, int64(s.cfg.MaxBatchBytes)) {
-		batchStartOffset := ev.SnapshotStartOffset + int64(rowOffset)
-		var chunkResult flushResult
-		if err := util.RetryWithBackoff(ctx, s.retry, func() error {
-			if err := s.refreshStateTable(ctx, state); err != nil {
+	for _, span := range s.unrecoveredSnapshotRows(sourceKey, ev.SnapshotStartOffset, ev.Rows) {
+		rowOffset := 0
+		for _, rows := range splitRowsByLimits(span.rows, s.cfg.SnapshotBatchSize, int64(s.cfg.MaxBatchBytes)) {
+			batchStartOffset := span.start + int64(rowOffset)
+			chunkCtx := withIcebergBatch(ctx, snapshotIcebergBatch(sourceKey, batchStartOffset, batchStartOffset+int64(len(rows))))
+			var chunkResult flushResult
+			if err := util.RetryWithBackoff(chunkCtx, s.retry, func() error {
+				if err := s.refreshStateTable(chunkCtx, state); err != nil {
+					return err
+				}
+				var flushErr error
+				chunkResult, flushErr = s.flushSnapshotRowsOnce(chunkCtx, state, rows, ev.Timestamp, batchStartOffset)
+				return flushErr
+			}); err != nil {
 				return err
 			}
-			var flushErr error
-			chunkResult, flushErr = s.flushSnapshotRowsOnce(ctx, state, rows, ev.Timestamp, batchStartOffset)
-			return flushErr
-		}); err != nil {
-			return err
+			result.operation = chunkResult.operation
+			result.rowCount += chunkResult.rowCount
+			result.deleteCount += chunkResult.deleteCount
+			rowOffset += len(rows)
 		}
-		result.operation = chunkResult.operation
-		result.rowCount += chunkResult.rowCount
-		result.deleteCount += chunkResult.deleteCount
-		rowOffset += len(rows)
 	}
 
 	completedAt := time.Now()
@@ -1841,6 +1909,7 @@ func (s *Sink) flushState(ctx context.Context, state *tableState) error {
 	if len(events) == 0 {
 		return nil
 	}
+	ctx = withIcebergBatch(ctx, cdcIcebergBatch(state.sourceKey, events))
 
 	startedAt := time.Now()
 	var result flushResult
@@ -2148,15 +2217,17 @@ func (s *Sink) flushSnapshotAppendOnce(ctx context.Context, state *tableState, r
 	var writeCallDuration time.Duration
 	err = s.withCommitSlot(ctx, commitProgress{
 		operation:       result.operation,
+		icebergCommit:   true,
+		recoveredTable:  &updated,
 		sourceKey:       state.sourceKey,
 		targetNamespace: state.targetNamespace,
 		targetTable:     state.targetTable,
 		rowCount:        result.rowCount,
 		deleteCount:     result.deleteCount,
-	}, func() error {
+	}, func(ctx context.Context) error {
 		writeStartedAt = time.Now()
 		var commitErr error
-		updated, commitErr = state.table.Append(ctx, reader, props)
+		updated, commitErr = commitAppend(ctx, state.table, reader, icebergCommitProperties(ctx, props))
 		writeCallDuration = time.Since(writeStartedAt)
 		return commitErr
 	})
@@ -2222,7 +2293,7 @@ func (s *Sink) ensureSnapshotReplaceFilterAppliedWithTrino(ctx context.Context, 
 		sourceKey:       state.sourceKey,
 		targetNamespace: state.targetNamespace,
 		targetTable:     state.targetTable,
-	}, func() error {
+	}, func(ctx context.Context) error {
 		startedAt = time.Now()
 		execErr := s.execTrinoStatement(ctx, query, state.targetNamespace)
 		duration = time.Since(startedAt)
@@ -2534,13 +2605,15 @@ func (s *Sink) ensureSnapshotTruncateApplied(ctx context.Context, state *tableSt
 	var writeCallDuration time.Duration
 	err := s.withCommitSlot(ctx, commitProgress{
 		operation:       result.operation,
+		icebergCommit:   true,
+		recoveredTable:  &updated,
 		sourceKey:       state.sourceKey,
 		targetNamespace: state.targetNamespace,
 		targetTable:     state.targetTable,
-	}, func() error {
+	}, func(ctx context.Context) error {
 		writeStartedAt = time.Now()
 		var commitErr error
-		updated, commitErr = state.table.Delete(ctx, iceberglib.AlwaysTrue{}, props, icetable.WithDeleteConcurrency(s.cfg.DeleteConcurrency))
+		updated, commitErr = commitDelete(ctx, state.table, iceberglib.AlwaysTrue{}, icebergCommitProperties(ctx, props), icetable.WithDeleteConcurrency(s.cfg.DeleteConcurrency))
 		writeCallDuration = time.Since(writeStartedAt)
 		return commitErr
 	})
@@ -2572,7 +2645,7 @@ func (s *Sink) ensureSnapshotTruncateAppliedWithTrino(ctx context.Context, state
 		sourceKey:       state.sourceKey,
 		targetNamespace: state.targetNamespace,
 		targetTable:     state.targetTable,
-	}, func() error {
+	}, func(ctx context.Context) error {
 		startedAt = time.Now()
 		execErr := s.execTrinoStatement(ctx, query, state.targetNamespace)
 		duration = time.Since(startedAt)
@@ -2613,7 +2686,7 @@ func (s *Sink) applyKeyDeleteWithTrino(ctx context.Context, state *tableState, b
 		targetTable:     state.targetTable,
 		rowCount:        result.rowCount,
 		deleteCount:     result.deleteCount,
-	}, func() error {
+	}, func(ctx context.Context) error {
 		startedAt = time.Now()
 		for _, keys := range splitDeleteKeys(batch.deleteKeys, 500) {
 			query, err := s.keyDeleteTrinoSQL(state, keys)
@@ -2716,26 +2789,28 @@ func (s *Sink) flushSnapshotDeleteAppendOnce(ctx context.Context, state *tableSt
 	var writeCallDuration time.Duration
 	err = s.withCommitSlot(ctx, commitProgress{
 		operation:       result.operation,
+		icebergCommit:   true,
+		recoveredTable:  &updated,
 		sourceKey:       state.sourceKey,
 		targetNamespace: state.targetNamespace,
 		targetTable:     state.targetTable,
 		rowCount:        result.rowCount,
 		deleteCount:     result.deleteCount,
-	}, func() error {
+	}, func(ctx context.Context) error {
 		writeStartedAt = time.Now()
 		txn := state.table.NewTransaction()
-		if err := txn.Delete(ctx, batch.filter, props, icetable.WithDeleteConcurrency(s.cfg.DeleteConcurrency)); err != nil {
+		if err := txn.Delete(ctx, batch.filter, icebergCommitProperties(ctx, props), icetable.WithDeleteConcurrency(s.cfg.DeleteConcurrency)); err != nil {
 			writeCallDuration = time.Since(writeStartedAt)
 			return err
 		}
-		if err := txn.Append(ctx, reader, props); err != nil {
+		if err := txn.Append(ctx, reader, icebergCommitProperties(ctx, props)); err != nil {
 			writeCallDuration = time.Since(writeStartedAt)
 			return err
 		}
 		var commitErr error
 		updated, commitErr = txn.Commit(ctx)
 		writeCallDuration = time.Since(writeStartedAt)
-		return commitErr
+		return classifyCatalogCommitError(updated, commitErr)
 	})
 	s.logWriteTiming(state, result, err, writeStartedAt, writeCallDuration)
 	if err != nil {
@@ -2791,15 +2866,17 @@ func (s *Sink) flushReducedBatchOnce(ctx context.Context, state *tableState, bat
 		result.operation = "append"
 		err = s.withCommitSlot(ctx, commitProgress{
 			operation:       result.operation,
+			icebergCommit:   true,
+			recoveredTable:  &updated,
 			sourceKey:       state.sourceKey,
 			targetNamespace: state.targetNamespace,
 			targetTable:     state.targetTable,
 			rowCount:        result.rowCount,
 			deleteCount:     result.deleteCount,
-		}, func() error {
+		}, func(ctx context.Context) error {
 			writeStartedAt = time.Now()
 			var commitErr error
-			updated, commitErr = state.table.Append(ctx, reader, props)
+			updated, commitErr = commitAppend(ctx, state.table, reader, icebergCommitProperties(ctx, props))
 			writeCallDuration = time.Since(writeStartedAt)
 			return commitErr
 		})
@@ -2807,15 +2884,17 @@ func (s *Sink) flushReducedBatchOnce(ctx context.Context, state *tableState, bat
 		result.operation = "delete"
 		err = s.withCommitSlot(ctx, commitProgress{
 			operation:       result.operation,
+			icebergCommit:   true,
+			recoveredTable:  &updated,
 			sourceKey:       state.sourceKey,
 			targetNamespace: state.targetNamespace,
 			targetTable:     state.targetTable,
 			rowCount:        result.rowCount,
 			deleteCount:     result.deleteCount,
-		}, func() error {
+		}, func(ctx context.Context) error {
 			writeStartedAt = time.Now()
 			var commitErr error
-			updated, commitErr = state.table.Delete(ctx, batch.filter, props, icetable.WithDeleteConcurrency(s.cfg.DeleteConcurrency))
+			updated, commitErr = commitDelete(ctx, state.table, batch.filter, icebergCommitProperties(ctx, props), icetable.WithDeleteConcurrency(s.cfg.DeleteConcurrency))
 			writeCallDuration = time.Since(writeStartedAt)
 			return commitErr
 		})
@@ -2829,26 +2908,28 @@ func (s *Sink) flushReducedBatchOnce(ctx context.Context, state *tableState, bat
 		result.operation = "delete-append"
 		err = s.withCommitSlot(ctx, commitProgress{
 			operation:       result.operation,
+			icebergCommit:   true,
+			recoveredTable:  &updated,
 			sourceKey:       state.sourceKey,
 			targetNamespace: state.targetNamespace,
 			targetTable:     state.targetTable,
 			rowCount:        result.rowCount,
 			deleteCount:     result.deleteCount,
-		}, func() error {
+		}, func(ctx context.Context) error {
 			writeStartedAt = time.Now()
 			txn := state.table.NewTransaction()
-			if err := txn.Delete(ctx, batch.filter, props, icetable.WithDeleteConcurrency(s.cfg.DeleteConcurrency)); err != nil {
+			if err := txn.Delete(ctx, batch.filter, icebergCommitProperties(ctx, props), icetable.WithDeleteConcurrency(s.cfg.DeleteConcurrency)); err != nil {
 				writeCallDuration = time.Since(writeStartedAt)
 				return err
 			}
-			if err := txn.Append(ctx, reader, props); err != nil {
+			if err := txn.Append(ctx, reader, icebergCommitProperties(ctx, props)); err != nil {
 				writeCallDuration = time.Since(writeStartedAt)
 				return err
 			}
 			var commitErr error
 			updated, commitErr = txn.Commit(ctx)
 			writeCallDuration = time.Since(writeStartedAt)
-			return commitErr
+			return classifyCatalogCommitError(updated, commitErr)
 		})
 	}
 	s.logWriteTiming(state, result, err, writeStartedAt, writeCallDuration)
@@ -2890,15 +2971,17 @@ func (s *Sink) flushReducedBatchWithTrinoDeleteOnce(ctx context.Context, state *
 	var writeCallDuration time.Duration
 	err = s.withCommitSlot(ctx, commitProgress{
 		operation:       "append-after-delete-trino",
+		icebergCommit:   true,
+		recoveredTable:  &updated,
 		sourceKey:       state.sourceKey,
 		targetNamespace: state.targetNamespace,
 		targetTable:     state.targetTable,
 		rowCount:        result.rowCount,
 		deleteCount:     result.deleteCount,
-	}, func() error {
+	}, func(ctx context.Context) error {
 		writeStartedAt = time.Now()
 		var commitErr error
-		updated, commitErr = state.table.Append(ctx, reader, props)
+		updated, commitErr = commitAppend(ctx, state.table, reader, icebergCommitProperties(ctx, props))
 		writeCallDuration = time.Since(writeStartedAt)
 		return commitErr
 	})
@@ -3111,17 +3194,19 @@ func (s *Sink) applyDDL(ctx context.Context, state *tableState, ev model.Event) 
 		}
 		commitErr := s.withCommitSlot(ctx, commitProgress{
 			operation:       "schema",
+			icebergCommit:   true,
+			recoveredTable:  &updated,
 			sourceKey:       state.sourceKey,
 			targetNamespace: state.targetNamespace,
 			targetTable:     state.targetTable,
-		}, func() error {
+		}, func(ctx context.Context) error {
 			var err error
+			if err = txn.SetProperties(icebergCommitProperties(ctx, nil)); err != nil {
+				return err
+			}
 			updated, err = txn.Commit(ctx)
-			return err
+			return classifyCatalogCommitError(updated, err)
 		})
-		if commitErr != nil && (updated != nil || !errors.Is(commitErr, icetable.ErrCommitFailed)) {
-			return util.Permanent(commitErr)
-		}
 		return commitErr
 	})
 	if err != nil {
@@ -3330,11 +3415,13 @@ func (s *Sink) loadOrCreateTable(ctx context.Context, namespace, tableName strin
 	var created *icetable.Table
 	err = s.withCommitSlot(ctx, commitProgress{
 		operation:       "create_table",
+		icebergCommit:   true,
+		recoveredTable:  &created,
 		targetNamespace: namespace,
 		targetTable:     tableName,
-	}, func() error {
+	}, func(ctx context.Context) error {
 		var commitErr error
-		created, commitErr = s.catalog.CreateTable(ctx, ident, sc, icecatalog.WithProperties(s.defaultTableProperties()))
+		created, commitErr = s.catalog.CreateTable(ctx, ident, sc, icecatalog.WithProperties(icebergCommitProperties(ctx, s.defaultTableProperties())))
 		return commitErr
 	})
 	if err != nil {
@@ -3361,13 +3448,18 @@ func (s *Sink) syncTableSchema(ctx context.Context, tbl *icetable.Table, targetN
 	var updated *icetable.Table
 	err = s.withCommitSlot(ctx, commitProgress{
 		operation:       "schema",
+		icebergCommit:   true,
+		recoveredTable:  &updated,
 		sourceKey:       tableKey(sourceSchema.SchemaName, sourceSchema.TableName),
 		targetNamespace: targetNamespace,
 		targetTable:     targetTable,
-	}, func() error {
+	}, func(ctx context.Context) error {
 		var commitErr error
+		if commitErr = txn.SetProperties(icebergCommitProperties(ctx, nil)); commitErr != nil {
+			return commitErr
+		}
 		updated, commitErr = txn.Commit(ctx)
-		return commitErr
+		return classifyCatalogCommitError(updated, commitErr)
 	})
 	if err != nil {
 		return nil, s.operationError("sync table schema", err)

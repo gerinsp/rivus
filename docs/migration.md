@@ -4,6 +4,20 @@ Rivus stores execution state durably, so upgrades should preserve metadata and c
 
 This guide covers the main upgrade paths for a pre-1.0 deployment.
 
+## v0.5.0 reliability hardening
+
+This update changes snapshot completion validation and split Iceberg worker requirements. Follow the general upgrade procedure below, stop all old workers before starting new ones, and retain a metadata backup. Mixed worker versions are unsafe because older code does not enforce the new completion and intent checks.
+
+- Offset-store initialization adds `job_snapshots.completion_version` (default `0`) and creates/extends `iceberg_commit_intents` with operation, target, source-range and replay identity fields. Metadata credentials need the existing startup `CREATE`/`ALTER` privileges.
+- Legacy `done=1, completion_version=0` does not prove the sink committed all required snapshot data. Such completion is blocked pending operator verification. Do not promote it to version `1` solely because `done=1` exists.
+- Split `iceberg_native` workers require job registry and checkpoint stores on the same MySQL network endpoint and database, with transactional InnoDB tables. Endpoint aliases are compared conservatively; different addresses are rejected even if they resolve to the same server. Unsupported stores are rejected before connector startup.
+- Preserve PREPARED and uncovered COMMITTED intents. Missing catalog evidence is not proof that a commit failed. Reset/delete is blocked while unresolved state remains; do not remove that state to force replay.
+- Recovery uses the existing job `retry` configuration with bounded verification. No new production environment variable is required. Jobs already FAILED remain manual; exhausted or unproven recovery does not auto-resubmit them.
+
+Downgrade is unsafe while new completion state or unresolved/uncovered commit intents exist: older workers may ignore those correctness barriers. Stop workers and assess source, target, checkpoint and intent consistency before choosing a rollback. A metadata backup alone does not undo Iceberg commits; restoring an earlier checkpoint can replay already committed data.
+
+See [release notes](releases/v0.5.0-reliability-hardening.md) and the [isolated recovery test runbook](../tests/recovery/README.md).
+
 ## General upgrade rules
 
 Before every production upgrade:

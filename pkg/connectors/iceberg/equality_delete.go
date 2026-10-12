@@ -3,6 +3,7 @@ package iceberg
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -73,12 +74,14 @@ func (s *Sink) applyEqualityDelta(ctx context.Context, state *tableState, batch 
 	var duration time.Duration
 	err := s.withCommitSlot(ctx, commitProgress{
 		operation:       result.operation,
+		icebergCommit:   true,
+		recoveredTable:  &updated,
 		sourceKey:       state.sourceKey,
 		targetNamespace: state.targetNamespace,
 		targetTable:     state.targetTable,
 		rowCount:        result.rowCount,
 		deleteCount:     result.deleteCount,
-	}, func() error {
+	}, func(ctx context.Context) error {
 		startedAt = time.Now()
 		var err error
 		committer := s.equalityCommitter
@@ -163,7 +166,7 @@ func (s *Sink) commitEqualityDelta(ctx context.Context, state *tableState, batch
 	}
 
 	txn := tbl.NewTransaction()
-	delta := txn.NewRowDelta(s.snapshotProps(state))
+	delta := txn.NewRowDelta(icebergCommitProperties(ctx, s.snapshotProps(state)))
 	delta.AddDeletes(deleteFiles...)
 	if len(dataFiles) > 0 {
 		delta.AddRows(dataFiles...)
@@ -178,7 +181,10 @@ func (s *Sink) commitEqualityDelta(ctx context.Context, state *tableState, batch
 	cleanupStaged = false
 	updated, err := txn.Commit(ctx)
 	if err != nil {
-		return nil, err
+		if updated == nil && errors.Is(err, icetable.ErrCommitFailed) {
+			cleanupStaged = true
+		}
+		return updated, classifyCatalogCommitError(updated, err)
 	}
 	return updated, nil
 }

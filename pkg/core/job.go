@@ -59,6 +59,12 @@ type JobProgress struct {
 	SinkDetail              string `json:"sink_detail,omitempty"`
 	SinkTable               string `json:"sink_table,omitempty"`
 	SinkRows                int64  `json:"sink_rows,omitempty"`
+	RecoveryStatus          string `json:"recovery_status,omitempty"`
+	RecoveryOperationID     string `json:"recovery_operation_id,omitempty"`
+	RecoveryAttempts        int    `json:"recovery_attempts,omitempty"`
+	RecoveryLastError       string `json:"recovery_last_error,omitempty"`
+	RecoveryCheckpoint      string `json:"recovery_checkpoint,omitempty"`
+	RecoveryStartedAt       string `json:"recovery_started_at,omitempty"`
 }
 
 type Checkpoint struct {
@@ -140,8 +146,9 @@ type Job struct {
 	registry *connector.Registry
 
 	// meta checkpoint
-	metaStore meta.OffsetStore
-	metaKey   string
+	metaStore    meta.OffsetStore
+	metaKey      string
+	runtimeFence func(meta.OffsetStore, string) (meta.OffsetStore, error)
 
 	// graph snapshot
 	graph *JobGraph
@@ -315,7 +322,7 @@ func (j *Job) Checkpoint() *Checkpoint {
 		cp.SnapshotState = &CheckpointSnapshotState{
 			StartFile: st.StartFile,
 			StartPos:  st.StartPos,
-			Done:      st.Done,
+			Done:      st.CompletionConfirmed(),
 			UpdatedAt: formatCheckpointTime(st.UpdatedAt),
 		}
 	}
@@ -922,6 +929,14 @@ func (j *Job) updateProgress(info connector.ProgressInfo) {
 		CheckpointReason:        strings.TrimSpace(info.CheckpointReason),
 		CheckpointPosition:      strings.TrimSpace(info.CheckpointPosition),
 		CheckpointPendingTables: strings.TrimSpace(info.CheckpointPendingTables),
+		RecoveryStatus:          info.RecoveryStatus,
+		RecoveryOperationID:     info.RecoveryOperationID,
+		RecoveryAttempts:        info.RecoveryAttempts,
+		RecoveryLastError:       info.RecoveryLastError,
+		RecoveryCheckpoint:      info.RecoveryCheckpoint,
+	}
+	if !info.RecoveryStartedAt.IsZero() {
+		progress.RecoveryStartedAt = info.RecoveryStartedAt.UTC().Format(time.RFC3339Nano)
 	}
 
 	j.mu.Lock()
@@ -986,7 +1001,7 @@ func mergeCDCHealthProgress(previous, incoming JobProgress) *JobProgress {
 
 func isSinkRuntimeProgress(phase string) bool {
 	switch strings.ToLower(strings.TrimSpace(phase)) {
-	case "sink_commit", "sink_commit_wait", "sink_checkpoint", "sink_checkpoint_wait":
+	case "sink_commit", "sink_commit_wait", "sink_checkpoint", "sink_checkpoint_wait", "sink_recovery":
 		return true
 	default:
 		return false
@@ -1012,7 +1027,19 @@ func mergeSinkRuntimeProgress(previous, incoming JobProgress) *JobProgress {
 	merged.CheckpointReason = incoming.CheckpointReason
 	merged.CheckpointPosition = incoming.CheckpointPosition
 	merged.CheckpointPendingTables = incoming.CheckpointPendingTables
+	if incoming.RecoveryStatus != "" {
+		copyRecoveryProgress(&merged, incoming)
+	}
 	return &merged
+}
+
+func copyRecoveryProgress(to *JobProgress, from JobProgress) {
+	to.RecoveryStatus = from.RecoveryStatus
+	to.RecoveryOperationID = from.RecoveryOperationID
+	to.RecoveryAttempts = from.RecoveryAttempts
+	to.RecoveryLastError = from.RecoveryLastError
+	to.RecoveryCheckpoint = from.RecoveryCheckpoint
+	to.RecoveryStartedAt = from.RecoveryStartedAt
 }
 
 func mergeSourceRuntimeProgress(previous, incoming JobProgress) *JobProgress {
@@ -1022,6 +1049,7 @@ func mergeSourceRuntimeProgress(previous, incoming JobProgress) *JobProgress {
 	merged.SinkDetail = previous.SinkDetail
 	merged.SinkTable = previous.SinkTable
 	merged.SinkRows = previous.SinkRows
+	copyRecoveryProgress(&merged, previous)
 	merged.CheckpointPending = previous.CheckpointPending
 	merged.CheckpointReason = previous.CheckpointReason
 	merged.CheckpointPosition = previous.CheckpointPosition
@@ -1269,15 +1297,18 @@ func (j *Job) StopAsync() {
 }
 
 // IMPORTANT: delete meta state when job is deleted from manager/UI
-func (j *Job) CleanupMeta() {
+func (j *Job) CleanupMeta() error {
 	j.mu.RLock()
 	store := j.metaStore
 	key := j.metaKey
 	j.mu.RUnlock()
 	if store == nil && key != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_, _ = j.ensureMetaStore(ctx)
+		_, err := j.ensureMetaStore(ctx)
 		cancel()
+		if err != nil {
+			return fmt.Errorf("open metadata store for cleanup: %w", err)
+		}
 	}
 
 	j.mu.Lock()
@@ -1287,15 +1318,15 @@ func (j *Job) CleanupMeta() {
 	j.mu.Unlock()
 
 	if store == nil {
-		return
+		return nil
 	}
 	defer closeOffsetStore(store)
 	if key == "" {
-		return
+		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = store.DeleteJobState(ctx, key)
+	return store.DeleteJobState(ctx, key)
 }
 
 // ---- NEW: Graph accessor ----
@@ -1529,7 +1560,18 @@ func (j *Job) startWithMode(mode config.JobMode) (err error) {
 	j.mu.Lock()
 	j.metaKey = metaKey
 	runtimeMetaStore := j.metaStore
+	runtimeFence := j.runtimeFence
 	j.mu.Unlock()
+	if runtimeFence != nil {
+		var err error
+		runtimeMetaStore, err = runtimeFence(runtimeMetaStore, metaKey)
+		if err != nil {
+			return j.failStart("worker ownership", err, cancel)
+		}
+		if err := meta.CheckOwnership(ctx, runtimeMetaStore); err != nil {
+			return j.failStart("worker ownership", err, cancel)
+		}
+	}
 
 	jctx := connector.JobContext{
 		JobID:        j.Config.ID,

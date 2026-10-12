@@ -1,0 +1,24 @@
+name: rivus-recovery-test
+services:
+  source:
+    image: mysql:8@sha256:6ea90827b1100f8f2ae306a539f86d2c264a26ed435a2a9f75551dd5c3aeb242
+    command: ["--server-id=101", "--log-bin=mysql-bin", "--binlog-format=ROW", "--binlog-row-image=FULL"]
+    environment:
+      MYSQL_ROOT_PASSWORD: recovery-test-only
+      MYSQL_DATABASE: source_test
+    ports: ["127.0.0.1:49316:3306"]
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-precovery-test-only"]
+      interval: 2s
+      retries: 40
+  metadata:
+    image: mysql:8@sha256:6ea90827b1100f8f2ae306a539f86d2c264a26ed435a2a9f75551dd5c3aeb242
+    command: ["--innodb-flush-log-at-trx-commit=1", "--sync-binlog=1"]
+    environment:
+      MYSQL_ROOT_PASSWORD: recovery-test-only
+      MYSQL_DATABASE: recovery_meta
+    ports: ["127.0.0.1:49317:3306"]
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-precovery-test-only"]
+      interval: 2s
+      retries: 40

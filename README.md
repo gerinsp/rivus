@@ -88,12 +88,16 @@ See [docs/runtime-roles.md](docs/runtime-roles.md) for lifecycle and handoff det
 - Graceful pause, resume, cancel, restart, and checkpoint drain behavior.
 - Doris sink with table creation, DDL forwarding, batching, retries, and stream-load support.
 - Native Iceberg REST catalog sink for object-storage-backed tables.
+- Durable Iceberg commit intents and bounded automatic reconciliation of ambiguous commits; processing resumes only after positive commit proof. Failed jobs still require operator action.
+- Sink-confirmed snapshot completion and transactional checkpoint ownership fencing for split Iceberg workers.
 - Hybrid Iceberg maintenance with durable scheduling, native `iceberg-go` operations, and Spark fallback for heavy compaction.
 - Master API/UI with durable worker progress and maintenance state.
 - Central log viewer over role-separated rotating files.
 - Optional UI login and API-token protection.
 - YAML/JSON job configs with `${ENV_VAR}` placeholder expansion.
 - Multi-architecture container images for `linux/amd64` and `linux/arm64`.
+
+See [reliability hardening notes](docs/releases/v0.5.0-reliability-hardening.md) for upgrade requirements, verification results, and recovery limits.
 
 ## Quick start
 
