@@ -240,7 +240,10 @@ func (m *JobManager) resubmitDurableJob(job *Job) (*Job, error) {
 	if role != meta.JobExecutionRoleSnapshot && role != meta.JobExecutionRoleStreaming {
 		role = executionRoleForConfig(job.Config)
 	}
-	freshSnapshot := jobCheckpointBinlogPurged(job)
+	freshSnapshot, err := jobFreshSnapshotOnResubmit(job)
+	if err != nil {
+		return nil, err
+	}
 	if freshSnapshot {
 		role = meta.JobExecutionRoleSnapshot
 	}

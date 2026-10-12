@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -185,6 +186,31 @@ func TestSnapshotCompletionLegacyDoneBlocksRestart(t *testing.T) {
 	}
 	if len(out) != 0 || store.progress == nil {
 		t.Fatal("legacy state was upgraded or discarded")
+	}
+}
+
+func TestSnapshotCompletionLegacyDoneReportsMigrationWithoutTrustingCDC(t *testing.T) {
+	for _, mode := range []config.JobMode{config.JobModeResume, config.JobModeSnapshotHandoffResume} {
+		t.Run(string(mode), func(t *testing.T) {
+			src, store := incompleteCompletionSource()
+			store.snapshot.Done = true
+			store.progress = nil // Old completion cleared progress before final ACK.
+			store.offset = &meta.Offset{BinlogFile: "mysql-bin.000002", BinlogPos: 500}
+			ctx, _ := completionTestContext(t)
+			out := make(chan model.Event, 1)
+			err := src.RunFull(ctx, out, mode)
+			if err == nil {
+				t.Fatal("legacy completion was trusted based on an advanced CDC checkpoint")
+			}
+			for _, want := range []string{"job_id=job", "state_key=state", "completion_version=0", "docs/legacy-snapshot-recovery.md", "resubmit alone"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q missing migration context %q", err, want)
+				}
+			}
+			if len(out) != 0 || store.snapshot.CompletionVersion != 0 || store.offset.BinlogPos != 500 {
+				t.Fatal("blocked migration emitted a completion event or changed durable state")
+			}
+		})
 	}
 }
 

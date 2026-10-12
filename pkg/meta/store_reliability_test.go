@@ -143,3 +143,24 @@ func TestDeleteJobStateAtomicAndProtectsIntents(t *testing.T) {
 		})
 	}
 }
+
+func TestCheckJobStateCleanupDoesNotMutateCheckpoints(t *testing.T) {
+	for _, fault := range []string{"PREPARED", "COMMITTED", "query", "none"} {
+		t.Run(fault, func(t *testing.T) {
+			original := map[string]bool{"job_snapshots": true, "job_snapshot_progress": true, "job_offsets": true}
+			state := &deleteFailureState{present: maps.Clone(original), failBegin: true, failQuery: fault == "query"}
+			if fault == "PREPARED" || fault == "COMMITTED" {
+				state.intent = "retained-operation"
+			}
+			db := sql.OpenDB(deleteFailureConnector{state})
+			defer db.Close()
+			err := (&MySQLOffsetStore{db: db}).CheckJobStateCleanup(context.Background(), "job")
+			if (err != nil) != (fault != "none") || !maps.Equal(state.present, original) || len(state.calls) != 0 {
+				t.Fatalf("check err=%v checkpoints=%v deletes=%v", err, state.present, state.calls)
+			}
+			if fault == "query" && !errors.Is(err, errInjectedOffsetDelete) {
+				t.Fatalf("read failure was not propagated: %v", err)
+			}
+		})
+	}
+}

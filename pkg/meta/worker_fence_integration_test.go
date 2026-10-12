@@ -178,3 +178,77 @@ func TestWorkerFenceRealMySQLLeaseExpiresDuringMutation(t *testing.T) {
 	}
 	t.Log("real MySQL lease expired inside slow SQL mutation; second ownership check rolled back offset 42 to 4")
 }
+
+func TestWorkerFenceRealMySQLClaimDoesNotScanLockedRunningJobs(t *testing.T) {
+	for _, legacy := range []bool{true, false} {
+		name := "existing_submission"
+		if legacy {
+			name = "legacy_submission"
+		}
+		t.Run(name, func(t *testing.T) { claimWhileRunningJobLocked(t, legacy) })
+	}
+}
+
+func claimWhileRunningJobLocked(t *testing.T, legacy bool) {
+	t.Helper()
+	db, _, _, runningKey := realFenceFixture(t)
+	registry, err := NewMySQLJobStore(fenceIntegrationDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer registry.Close()
+	queuedKey := "claim_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	queuedSubmission := uuid.NewString()
+	if err := registry.SaveJob(ctx, PersistedJob{ID: queuedKey, SubmissionID: queuedSubmission, Config: &config.JobConfig{ID: queuedKey}, MetaKey: queuedKey, DesiredState: DesiredStateRunning, ExecutionRole: JobExecutionRoleStreaming, LastStatus: "QUEUED"}); err != nil {
+		t.Fatal(err)
+	}
+	defer registry.DeleteJob(context.Background(), queuedKey)
+	// Simulate a legacy control plane inserting an empty submission token
+	// after Init. Only the row being claimed may be backfilled by polling.
+	if legacy {
+		if _, err := db.ExecContext(ctx, "UPDATE job_registry SET submission_id='' WHERE job_id=?", queuedKey); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lock, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Rollback()
+	var owner string
+	if err := lock.QueryRowContext(ctx, "SELECT lease_owner FROM job_registry WHERE job_id=? FOR UPDATE", runningKey).Scan(&owner); err != nil {
+		t.Fatal(err)
+	}
+	if owner != "fence-owner" {
+		t.Fatalf("unexpected running owner %q", owner)
+	}
+	claimCtx, stopClaim := context.WithTimeout(ctx, time.Second)
+	defer stopClaim()
+	records, err := registry.ClaimJobs(claimCtx, JobExecutionRoleStreaming, "next-owner", 1, 30*time.Second)
+	if err != nil {
+		t.Fatalf("claiming an unrelated queued job waited on the running row: %v", err)
+	}
+	if len(records) != 1 || records[0].ID != queuedKey || records[0].SubmissionID == "" || records[0].LeaseOwner != "next-owner" {
+		t.Fatalf("legacy queued row was not claimed with a durable token: %#v", records)
+	}
+	if !legacy && records[0].SubmissionID != queuedSubmission {
+		t.Fatal("claim changed an existing submission generation")
+	}
+	// The unrelated running row remains locked throughout claim and renewal.
+	renewed, err := registry.RenewJobLease(claimCtx, queuedKey, records[0].SubmissionID, "next-owner", 30*time.Second)
+	if err != nil || !renewed {
+		t.Fatalf("unrelated registry lock blocked claimed worker renewal: renewed=%t err=%v", renewed, err)
+	}
+	if err := lock.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	var oldOwner, oldSubmission string
+	if err := db.QueryRowContext(ctx, "SELECT lease_owner,submission_id FROM job_registry WHERE job_id=?", runningKey).Scan(&oldOwner, &oldSubmission); err != nil {
+		t.Fatal(err)
+	}
+	if oldOwner != "fence-owner" || oldSubmission == "" {
+		t.Fatal("claim polling modified the running worker's identity")
+	}
+}

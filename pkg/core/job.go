@@ -1572,6 +1572,11 @@ func (j *Job) startWithMode(mode config.JobMode) (err error) {
 			return j.failStart("worker ownership", err, cancel)
 		}
 	}
+	if effectiveMode == config.JobModeInitial || effectiveMode == config.JobModeSnapshotOnly || effectiveMode == config.JobModeSnapshotHandoff {
+		if err := j.checkFreshSnapshotRecovery(ctx, runtimeMetaStore, metaKey); err != nil {
+			return j.failStart("snapshot recovery", err, cancel)
+		}
+	}
 
 	jctx := connector.JobContext{
 		JobID:        j.Config.ID,

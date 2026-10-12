@@ -35,9 +35,21 @@ SQL trigger keyed ke fixture masing-masing menyebabkan COMMITTED write failure; 
 
 Metadata tests memakai **dua MySQL sessions nyata**: advisory-lock barrier yang terlihat pada `performance_schema.metadata_locks` menahan offset mutation, competing registry update wajib mendapat lock timeout 1205, lalu stale token ditolak setelah takeover. Slow trigger membuat lease expired saat SQL mutation; second ownership check wajib rollback offset 42 ke 4.
 
+Claim-poll regression menahan registry row milik running job sambil worker lain melakukan claim dan renewal untuk queued job. Dua cases memastikan legacy submission yang kosong diberi token durable dan existing token tidak diganti. Global backfill sebelum claim awalnya menyebabkan timeout pada unrelated locked row; follow-up patch membatasi backfill pada claim candidate. Detail: [worker ownership recovery](../../docs/worker-ownership-recovery.md).
+
 Harness sebelumnya tetap diuji: SIGKILL sebelum request, sesudah catalog commit, sesudah COMMITTED, dan sesudah checkpoint; SQL cleanup failure wajib rollback ketiga checkpoint rows. Hanya SIGKILL exit yang dihitung sebagai intended crash; ordinary test errors, startup failures, atau timeout menggagalkan test.
 
 ## Batas bukti
+
+Fresh-snapshot admission regression memakai source dan metadata MySQL nyata. Saved file `mysql-bin.000000` mendahului available fixture history; actual source diagnostics mengembalikan `purged` tanpa menghapus fixture binlog. Empat cases (ALL/master, PREPARED/COMMITTED) mempertahankan role/status, submission, lease, checkpoint dan receipts setelah resubmit ditolak. Public ID menemukan internal-key intent. Detail: [Iceberg checkpoint recovery](../../docs/iceberg-checkpoint-recovery.md).
+
+Jalankan seluruh **20 scenarios**, termasuk regression baru dan existing crash faults, setelah fixture setup:
+
+```sh
+env RIVUS_RECOVERY_INTEGRATION=1 RIVUS_RECOVERY_CONTAINER_FAULTS=1 go test -p=1 -tags=integration ./pkg/core ./pkg/connectors/iceberg ./pkg/meta -run '^(TestFreshSnapshotReal|TestAutomaticRecoveryReal|TestWorkerFenceReal|TestRecoveryReal)' -count=1 -v -timeout=5m
+```
+
+Admission cases tidak menguji actual source purge, binlog restoration atau target rebuild. Original 16 crash/fence/claim scenarios tetap lulus tanpa skips pada verification terbaru.
 
 Ini menguji actual process crash, metadata-server crash, lease failover, dan local Iceberg persistence. Catalog response loss/unavailability memakai test decorators, bukan network fault pada REST server nyata. REST/S3, source-server crash, snapshot/rolling-spool SIGKILL, external writers/rollback/expiration, host failure, dan exactly-once untuk semua kombinasi config belum dibuktikan.
 

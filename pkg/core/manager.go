@@ -428,7 +428,11 @@ func (m *JobManager) Resubmit(id string) (*Job, error) {
 			}
 		}
 		mode := config.JobModeResume
-		if jobCheckpointBinlogPurged(job) {
+		freshSnapshot, err := jobFreshSnapshotOnResubmit(job)
+		if err != nil {
+			return nil, err
+		}
+		if freshSnapshot {
 			mode = config.JobModeInitial
 			if normalizeMode(job.Config.Mode) == config.JobModeSnapshotOnly {
 				mode = config.JobModeSnapshotOnly

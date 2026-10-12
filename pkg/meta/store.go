@@ -316,18 +316,39 @@ func (s *MySQLOffsetStore) DeleteJobState(ctx context.Context, jobID string) err
 }
 
 func deleteJobState(ctx context.Context, tx sqlRunner, jobID string) error {
-	var operationID string
-	err := tx.QueryRowContext(ctx, `SELECT operation_id FROM iceberg_commit_intents WHERE state_key = ? OR job_id = ? LIMIT 1 FOR UPDATE`, jobID, jobID).Scan(&operationID)
-	if err == nil {
-		return fmt.Errorf("job state cleanup BLOCKED key=%s: retained Iceberg commit intent operation=%s requires recovery", jobID, operationID)
-	}
-	if err != sql.ErrNoRows {
-		return fmt.Errorf("check Iceberg intents before cleanup %s: %w", jobID, err)
+	if err := checkJobStateCleanup(ctx, tx, jobID, true); err != nil {
+		return err
 	}
 	for _, table := range []string{"job_snapshots", "job_snapshot_progress", "job_offsets"} {
 		if _, err := tx.ExecContext(ctx, "DELETE FROM "+table+" WHERE job_id = ?", jobID); err != nil {
 			return fmt.Errorf("delete %s key=%s: %w", table, jobID, err)
 		}
+	}
+	return nil
+}
+
+// JobStateCleanupChecker supports a non-mutating admission check. Cleanup
+// must still repeat the check under its transaction lock to close the race.
+type JobStateCleanupChecker interface {
+	CheckJobStateCleanup(context.Context, string) error
+}
+
+func (s *MySQLOffsetStore) CheckJobStateCleanup(ctx context.Context, key string) error {
+	return checkJobStateCleanup(ctx, s.sqlRunner(), key, false)
+}
+
+func checkJobStateCleanup(ctx context.Context, runner sqlRunner, jobID string, lock bool) error {
+	query := `SELECT operation_id FROM iceberg_commit_intents WHERE state_key = ? OR job_id = ? LIMIT 1`
+	if lock {
+		query += " FOR UPDATE"
+	}
+	var operationID string
+	err := runner.QueryRowContext(ctx, query, jobID, jobID).Scan(&operationID)
+	if err == nil {
+		return fmt.Errorf("job state cleanup BLOCKED key=%s: retained Iceberg commit intent operation=%s requires recovery", jobID, operationID)
+	}
+	if err != sql.ErrNoRows {
+		return fmt.Errorf("check Iceberg intents before cleanup %s: %w", jobID, err)
 	}
 	return nil
 }

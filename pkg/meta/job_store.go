@@ -459,12 +459,6 @@ func (s *MySQLJobStore) ClaimJobs(ctx context.Context, role JobExecutionRole, ow
 	if leaseDuration <= 0 {
 		leaseDuration = 30 * time.Second
 	}
-	// An older control-plane binary may insert a row using the column default
-	// during a rolling deployment. Fence it before any new worker can claim it.
-	if _, err := s.db.ExecContext(ctx, `UPDATE job_registry SET submission_id=LOWER(REPLACE(UUID(), '-', '')) WHERE submission_id=''`); err != nil {
-		return nil, err
-	}
-
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -506,9 +500,14 @@ func (s *MySQLJobStore) ClaimJobs(ctx context.Context, role JobExecutionRole, ow
 
 	leaseUntil := time.Now().UTC().Add(leaseDuration)
 	for _, id := range ids {
+		// A legacy control plane can insert an empty submission after Init.
+		// Backfill only this locked candidate, atomically with its lease. A
+		// global UPDATE on every poll locks unrelated running jobs even when
+		// none match the predicate and can block renewal beyond lease expiry.
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE job_registry
-			SET lease_owner=?, lease_until=?
+			SET lease_owner=?, lease_until=?,
+			    submission_id=CASE WHEN submission_id='' THEN LOWER(REPLACE(UUID(), '-', '')) ELSE submission_id END
 			WHERE job_id=? AND execution_role=? AND desired_state=?
 			  AND (lease_until IS NULL OR lease_until < UTC_TIMESTAMP(6))`,
 			owner, leaseUntil, id, string(role), string(DesiredStateRunning)); err != nil {

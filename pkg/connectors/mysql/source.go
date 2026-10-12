@@ -2956,7 +2956,7 @@ func (s *Source) runFull(ctx context.Context, out chan<- model.Event, mode confi
 		if st != nil {
 			if st.Done {
 				if !st.CompletionConfirmed() {
-					return fmt.Errorf("snapshot completion BLOCKED: legacy done state has no sink confirmation for job_id=%s", s.jobID)
+					return fmt.Errorf("snapshot completion BLOCKED: legacy done state has no sink confirmation for job_id=%s state_key=%s completion_version=%d; verify the original snapshot and follow docs/legacy-snapshot-recovery.md; resubmit alone cannot repair this metadata", s.jobID, s.checkpointKey(), st.CompletionVersion)
 				}
 				if err := s.completeSnapshot(ctx, out); err != nil {
 					return err

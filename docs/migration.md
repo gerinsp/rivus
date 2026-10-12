@@ -18,6 +18,10 @@ Downgrade is unsafe while new completion state or unresolved/uncovered commit in
 
 See [release notes](releases/v0.5.0-reliability-hardening.md) and the [isolated recovery test runbook](../tests/recovery/README.md).
 
+For existing jobs failing with `snapshot completion BLOCKED: legacy done state has no sink confirmation`, follow the [legacy snapshot recovery runbook](legacy-snapshot-recovery.md). A one-time operator attestation is appropriate only after verifying the original snapshot's required writes; resubmit alone does not migrate legacy completion state.
+
+`worker ownership lost` is a separate lease error. The follow-up patch removes a global legacy backfill from claim polling that could lock unrelated running jobs. See [worker ownership recovery](worker-ownership-recovery.md) for investigation, deployment, and resubmission steps. Do not change snapshot confirmation or clear retained commit intents to bypass ownership checks.
+
 ## General upgrade rules
 
 Before every production upgrade:
@@ -156,6 +160,8 @@ Before upgrading, compare:
 Do not copy the new `.env.example` over a production `.env`; merge new keys intentionally while preserving secrets and environment-specific values.
 
 ## Verification queries
+
+For cleanup blocked by retained Iceberg receipts, especially after a saved binlog is purged, see [Iceberg checkpoint recovery](iceberg-checkpoint-recovery.md). Proving a commit does not authorize discarding its replay receipt or starting a fresh snapshot.
 
 The exact metadata schema may evolve, but the operational questions remain the same:
 
