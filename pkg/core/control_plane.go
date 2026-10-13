@@ -242,7 +242,10 @@ func (m *JobManager) resubmitDurableJob(job *Job) (*Job, error) {
 	}
 	freshSnapshot, err := jobFreshSnapshotOnResubmit(job)
 	if err != nil {
-		return nil, err
+		if rebuildErr := m.rebuildPurgedIcebergJob(job, err); rebuildErr != nil {
+			return nil, rebuildErr
+		}
+		return job, nil
 	}
 	if freshSnapshot {
 		role = meta.JobExecutionRoleSnapshot

@@ -119,3 +119,88 @@ func TestFreshSnapshotRealMySQLPurgedBinlogRetainsReceipts(t *testing.T) {
 		}
 	}
 }
+
+func TestPurgedBinlogResubmitArchivesConfirmedReceiptsForConfiguredRebuild(t *testing.T) {
+	if os.Getenv("RIVUS_RECOVERY_INTEGRATION") != "1" {
+		t.Skip("isolated Colima fixture opt-in")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	const dsn = "root:recovery-test-only@tcp(127.0.0.1:49317)/recovery_meta?parseTime=true&timeout=5s"
+	offsets, err := meta.NewMySQLOffsetStore(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer offsets.Close()
+	registry, err := meta.NewMySQLJobStore(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer registry.Close()
+	if err := offsets.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cfg := newTestJobConfig("purged_rebuild_" + strings.ReplaceAll(uuid.NewString(), "-", ""))
+	cfg.Source = &config.ConnectorSpec{Type: "mysql", Config: map[string]any{"addr": "127.0.0.1:49316", "user": "root", "password": "recovery-test-only", "database": "source_test", "table": "orders"}}
+	cfg.Sink = &config.ConnectorSpec{Type: "iceberg_native", Config: map[string]any{"snapshot_write_mode": "auto", "snapshot_truncate_tables": []string{"source_test.orders"}}}
+	manager := NewJobManager(nil, WithJobStore(registry), WithControlPlaneRole())
+	job := manager.newManagedJob(cfg)
+	job.metaStore = offsets
+	key := job.ensureMetaKey()
+	job.setStatus(JobStatusFailed)
+	manager.mu.Lock()
+	manager.jobs[cfg.ID] = job
+	manager.executionRoles[cfg.ID] = meta.JobExecutionRoleStreaming
+	manager.mu.Unlock()
+	before := meta.PersistedJob{ID: cfg.ID, SubmissionID: job.SubmissionID(), Config: cfg, MetaKey: key, DesiredState: meta.DesiredStateStopped, ExecutionRole: meta.JobExecutionRoleStreaming, LastStatus: string(JobStatusFailed)}
+	if err := registry.SaveJob(ctx, before); err != nil {
+		t.Fatal(err)
+	}
+	operation := uuid.NewString()
+	defer func() {
+		offsets.DeleteIcebergCommit(context.Background(), key, operation)
+		offsets.DeleteJobState(context.Background(), key)
+		registry.DeleteJob(context.Background(), cfg.ID)
+	}()
+	checkpoint := meta.Offset{BinlogFile: "mysql-bin.000000", BinlogPos: 4}
+	if err := offsets.SaveOffset(ctx, key, checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	if err := offsets.BeginIcebergCommit(ctx, meta.IcebergCommitIntent{JobID: cfg.ID, StateKey: key, OperationID: operation, Kind: "cdc", Operation: "append", SourceTable: "source_test.orders", SourceEndFile: checkpoint.BinlogFile, SourceEndPos: 42}); err != nil {
+		t.Fatal(err)
+	}
+	if err := offsets.MarkIcebergCommitCommitted(ctx, key, operation); err != nil {
+		t.Fatal(err)
+	}
+	if observed, err := job.durableCheckpointBinlogStatus(ctx); err != nil || observed != "purged" {
+		t.Fatalf("status=%s error=%v", observed, err)
+	}
+	if _, err := manager.RequestResubmit(cfg.ID); err != nil {
+		t.Fatalf("configured rebuild remained blocked: %v", err)
+	}
+	if job.GetStatus() != JobStatusQueued {
+		t.Fatalf("status=%s", job.GetStatus())
+	}
+	if intents, err := offsets.ListIcebergCommits(ctx, key); err != nil || len(intents) != 0 {
+		t.Fatalf("active intents=%v error=%v", intents, err)
+	}
+	if off, err := offsets.GetOffset(ctx, key); err != nil || off != nil {
+		t.Fatalf("old checkpoint=%v error=%v", off, err)
+	}
+	records, err := registry.LoadJobs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, record := range records {
+		if record.ID == cfg.ID {
+			if record.SubmissionID == before.SubmissionID || record.ExecutionRole != meta.JobExecutionRoleSnapshot || record.ResumeRequested || record.DesiredState != meta.DesiredStateRunning || record.LastStatus != string(JobStatusQueued) || record.Config.Metadata[config.IcebergRebuildFullResetKey] != record.SubmissionID {
+				t.Fatalf("invalid rebuild registration: %+v", record)
+			}
+			return
+		}
+	}
+	t.Fatal("rebuild lost durable registry row")
+}

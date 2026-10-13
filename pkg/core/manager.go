@@ -641,6 +641,24 @@ func (m *JobManager) Delete(id string) error {
 		m.mu.Unlock()
 		return ErrJobNotFound
 	}
+	// A stopped job cannot drain its retained receipts any further. Report
+	// admission failure synchronously instead of returning "deleted" and then
+	// restoring the job asynchronously. Cleanup still checks under SQL locks.
+	if !job.runActive() {
+		m.mu.Unlock()
+		if err := job.checkDeleteAdmission(); err != nil {
+			return err
+		}
+		m.mu.Lock()
+		if m.shuttingDown {
+			m.mu.Unlock()
+			return ErrJobManagerShuttingDown
+		}
+		if m.jobs[id] != job {
+			m.mu.Unlock()
+			return ErrJobNotFound
+		}
+	}
 	executionRole := m.executionRoles[id]
 	delete(m.jobs, id)
 	delete(m.executionRoles, id)
@@ -1556,7 +1574,7 @@ func desiredStateForStatus(status JobStatus) meta.DesiredState {
 
 func parsePersistedStatus(raw string) JobStatus {
 	switch JobStatus(strings.ToUpper(strings.TrimSpace(raw))) {
-	case JobStatusCreated, JobStatusQueued, JobStatusPending, JobStatusRunning, JobStatusPausing, JobStatusPaused, JobStatusFailed, JobStatusStopped, JobStatusDone:
+	case JobStatusCreated, JobStatusQueued, JobStatusPending, JobStatusRunning, JobStatusPausing, JobStatusPaused, JobStatusFailed, JobStatusStopped, JobStatusStopping, JobStatusDone:
 		return JobStatus(strings.ToUpper(strings.TrimSpace(raw)))
 	default:
 		return JobStatusCreated

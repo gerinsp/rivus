@@ -221,6 +221,31 @@ func TestRestoreJobSnapshotUsesPersistedMetaKey(t *testing.T) {
 	}
 }
 
+func TestRestoreStoppingStatusPreservesOwnership(t *testing.T) {
+	for _, fault := range []string{"released", "owned", "lease without owner", "desired running", "ALL"} {
+		t.Run(fault, func(t *testing.T) {
+			manager := NewJobManager(connector.NewRegistry(), WithControlPlaneRole())
+			job := NewJob(newTestJobConfig("stopping-status"), manager.reg)
+			record := meta.PersistedJob{ID: job.Config.ID, LastStatus: "STOPPING", DesiredState: meta.DesiredStateStopped, ExecutionRole: meta.JobExecutionRoleStreaming}
+			switch fault {
+			case "owned":
+				record.LeaseOwner = "previous-worker"
+			case "lease without owner":
+				record.LeaseUntil = time.Now().Add(time.Minute)
+			case "desired running":
+				record.DesiredState = meta.DesiredStateRunning
+			case "ALL":
+				record.ExecutionRole = meta.JobExecutionRoleAll
+			}
+			manager.restoreJobSnapshot(job, record, false)
+			want := JobStatus("STOPPING")
+			if got := job.GetStatus(); got != want {
+				t.Fatalf("status=%s want=%s; STOPPING must never appear as CREATED", got, want)
+			}
+		})
+	}
+}
+
 func TestRestoreJobSnapshotRestoresPersistedProgress(t *testing.T) {
 	progressJSON, err := json.Marshal(&JobProgress{
 		Phase:            "snapshot",

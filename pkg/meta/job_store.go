@@ -162,6 +162,9 @@ func (s *MySQLJobStore) Close() error {
 }
 
 func (s *MySQLJobStore) Init(ctx context.Context) error {
+	if _, err := s.db.ExecContext(ctx, jobRecoveryArchiveDDL); err != nil {
+		return err
+	}
 	const ddl = `
 	CREATE TABLE IF NOT EXISTS job_registry (
 	  job_id        VARCHAR(255) NOT NULL PRIMARY KEY,

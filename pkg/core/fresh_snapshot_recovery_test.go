@@ -130,3 +130,27 @@ func TestFreshIcebergSnapshotFailsClosedWithoutCheckerOrOwnership(t *testing.T) 
 		})
 	}
 }
+
+func TestArchivedRebuildPreflightResetsEmptyAndPopulatedTargets(t *testing.T) {
+	cfg := newTestJobConfig("archived-full-rebuild")
+	cfg.Source = &config.ConnectorSpec{Type: "mysql", Config: map[string]any{"tables": []string{"app.empty", "app.populated"}}}
+	cfg.Sink = &config.ConnectorSpec{Type: "iceberg_native", Config: map[string]any{"snapshot_write_mode": "truncate-append"}}
+	cfg.Metadata = map[string]string{"iceberg_rebuild_full_reset": "true"}
+	job := NewJob(cfg, connector.NewRegistry())
+	cfg.Metadata[config.IcebergRebuildFullResetKey] = job.SubmissionID()
+	source := &countResumeSource{tables: []connector.TableRef{{Schema: "app", Table: "empty"}, {Schema: "app", Table: "populated"}}, sourceCounts: map[string]int64{"app.empty": 0, "app.populated": 10}}
+	sink := &countResumeSink{targetCounts: map[string]int64{"target.empty": 3, "target.populated": 7}}
+	if err := job.preflight(context.Background(), source, sink, config.JobModeSnapshotHandoff); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.resetTargets) != 2 {
+		t.Fatalf("rebuild failed to clear every target before snapshot: %v", sink.resetTargets)
+	}
+	resets := len(sink.resetTargets)
+	if err := job.preflight(context.Background(), source, sink, config.JobModeSnapshotHandoffResume); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.resetTargets) != resets {
+		t.Fatal("snapshot resume erased committed snapshot prefix")
+	}
+}

@@ -11,8 +11,9 @@ import (
 )
 
 type commitIntentSQLState struct {
-	intents map[string]IcebergCommitIntent
-	ddlSeen bool
+	intents      map[string]IcebergCommitIntent
+	ddlSeen      bool
+	jobIndexSeen bool
 }
 
 type commitIntentSQLConnector struct{ state *commitIntentSQLState }
@@ -43,6 +44,9 @@ func (commitIntentSQLConn) Begin() (driver.Tx, error) {
 
 func (c commitIntentSQLConn) ExecContext(_ context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
 	switch {
+	case query == "CREATE INDEX idx_iceberg_commit_job ON iceberg_commit_intents (job_id)":
+		c.state.jobIndexSeen = true
+		return driver.RowsAffected(0), nil
 	case strings.Contains(query, "CREATE TABLE IF NOT EXISTS iceberg_commit_intents"):
 		c.state.ddlSeen = true
 		return driver.RowsAffected(0), nil
@@ -128,8 +132,8 @@ func TestIcebergCommitIntentSQLLifecycle(t *testing.T) {
 	defer db.Close()
 	store := &MySQLOffsetStore{db: db}
 	ctx := context.Background()
-	if err := store.Init(ctx); err != nil || !state.ddlSeen {
-		t.Fatalf("Init=(%v, ddlSeen=%t), want created intent table", err, state.ddlSeen)
+	if err := store.Init(ctx); err != nil || !state.ddlSeen || !state.jobIndexSeen {
+		t.Fatalf("Init=(%v, ddlSeen=%t, jobIndexSeen=%t), want intent table and public job index", err, state.ddlSeen, state.jobIndexSeen)
 	}
 	intent := IcebergCommitIntent{
 		OperationID: "f77879a4-f54c-455c-a14c-8b617e5aca12", JobID: "job", StateKey: "state", BatchID: "batch-42", Kind: "cdc",

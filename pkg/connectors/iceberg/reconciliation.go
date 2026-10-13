@@ -128,7 +128,57 @@ func (s *Sink) loadProvenIcebergTable(ctx context.Context, intent meta.IcebergCo
 	return nil, fmt.Errorf("matching operation not found in retained main snapshot ancestry")
 }
 
-func (s *Sink) retainRecoveryReceipt(intent meta.IcebergCommitIntent) error {
+// Version 2 keeps each event's offset alongside the original identity hash.
+// The complete manifest is fingerprinted before the catalog call. This lets
+// restart distinguish a durably checkpointed prefix from the replay suffix.
+// Legacy string arrays remain readable and retain their original fingerprint.
+type icebergReplayEvent struct {
+	Key    string              `json:"key"`
+	Offset *model.SourceOffset `json:"offset"`
+}
+
+type icebergReplayManifest struct {
+	Version int                  `json:"version"`
+	Events  []icebergReplayEvent `json:"events"`
+}
+
+func decodeIcebergReplayEvents(intent meta.IcebergCommitIntent) ([]icebergReplayEvent, error) {
+	var events []icebergReplayEvent
+	if strings.HasPrefix(strings.TrimSpace(intent.ReplayKeys), "[") {
+		var keys []string
+		if err := json.Unmarshal([]byte(intent.ReplayKeys), &keys); err != nil {
+			return nil, err
+		}
+		for _, key := range keys {
+			events = append(events, icebergReplayEvent{Key: key})
+		}
+	} else {
+		var manifest icebergReplayManifest
+		if err := json.Unmarshal([]byte(intent.ReplayKeys), &manifest); err != nil {
+			return nil, err
+		}
+		if manifest.Version != 2 {
+			return nil, fmt.Errorf("unsupported CDC replay manifest version=%d", manifest.Version)
+		}
+		events = manifest.Events
+		for _, ev := range events {
+			if !ev.Offset.Valid() || !binlogOffsetCovers(ev.Offset.BinlogFile, ev.Offset.BinlogPos, intent.SourceStartFile, intent.SourceStartPos) || !binlogOffsetCovers(intent.SourceEndFile, intent.SourceEndPos, ev.Offset.BinlogFile, ev.Offset.BinlogPos) {
+				return nil, fmt.Errorf("CDC replay event offset outside durable commit range")
+			}
+		}
+	}
+	if len(events) == 0 || intent.SourceTable == "" || intent.SourceEndFile == "" || intent.SourceEndPos == 0 {
+		return nil, fmt.Errorf("CDC intent lacks stable source event identities")
+	}
+	for _, ev := range events {
+		if len(ev.Key) != 129 || ev.Key[64] != '.' {
+			return nil, fmt.Errorf("invalid CDC event identity")
+		}
+	}
+	return events, nil
+}
+
+func (s *Sink) retainRecoveryReceipt(intent meta.IcebergCommitIntent, checkpoint *meta.Offset) error {
 	if s.recoveryLoaded == nil {
 		s.recoveryLoaded = make(map[string]bool)
 		s.recoveryEvents = make(map[string]int)
@@ -140,20 +190,19 @@ func (s *Sink) retainRecoveryReceipt(intent meta.IcebergCommitIntent) error {
 	if recoverableDataOperation(intent.Operation) {
 		switch intent.Kind {
 		case "cdc":
-			var keys []string
-			if err := json.Unmarshal([]byte(intent.ReplayKeys), &keys); err != nil || len(keys) == 0 || intent.SourceTable == "" || intent.SourceEndFile == "" || intent.SourceEndPos == 0 {
-				return fmt.Errorf("CDC intent lacks stable source event identities")
+			events, err := decodeIcebergReplayEvents(intent)
+			if err != nil {
+				return err
 			}
-			for _, key := range keys {
-				if len(key) != 129 || key[64] != '.' {
-					return fmt.Errorf("invalid CDC event identity")
-				}
-			}
-			for _, key := range keys {
+			for _, ev := range events {
+				key := ev.Key
 				if previous := s.recoveryEventPayloads[key[:64]]; previous != "" && previous != key {
 					return fmt.Errorf("conflicting payloads for one binlog event identity")
 				}
 				s.recoveryEventPayloads[key[:64]] = key
+				if checkpoint != nil && ev.Offset.Valid() && binlogOffsetCovers(checkpoint.BinlogFile, checkpoint.BinlogPos, ev.Offset.BinlogFile, ev.Offset.BinlogPos) {
+					continue
+				}
 				s.recoveryEvents[key]++
 			}
 		case "snapshot":
@@ -195,12 +244,12 @@ func (s *Sink) checkRecoveryReplayComplete(off *model.SourceOffset) error {
 		if intent.Kind != "cdc" || !recoverableDataOperation(intent.Operation) || !binlogOffsetCovers(off.BinlogFile, off.BinlogPos, intent.SourceEndFile, intent.SourceEndPos) {
 			continue
 		}
-		var keys []string
-		if err := json.Unmarshal([]byte(intent.ReplayKeys), &keys); err != nil {
+		events, err := decodeIcebergReplayEvents(intent)
+		if err != nil {
 			return err
 		}
-		for _, key := range keys {
-			if s.recoveryEvents[key] > 0 {
+		for _, ev := range events {
+			if s.recoveryEvents[ev.Key] > 0 {
 				return fmt.Errorf("Iceberg recovery BLOCKED operation=%s: checkpoint reached commit range before all source event identities replayed", intent.OperationID)
 			}
 		}

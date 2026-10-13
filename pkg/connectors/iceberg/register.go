@@ -16,11 +16,16 @@ func Register(reg *connector.Registry) {
 		if err != nil {
 			return nil, err
 		}
+		icfg, err = rebuildSnapshotConfig(jctx, icfg)
+		if err != nil {
+			return nil, err
+		}
 
 		sink, err := NewSink(jctx.JobID, jctx.MetaKey, jctx.JobName, icfg, jctx.Retry, jctx.MetaStore, jctx.ReportProgress)
 		if err != nil {
 			return nil, err
 		}
+		sink.authoritativeRebuild = jctx.SubmissionID != "" && jctx.Metadata[config.IcebergRebuildFullResetKey] == jctx.SubmissionID
 		ownership, err := newIcebergMaintenanceOwnership(jctx, icfg)
 		if err != nil {
 			return nil, err
@@ -32,6 +37,21 @@ func Register(reg *connector.Registry) {
 		return sink, nil
 	})
 
+}
+
+func rebuildSnapshotConfig(jctx connector.JobContext, cfg config.IcebergConfig) (config.IcebergConfig, error) {
+	bound := jctx.SubmissionID != "" && jctx.Metadata[config.IcebergRebuildFullResetKey] == jctx.SubmissionID
+	protocol := cfg.SnapshotWriteMode == config.IcebergRebuildSnapshotWriteMode
+	if protocol != bound {
+		return cfg, fmt.Errorf("snapshot rebuild BLOCKED: protocol mode and current submission marker must match")
+	}
+	if protocol {
+		if jctx.MetaStore == nil {
+			return cfg, fmt.Errorf("snapshot rebuild BLOCKED: durable metadata required")
+		}
+		cfg.SnapshotWriteMode = snapshotWriteModeTruncateAppend
+	}
+	return cfg, nil
 }
 
 func maintenanceStartsComplete(mode config.JobMode) bool {

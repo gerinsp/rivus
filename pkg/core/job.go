@@ -1296,7 +1296,40 @@ func (j *Job) StopAsync() {
 	}()
 }
 
-// IMPORTANT: delete meta state when job is deleted from manager/UI
+// Check retained recovery state before removing a stopped job from the UI.
+func (j *Job) checkDeleteAdmission() error {
+	j.mu.RLock()
+	hasStore := j.metaStore != nil
+	j.mu.RUnlock()
+	if !hasStore && (j.Config == nil || strings.TrimSpace(j.Config.Meta.MySQLDSN) == "") {
+		return nil
+	}
+	store, key, err := j.checkpointReader()
+	if err != nil {
+		return err
+	}
+	checker, ok := store.(meta.JobStateCleanupChecker)
+	if !ok {
+		// Existing stores still enforce their transactional cleanup contract.
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for _, candidate := range []string{j.Config.ID, key} {
+		if candidate == "" {
+			continue
+		}
+		if err := checker.CheckJobStateCleanup(ctx, candidate); err != nil {
+			return fmt.Errorf("cannot delete job_id=%s while recovery state is retained: %w; resolve the commit or use a configured snapshot rebuild after binlog purge", j.Config.ID, err)
+		}
+		if key == j.Config.ID {
+			break
+		}
+	}
+	return nil
+}
+
+// Delete metadata state when the drained job is removed from the manager/UI.
 func (j *Job) CleanupMeta() error {
 	j.mu.RLock()
 	store := j.metaStore
@@ -1367,6 +1400,13 @@ func (j *Job) preflight(ctx context.Context, src connector.Source, sink connecto
 	authoritativeSink, hasAuthoritativeInitialSnapshot := sink.(connector.AuthoritativeInitialSnapshot)
 	freshAuthoritativeSnapshot := hasAuthoritativeInitialSnapshot && authoritativeSink.RequiresInitialSnapshotReset() &&
 		(mode == config.JobModeInitial || mode == config.JobModeSnapshotHandoff)
+	rebuildToken := j.Config.Metadata[config.IcebergRebuildFullResetKey]
+	if rebuildToken != "" && rebuildToken == j.SubmissionID() && (mode == config.JobModeInitial || mode == config.JobModeSnapshotHandoff) {
+		if err := config.ValidateIcebergSnapshotRebuild(j.Config); err != nil {
+			return err
+		}
+		freshAuthoritativeSnapshot = true
+	}
 	safeSnapshotReload := freshAuthoritativeSnapshot ||
 		(mode == config.JobModeSnapshotOnly && snapshotOnlyCountResumeEnabled(j.Config.Metadata))
 	pkSkipper, skipMissingPK := sink.(connector.SnapshotPrimaryKeySkipper)

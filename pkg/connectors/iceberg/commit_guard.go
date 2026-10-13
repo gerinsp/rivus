@@ -38,16 +38,16 @@ func withIcebergBatch(ctx context.Context, batch icebergBatch) context.Context {
 
 func cdcIcebergBatch(sourceKey string, events []model.Event) icebergBatch {
 	batch := icebergBatch{kind: "cdc"}
-	keys := make([]string, 0, len(events))
+	keys := make([]icebergReplayEvent, 0, len(events))
 	complete := true
 	for _, ev := range events {
 		if key, err := icebergReplayKey(ev); err == nil {
-			keys = append(keys, key)
+			keys = append(keys, icebergReplayEvent{Key: key, Offset: ev.SourceOffset})
 		} else {
 			complete = false
 		}
 	}
-	encoded, _ := json.Marshal(keys)
+	encoded, _ := json.Marshal(icebergReplayManifest{Version: 2, Events: keys})
 	if complete {
 		batch.replayKeys = string(encoded)
 	}
@@ -198,7 +198,7 @@ func (s *Sink) checkIcebergRecovery(ctx context.Context) error {
 			return util.Permanent(err)
 		}
 		if !icebergIntentCovered(intent, offset, progress, snapshot) {
-			if err := s.retainRecoveryReceipt(intent); err != nil {
+			if err := s.retainRecoveryReceipt(intent, offset); err != nil {
 				return util.Permanent(fmt.Errorf("Iceberg recovery BLOCKED operation=%s: %w", intent.OperationID, err))
 			}
 		}
@@ -217,6 +217,35 @@ func (s *Sink) checkIcebergRecovery(ctx context.Context) error {
 		log.Printf("[iceberg][job %s] reconciled accepted operation=%s batch=%s; resuming source replay", s.jobID, intent.OperationID, intent.BatchID)
 	}
 
+	return nil
+}
+
+// Normal checkpoint cleanup must not install startup replay receipts. Live
+// batches have already consumed their source events, even when the latest
+// transaction checkpoint is behind their row offsets.
+func (s *Sink) cleanupCheckpointedIcebergCommits(ctx context.Context, offset *meta.Offset) error {
+	if err := meta.CheckOwnership(ctx, s.offsetSto); err != nil {
+		return util.Permanent(err)
+	}
+	store, err := s.icebergIntentStore()
+	if err != nil {
+		return util.Permanent(err)
+	}
+	intents, err := store.ListIcebergCommits(ctx, s.checkpointKey())
+	if err != nil {
+		return util.Permanent(fmt.Errorf("read Iceberg intents for checkpoint cleanup: %w", err))
+	}
+	for _, intent := range intents {
+		if intent.Status != meta.IcebergCommitCommitted || intent.Kind != "cdc" || !icebergIntentCovered(intent, offset, nil, nil) {
+			continue
+		}
+		if err := meta.CheckOwnership(ctx, s.offsetSto); err != nil {
+			return util.Permanent(err)
+		}
+		if err := store.DeleteIcebergCommit(ctx, s.checkpointKey(), intent.OperationID); err != nil {
+			return util.Permanent(fmt.Errorf("clear checkpointed Iceberg commit intent operation=%s: %w", intent.OperationID, err))
+		}
+	}
 	return nil
 }
 

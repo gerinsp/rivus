@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -213,5 +214,34 @@ func TestDeleteKeepsRecoverableJobAfterMetadataCleanupFailure(t *testing.T) {
 	}
 	if len(job.GetErrors()) == 0 {
 		t.Fatal("cleanup failure not visible on restored job")
+	}
+}
+
+func TestDeleteReportsRetainedReceiptBeforeRemovingStoppedJob(t *testing.T) {
+	persisted := newMemoryJobStore()
+	manager := NewJobManager(connector.NewRegistry(), WithJobStore(persisted))
+	cfg := newTestJobConfig("blocked-delete-admission")
+	job := manager.newManagedJob(cfg)
+	store := &snapshotCleanupCheckStore{closingOffsetStore: &closingOffsetStore{}, checkErr: fmt.Errorf("%w operation=accepted-but-uncheckpointed", meta.ErrJobStateCleanupBlocked)}
+	job.metaStore = store
+	job.metaKey = "blocked-delete-state"
+	job.setStatus(JobStatusFailed)
+	manager.mu.Lock()
+	manager.jobs[cfg.ID] = job
+	manager.mu.Unlock()
+	if err := manager.saveManagedJobRecord(context.Background(), job, meta.DesiredStateStopped, JobStatusFailed); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Delete(cfg.ID); !errors.Is(err, meta.ErrJobStateCleanupBlocked) {
+		t.Fatalf("delete did not report retained receipt immediately: %v", err)
+	}
+	if current, err := manager.Get(cfg.ID); err != nil || current != job || current.GetStatus() != JobStatusFailed {
+		t.Fatal("rejected delete removed or changed job")
+	}
+	if record, ok := persisted.Get(cfg.ID); !ok || record.LastStatus != string(JobStatusFailed) || record.DesiredState != meta.DesiredStateStopped {
+		t.Fatal("rejected delete changed durable job")
+	}
+	if closes, deletes := store.counts(); closes != 0 || deletes != 0 {
+		t.Fatal("delete admission mutated or closed recovery state")
 	}
 }

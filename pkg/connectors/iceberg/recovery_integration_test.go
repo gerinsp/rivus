@@ -78,6 +78,8 @@ func (s *crashStore) SaveOffset(ctx context.Context, key string, off meta.Offset
 type recoveryWorkerInput struct {
 	StateKey, Warehouse string
 	Event, Checkpoint   model.Event
+	ExtraEvent          *model.Event
+	LaggingCheckpoint   *model.SourceOffset
 }
 
 func integrationSink(t *testing.T, cat icecatalog.Catalog, store meta.OffsetStore, input recoveryWorkerInput) *Sink {
@@ -113,7 +115,11 @@ func TestRecoveryCrashWorker(t *testing.T) {
 	if err = decoder.Decode(&input); err != nil {
 		t.Fatal(err)
 	}
-	for _, row := range []map[string]interface{}{input.Event.Data, input.Event.OldData} {
+	rows := []map[string]interface{}{input.Event.Data, input.Event.OldData}
+	if input.ExtraEvent != nil {
+		rows = append(rows, input.ExtraEvent.Data, input.ExtraEvent.OldData)
+	}
+	for _, row := range rows {
 		if n, ok := row["id"].(json.Number); ok {
 			value, err := n.Int64()
 			if err != nil {
@@ -140,6 +146,14 @@ func TestRecoveryCrashWorker(t *testing.T) {
 	}
 	if err := sink.handleEvent(ctx, input.Event); err != nil {
 		t.Fatal(err)
+	}
+	if input.ExtraEvent != nil {
+		if err := sink.handleEvent(ctx, *input.ExtraEvent); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if input.LaggingCheckpoint != nil {
+		sink.rememberOffset(input.LaggingCheckpoint)
 	}
 	if err := sink.flushAll(ctx); err != nil {
 		t.Fatal(err)

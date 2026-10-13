@@ -24,6 +24,18 @@ For existing jobs failing with `snapshot completion BLOCKED: legacy done state h
 
 ## General upgrade rules
 
+### Iceberg replay compatibility follow-up
+
+The next main build after `ff300c0` writes version 2 CDC replay manifests with per-event source offsets. New readers preserve the original fingerprint of legacy arrays and support complete legacy replay; an interior checkpoint in a legacy hash-only batch still requires separate recovery. An available binlog file alone does not establish sink commit outcome.
+
+`ff300c0` rejects version 2 receipts safely but cannot resume those jobs. The internal archived-rebuild protocol `rebuild-truncate-append-v1` is also rejected by that image before catalog access. Stop old execution workers before starting compatible workers; do not queue rebuilds during a mixed-version rollout. Keep the previous image and a metadata backup, but assess retained receipt formats before rollback. Never restore an earlier checkpoint or erase receipts merely to make the old image start.
+
+Initialization adds `job_recovery_archives` and an index on `iceberg_commit_intents.job_id`; existing completion flags are not automatically promoted. Archives include original config credentials and require the same access restrictions as `job_registry`. They preserve recovery evidence, not target data. No new production environment variable is required.
+
+Full native unfiltered rebuild is available only through explicit purged-binlog resubmit on eligible stopped split-worker jobs. PREPARED outcomes, active ownership and filtered configurations remain blocked. Ordinary Delete preserves receipt protection and reports a synchronous conflict for stopped jobs. Deployment does not delete or automatically resubmit FAILED jobs.
+
+See the [upgrade/rollback matrix](iceberg-checkpoint-recovery.md#upgrade-and-rollback-compatibility) and [compatibility test commands](../tests/recovery/README.md#compatibility-upgrade-dan-rollback).
+
 Before every production upgrade:
 
 1. read the release notes and compare configuration changes;

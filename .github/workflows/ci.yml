@@ -42,3 +42,34 @@ jobs:
 
       - name: Test
         run: go test ./...
+
+  compatibility:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out deployed baseline history
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.25.x"
+          cache: true
+
+      - name: Start isolated MySQL fixtures
+        run: docker compose -f tests/recovery/compose.yml up -d --wait
+
+      - name: Build pinned deployed worker
+        run: bash tests/recovery/build-compatibility-baseline.sh "$RUNNER_TEMP/rivus-ff300c0.test"
+
+      - name: Test upgrade, rollback and legacy schema
+        env:
+          RIVUS_RECOVERY_INTEGRATION: "1"
+          RIVUS_COMPATIBILITY_BASELINE_BINARY: ${{ runner.temp }}/rivus-ff300c0.test
+        run: go test -p=1 -tags=integration ./pkg/connectors/iceberg ./pkg/meta -run '^(TestCompatibilityReal|TestCompatibilitySchemaReal)' -count=1 -v -timeout=3m
+
+      - name: Remove isolated fixtures
+        if: always()
+        run: docker compose -f tests/recovery/compose.yml down --volumes

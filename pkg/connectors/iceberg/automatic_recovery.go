@@ -80,7 +80,7 @@ func (s *Sink) runAutomaticRecovery(ctx context.Context, operation string, verif
 	backoff := policy.BaseBackoff
 	for attempts < policy.MaxAttempts {
 		if err := ctx.Err(); err != nil {
-			last = err
+			last = recoveryInterrupted(err, last)
 			break
 		}
 		attempts++
@@ -118,11 +118,15 @@ func (s *Sink) runAutomaticRecovery(ctx context.Context, operation string, verif
 			return nil
 		}
 		report("RECOVERING")
-		if errors.Is(last, meta.ErrWorkerOwnershipLost) || ctx.Err() != nil || attempts == policy.MaxAttempts {
+		if errors.Is(last, meta.ErrWorkerOwnershipLost) || attempts == policy.MaxAttempts {
+			break
+		}
+		if err := ctx.Err(); err != nil {
+			last = recoveryInterrupted(err, last)
 			break
 		}
 		if err := wait(ctx, backoff); err != nil {
-			last = err
+			last = recoveryInterrupted(err, last)
 			break
 		}
 		backoff = min(backoff*2, policy.MaxBackoff)
@@ -134,6 +138,16 @@ func (s *Sink) runAutomaticRecovery(ctx context.Context, operation string, verif
 	return util.Permanent(fmt.Errorf("Iceberg recovery BLOCKED job=%s operation=%s attempts=%d; durable intent/checkpoint retained: %w", s.jobID, operation, attempts, last))
 }
 
+// A deadline while waiting ends verification; it does not explain why the
+// preceding catalog/metadata check failed. Keep both causes for the operator
+// and retain errors.Is support for cancellation and ownership checks.
+func recoveryInterrupted(stop, verification error) error {
+	if verification == nil || errors.Is(verification, stop) {
+		return stop
+	}
+	return fmt.Errorf("verification stopped: %w; last verification error: %w", stop, verification)
+}
+
 func (s *Sink) recoverUnknownCommit(ctx context.Context, intent meta.IcebergCommitIntent, progress commitProgress, original error) error {
 	if s.recoveryPolicy == nil || progress.recoveredTable == nil || (!recoverableDataOperation(intent.Operation) && !recoverableMetadataOperation(intent.Operation)) {
 		return original
@@ -142,7 +156,7 @@ func (s *Sink) recoverUnknownCommit(ctx context.Context, intent meta.IcebergComm
 	// validate replay identities here; do not install receipt skip counters that
 	// would incorrectly wait for this batch to arrive a second time.
 	validator := &Sink{}
-	if err := validator.retainRecoveryReceipt(intent); err != nil {
+	if err := validator.retainRecoveryReceipt(intent, nil); err != nil {
 		return util.Permanent(fmt.Errorf("Iceberg recovery BLOCKED: %w", err))
 	}
 	return s.runAutomaticRecovery(ctx, intent.OperationID, func(ctx context.Context) error {

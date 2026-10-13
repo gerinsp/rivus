@@ -58,6 +58,7 @@ type Sink struct {
 	maintenanceSignals   *nativeMaintenanceSignaler
 	maintenanceOwnership connector.MaintenanceOwnershipLifecycle
 	snapshotSpoolDir     string
+	authoritativeRebuild bool
 
 	equalityCommitter cdcEqualityCommitter
 
@@ -588,7 +589,7 @@ func (s *Sink) commitPendingOffset(ctx context.Context, force bool) error {
 		log.Printf("[iceberg][job %s] save offset error key=%s pos=%s:%d: %v", s.jobID, checkpointKey, off.BinlogFile, off.BinlogPos, err)
 		return nil
 	}
-	if err := s.checkIcebergRecovery(saveCtx); err != nil {
+	if err := s.cleanupCheckpointedIcebergCommits(saveCtx, &meta.Offset{BinlogFile: off.BinlogFile, BinlogPos: off.BinlogPos}); err != nil {
 		return err
 	}
 
@@ -1451,6 +1452,11 @@ func (s *Sink) ResetTargetTable(ctx context.Context, targetSchema, targetTable s
 		}
 		s.mu.Lock()
 		s.updateTargetTableStatesLocked(targetSchema, targetTable, state.table, time.Now())
+		for _, candidate := range s.states {
+			if sameTarget(candidate.targetNamespace, targetSchema) && sameTarget(candidate.targetTable, targetTable) {
+				candidate.snapshotTruncateApplied = true
+			}
+		}
 		s.mu.Unlock()
 		return nil
 	}
@@ -1478,6 +1484,7 @@ func (s *Sink) ResetTargetTable(ctx context.Context, targetSchema, targetTable s
 		if sameTarget(state.targetNamespace, targetSchema) && sameTarget(state.targetTable, targetTable) {
 			state.table = updated
 			state.lastTouchedAt = time.Now()
+			state.snapshotTruncateApplied = true
 		}
 	}
 	return nil
@@ -1585,6 +1592,33 @@ func (s *Sink) handleSnapshotBarrier(ctx context.Context, ev model.Event) (err e
 
 	switch ev.Type {
 	case model.EventTypeSnapshotStart:
+		if s.authoritativeRebuild {
+			if s.offsetSto == nil {
+				return fmt.Errorf("snapshot rebuild requires durable metadata")
+			}
+			if err := meta.CheckOwnership(ctx, s.offsetSto); err != nil {
+				return util.Permanent(err)
+			}
+			state, err := s.offsetSto.GetSnapshotState(ctx, s.checkpointKey())
+			if err != nil {
+				return err
+			}
+			if state == nil || state.Done || state.StartFile == "" || state.StartPos == 0 {
+				return fmt.Errorf("snapshot rebuild BLOCKED: missing unfinished snapshot start after target reset")
+			}
+			if err := meta.CheckOwnership(ctx, s.offsetSto); err != nil {
+				return util.Permanent(err)
+			}
+			// The rebuild token belongs to this submission. Its snapshot start
+			// is saved only after authoritative preflight reset succeeds. Resume
+			// therefore appends the remaining snapshot rows without re-truncating
+			// a prefix already committed by the previous owner.
+			s.mu.Lock()
+			for _, target := range s.states {
+				target.snapshotTruncateApplied = true
+			}
+			s.mu.Unlock()
+		}
 		s.cleanupSnapshotSpools()
 		if s.maintenanceSignals != nil {
 			s.maintenanceSignals.setSnapshotComplete(false)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -272,6 +273,25 @@ func TestAutomaticRecoveryRestartUnfinishedUsesDurableReceipt(t *testing.T) {
 		t.Fatal("accepted row replayed after restart")
 	}
 	assertAutomaticData(t, base, 1, 1)
+}
+
+func TestAutomaticRecoveryWaitDeadlineRetainsLastVerificationError(t *testing.T) {
+	store := &automaticStore{guardTestStore: newGuardTestStore()}
+	s := automaticSink(t, recoveryCatalog(t), store)
+	proofErr := errors.New("matching operation not found in retained main snapshot ancestry")
+	s.recoveryWait = func(context.Context, time.Duration) error { return context.DeadlineExceeded }
+	var last connector.ProgressInfo
+	s.progress = func(p connector.ProgressInfo) { last = p }
+	err := s.runAutomaticRecovery(context.Background(), "uncertain-operation", func(context.Context) error { return proofErr })
+	if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, proofErr) {
+		t.Fatalf("deadline replaced the verification cause: %v", err)
+	}
+	if last.RecoveryStatus != "BLOCKED" || last.RecoveryAttempts != 1 || !strings.Contains(last.RecoveryLastError, proofErr.Error()) || !strings.Contains(last.RecoveryLastError, "context deadline exceeded") {
+		t.Fatalf("blocked progress omitted the verification cause: %#v", last)
+	}
+	if store.saveCount != 0 || store.marks != 0 {
+		t.Fatal("deadline advanced recovery metadata")
+	}
 }
 
 func TestAutomaticRecoveryOwnershipLostDuringVerification(t *testing.T) {

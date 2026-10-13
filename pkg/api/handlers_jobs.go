@@ -12,6 +12,7 @@ import (
 	"github.com/gerinsp/rivus/pkg/config"
 	"github.com/gerinsp/rivus/pkg/connectors/iceberg"
 	"github.com/gerinsp/rivus/pkg/core"
+	"github.com/gerinsp/rivus/pkg/meta"
 )
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
@@ -252,6 +253,8 @@ func (s *Server) handleJobByID(w http.ResponseWriter, r *http.Request) {
 				writeJSON(w, http.StatusNotFound, map[string]string{"error": "job not found"})
 			} else if err == core.ErrJobManagerShuttingDown {
 				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+			} else if errors.Is(err, meta.ErrJobStateCleanupBlocked) {
+				writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 			} else {
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			}

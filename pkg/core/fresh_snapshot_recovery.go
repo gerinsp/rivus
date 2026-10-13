@@ -2,10 +2,13 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
+	"github.com/gerinsp/rivus/pkg/config"
 	"github.com/gerinsp/rivus/pkg/meta"
 )
 
@@ -39,6 +42,51 @@ func (j *Job) checkFreshSnapshotRecovery(ctx context.Context, store meta.OffsetS
 		}
 	}
 	return meta.CheckOwnership(ctx, store)
+}
+
+func (m *JobManager) rebuildPurgedIcebergJob(job *Job, admissionErr error) error {
+	if !errors.Is(admissionErr, meta.ErrJobStateCleanupBlocked) {
+		return admissionErr
+	}
+	blocked := func(err error) error {
+		return fmt.Errorf("%w; configured snapshot rebuild unavailable: %w", admissionErr, err)
+	}
+	if job.runActive() {
+		return blocked(ErrJobStillStopping)
+	}
+	if m.workerRole == WorkerRoleAll {
+		return blocked(fmt.Errorf("archived rebuild requires durable split-worker ownership"))
+	}
+	if err := config.ValidateIcebergSnapshotRebuild(job.Config); err != nil {
+		return blocked(err)
+	}
+	rebuilder, ok := m.jobStore.(meta.JobRebuildStore)
+	if !ok {
+		return blocked(fmt.Errorf("metadata registry does not support durable recovery archives"))
+	}
+	store, key, err := job.checkpointReader()
+	if err != nil {
+		return blocked(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := m.ensureJobStoreReady(ctx); err != nil {
+		return blocked(err)
+	}
+	result, err := rebuilder.RequestJobRebuild(ctx, store, job.Config.ID, job.SubmissionID(), key)
+	if err != nil {
+		return blocked(err)
+	}
+	job.mu.Lock()
+	job.submissionID = result.SubmissionID
+	job.mu.Unlock()
+	m.mu.Lock()
+	m.executionRoles[job.Config.ID] = meta.JobExecutionRoleSnapshot
+	m.mu.Unlock()
+	setObservedJobStatus(job, JobStatusQueued)
+	setObservedFreshSnapshotProgress(job)
+	log.Printf("[job %s] purged binlog rebuild queued archive_id=%s submission_id=%s; previous checkpoint and confirmed intents archived; snapshot uses configured full target reset", job.Config.ID, result.ArchiveID, result.SubmissionID)
+	return nil
 }
 
 func jobFreshSnapshotOnResubmit(job *Job) (bool, error) {

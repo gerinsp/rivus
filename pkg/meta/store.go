@@ -3,6 +3,7 @@ package meta
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -155,6 +156,9 @@ CREATE TABLE IF NOT EXISTS job_snapshot_progress (
 	}
 
 	if _, err := s.sqlRunner().ExecContext(ctx, "ALTER TABLE iceberg_commit_intents ADD COLUMN replay_keys LONGTEXT NULL"); err != nil && !isDuplicateColumnError(err) {
+		return err
+	}
+	if _, err := s.sqlRunner().ExecContext(ctx, "CREATE INDEX idx_iceberg_commit_job ON iceberg_commit_intents (job_id)"); err != nil && !isDuplicateKeyNameError(err) {
 		return err
 	}
 
@@ -333,6 +337,8 @@ type JobStateCleanupChecker interface {
 	CheckJobStateCleanup(context.Context, string) error
 }
 
+var ErrJobStateCleanupBlocked = errors.New("job state cleanup BLOCKED")
+
 func (s *MySQLOffsetStore) CheckJobStateCleanup(ctx context.Context, key string) error {
 	return checkJobStateCleanup(ctx, s.sqlRunner(), key, false)
 }
@@ -345,7 +351,7 @@ func checkJobStateCleanup(ctx context.Context, runner sqlRunner, jobID string, l
 	var operationID string
 	err := runner.QueryRowContext(ctx, query, jobID, jobID).Scan(&operationID)
 	if err == nil {
-		return fmt.Errorf("job state cleanup BLOCKED key=%s: retained Iceberg commit intent operation=%s requires recovery", jobID, operationID)
+		return fmt.Errorf("%w key=%s: retained Iceberg commit intent operation=%s requires recovery", ErrJobStateCleanupBlocked, jobID, operationID)
 	}
 	if err != sql.ErrNoRows {
 		return fmt.Errorf("check Iceberg intents before cleanup %s: %w", jobID, err)

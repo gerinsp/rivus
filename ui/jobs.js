@@ -18,7 +18,7 @@ import {
   tableDateCell,
 } from './core/api.js';
 
-export const ACTIVE = new Set(['RUNNING', 'PAUSING', 'PENDING', 'QUEUED']);
+export const ACTIVE = new Set(['RUNNING', 'PAUSING', 'PENDING', 'QUEUED', 'STOPPING']);
 const RESUMABLE = new Set(['STOPPED', 'PAUSED']);
 
 let latestDorisArchiveJobs = [];
