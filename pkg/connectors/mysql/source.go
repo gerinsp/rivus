@@ -45,6 +45,7 @@ type Source struct {
 	skipSnapshotTables     map[string]bool
 	snapshotBatchEvents    bool
 	rollingSnapshotBatches bool
+	scopedRebuildToken     string
 }
 
 func NewSource(jobID, stateKey string, cfg config.MySQLConfig, retry config.RetryPolicy, offsetSto meta.OffsetStore, progress connector.ProgressReporter) (*Source, error) {
@@ -180,6 +181,12 @@ func (s *Source) clearLegacyCheckpoint(ctx context.Context) error {
 func (s *Source) resetInitialCheckpoint(ctx context.Context) error {
 	if s.offsetSto == nil {
 		return nil
+	}
+	if s.scopedRebuildToken != "" {
+		if err := meta.CheckScopedRebuildEmptyCheckpoint(ctx, s.offsetSto, s.jobID, s.checkpointKey()); err != nil {
+			return err
+		}
+		return meta.CheckScopedRebuildIntents(ctx, s.offsetSto, s.jobID, s.checkpointKey(), s.scopedRebuildToken, false)
 	}
 	if err := s.clearLegacyCheckpoint(ctx); err != nil {
 		return err

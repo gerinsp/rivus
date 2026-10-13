@@ -8,6 +8,7 @@ import (
 
 	"github.com/gerinsp/rivus/pkg/config"
 	"github.com/gerinsp/rivus/pkg/connector"
+	"github.com/gerinsp/rivus/pkg/meta"
 )
 
 func Register(reg *connector.Registry) {
@@ -21,7 +22,11 @@ func Register(reg *connector.Registry) {
 			return nil, err
 		}
 
-		sink, err := NewSink(jctx.JobID, jctx.MetaKey, jctx.JobName, icfg, jctx.Retry, jctx.MetaStore, jctx.ReportProgress)
+		scopedToken := ""
+		if jctx.SubmissionID != "" && jctx.Metadata[config.IcebergRebuildScopedKey] == jctx.SubmissionID {
+			scopedToken = jctx.SubmissionID
+		}
+		sink, err := newSinkWithRebuild(jctx.JobID, jctx.MetaKey, jctx.JobName, icfg, jctx.Retry, jctx.MetaStore, jctx.ReportProgress, scopedToken)
 		if err != nil {
 			return nil, err
 		}
@@ -40,6 +45,22 @@ func Register(reg *connector.Registry) {
 }
 
 func rebuildSnapshotConfig(jctx connector.JobContext, cfg config.IcebergConfig) (config.IcebergConfig, error) {
+	scoped := cfg.SnapshotWriteMode == config.IcebergRebuildScopedWriteMode
+	scopedBound := jctx.SubmissionID != "" && jctx.Metadata[config.IcebergRebuildScopedKey] == jctx.SubmissionID
+	if scoped != scopedBound || (scoped && jctx.Metadata[config.IcebergRebuildFullResetKey] != "") {
+		return cfg, fmt.Errorf("scoped rebuild protocol and submission marker must match")
+	}
+	if scoped {
+		if _, ok := jctx.MetaStore.(meta.IcebergTrinoQueryStore); !ok {
+			return cfg, fmt.Errorf("scoped rebuild requires durable Trino query identities")
+		}
+		if _, ok := jctx.MetaStore.(meta.OwnershipChecker); !ok {
+			return cfg, fmt.Errorf("scoped rebuild requires worker ownership fencing")
+		}
+		cfg.SnapshotWriteMode = snapshotWriteModeAuto
+		rolling := false
+		cfg.SnapshotRollingEnabled = &rolling
+	}
 	bound := jctx.SubmissionID != "" && jctx.Metadata[config.IcebergRebuildFullResetKey] == jctx.SubmissionID
 	protocol := cfg.SnapshotWriteMode == config.IcebergRebuildSnapshotWriteMode
 	if protocol != bound {

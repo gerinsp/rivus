@@ -38,6 +38,10 @@ func automaticRecoveryPolicy(policy config.RetryPolicy) *config.RetryPolicy {
 // Retry only verification and idempotent metadata transitions. The original
 // catalog write callback is never invoked by this loop.
 func (s *Sink) runAutomaticRecovery(ctx context.Context, operation string, verify func(context.Context) error) error {
+	return s.runAutomaticRecoveryWithCause(ctx, operation, nil, verify)
+}
+
+func (s *Sink) runAutomaticRecoveryWithCause(ctx context.Context, operation string, initial error, verify func(context.Context) error) error {
 	ctx, cancel := context.WithTimeout(ctx, recoveryTimeout)
 	defer cancel()
 	policy := *automaticRecoveryPolicy(*s.recoveryPolicy)
@@ -52,7 +56,7 @@ func (s *Sink) runAutomaticRecovery(ctx context.Context, operation string, verif
 		}
 		message := ""
 		if last != nil {
-			message = last.Error()
+			message = recoveryFailure(initial, last).Error()
 		}
 		log.Printf("[iceberg][job %s] recovery status=%s operation_id=%s attempts=%d started_at=%s checkpoint=%s last_error=%q", s.jobID, status, op, attempts, started.Format(time.RFC3339Nano), checkpoint, message)
 		if s.progress != nil {
@@ -135,7 +139,16 @@ func (s *Sink) runAutomaticRecovery(ctx context.Context, operation string, verif
 	if operation == "" {
 		operation = s.recoveryOperation
 	}
-	return util.Permanent(fmt.Errorf("Iceberg recovery BLOCKED job=%s operation=%s attempts=%d; durable intent/checkpoint retained: %w", s.jobID, operation, attempts, last))
+	return util.Permanent(fmt.Errorf("Iceberg recovery BLOCKED job=%s operation=%s attempts=%d; durable intent/checkpoint retained: %w", s.jobID, operation, attempts, recoveryFailure(initial, last)))
+}
+
+// Reconciliation failure explains why recovery stopped, not why the original
+// write became ambiguous. Preserve both causes without changing retry decisions.
+func recoveryFailure(initial, verification error) error {
+	if initial == nil {
+		return verification
+	}
+	return fmt.Errorf("initial commit error: %w; reconciliation error: %w", initial, verification)
 }
 
 // A deadline while waiting ends verification; it does not explain why the
@@ -157,9 +170,9 @@ func (s *Sink) recoverUnknownCommit(ctx context.Context, intent meta.IcebergComm
 	// would incorrectly wait for this batch to arrive a second time.
 	validator := &Sink{}
 	if err := validator.retainRecoveryReceipt(intent, nil); err != nil {
-		return util.Permanent(fmt.Errorf("Iceberg recovery BLOCKED: %w", err))
+		return util.Permanent(fmt.Errorf("Iceberg recovery BLOCKED: %w", recoveryFailure(original, err)))
 	}
-	return s.runAutomaticRecovery(ctx, intent.OperationID, func(ctx context.Context) error {
+	return s.runAutomaticRecoveryWithCause(ctx, intent.OperationID, original, func(ctx context.Context) error {
 		store, err := s.icebergIntentStore()
 		if err != nil {
 			return err

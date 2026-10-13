@@ -40,6 +40,9 @@ jobs:
           grep -q '<script type="module" src="app.js?v=10"></script>' ui/index.html
           ! grep -q 'maintenance-ui.js' ui/index.html
 
+      - name: Test job progress presentation
+        run: node --test ui/job-progress.test.mjs
+
       - name: Test
         run: go test ./...
 

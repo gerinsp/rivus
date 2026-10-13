@@ -13,16 +13,18 @@ const IcebergRebuildFullResetKey = "iceberg_rebuild_full_reset"
 // translates it only after verifying the submission-bound rebuild marker.
 const IcebergRebuildSnapshotWriteMode = "rebuild-truncate-append-v1"
 
-// ValidateIcebergSnapshotRebuild requires the submitted config to explicitly
-// select a full truncate for every source table. Purged binlogs alone never
-// authorize appending another snapshot to populated targets. Matching source
-// filters are rejected because this path replaces the complete target contents.
+// ValidateIcebergSnapshotRebuild requires an explicit replacement scope for
+// every source table: native full reset, or matching source/target Trino filters.
+// Purged binlogs alone never authorize appending a snapshot to populated targets.
 func ValidateIcebergSnapshotRebuild(cfg *JobConfig) error {
 	if cfg == nil || cfg.Source == nil || cfg.Source.Type != "mysql" || cfg.Sink == nil || cfg.Sink.Type != "iceberg_native" {
 		return fmt.Errorf("snapshot rebuild requires MySQL and native Iceberg")
 	}
 	if cfg.Mode == JobModeSnapshotOnly {
 		return fmt.Errorf("purged-binlog rebuild requires a snapshot-to-CDC job")
+	}
+	if IcebergSnapshotRebuildUsesTrino(cfg) {
+		return validateScopedIcebergRebuild(cfg)
 	}
 	decode := func(v any, dst any) error {
 		b, err := json.Marshal(v)

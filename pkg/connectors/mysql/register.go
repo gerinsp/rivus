@@ -27,6 +27,9 @@ func Register(reg *connector.Registry) {
 		inner.UseSnapshotBatchEvents(sinkUsesAcknowledgedSnapshotBatches(jctx.SinkType))
 		inner.UseRollingSnapshotBatches(snapshotRollingEnabledForSink(jctx.SinkType, jctx.SinkConfig))
 		inner.SetSinkType(jctx.SinkType)
+		if jctx.SubmissionID != "" && jctx.Metadata[config.IcebergRebuildScopedKey] == jctx.SubmissionID {
+			inner.scopedRebuildToken = jctx.SubmissionID
+		}
 
 		return &sourceAdapter{inner: inner, mode: jctx.Mode, storedMode: jctx.StoredMode, tables: inner.tableRefs()}, nil
 	})
@@ -37,11 +40,17 @@ func snapshotRollingEnabledForSink(sinkType string, sinkConfig any) bool {
 		return false
 	}
 	if typed, ok := sinkConfig.(config.IcebergConfig); ok {
+		if typed.SnapshotWriteMode == config.IcebergRebuildScopedWriteMode {
+			return false
+		}
 		return typed.SnapshotRollingEnabled == nil || *typed.SnapshotRollingEnabled
 	}
 	configMap, ok := sinkConfig.(map[string]any)
 	if !ok {
 		return true
+	}
+	if mode, _ := configMap["snapshot_write_mode"].(string); mode == config.IcebergRebuildScopedWriteMode {
+		return false
 	}
 	value, exists := configMap["snapshot_rolling_enabled"]
 	if !exists || value == nil {
@@ -86,6 +95,10 @@ func (a *sourceAdapter) Tables() []connector.TableRef {
 
 func (a *sourceAdapter) HasSnapshotFilter(schema, table string) bool {
 	return strings.TrimSpace(a.inner.snapshotFilterForTable(schema, table)) != ""
+}
+
+func (a *sourceAdapter) SnapshotFilterExpression(schema, table string) string {
+	return a.inner.snapshotFilterForTable(schema, table)
 }
 
 func (a *sourceAdapter) FetchSchema(ctx context.Context, schema, table string) (*model.TableSchema, error) {

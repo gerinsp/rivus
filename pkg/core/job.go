@@ -120,9 +120,10 @@ type CheckpointBinlogDiagnostics struct {
 }
 
 type Job struct {
-	Config  *config.JobConfig
-	Created time.Time
-	Updated time.Time
+	displayName string
+	Config      *config.JobConfig
+	Created     time.Time
+	Updated     time.Time
 
 	mu                   sync.RWMutex
 	status               JobStatus
@@ -1401,6 +1402,14 @@ func (j *Job) preflight(ctx context.Context, src connector.Source, sink connecto
 	freshAuthoritativeSnapshot := hasAuthoritativeInitialSnapshot && authoritativeSink.RequiresInitialSnapshotReset() &&
 		(mode == config.JobModeInitial || mode == config.JobModeSnapshotHandoff)
 	rebuildToken := j.Config.Metadata[config.IcebergRebuildFullResetKey]
+	scopedToken := j.Config.Metadata[config.IcebergRebuildScopedKey]
+	scopedRebuild := scopedToken != "" && scopedToken == j.SubmissionID() && (mode == config.JobModeInitial || mode == config.JobModeSnapshotHandoff)
+	if scopedRebuild {
+		if err := config.ValidateIcebergSnapshotRebuild(j.Config); err != nil {
+			return err
+		}
+		freshAuthoritativeSnapshot = true
+	}
 	if rebuildToken != "" && rebuildToken == j.SubmissionID() && (mode == config.JobModeInitial || mode == config.JobModeSnapshotHandoff) {
 		if err := config.ValidateIcebergSnapshotRebuild(j.Config); err != nil {
 			return err
@@ -1423,8 +1432,21 @@ func (j *Job) preflight(ctx context.Context, src connector.Source, sink connecto
 	}
 
 	var targetResetter connector.TargetTableResetter
+	var scopedResetter connector.ScopedSnapshotTargetResetter
+	var sourceFilters connector.SnapshotFilterExpressionProvider
 	var snapshotSkipper connector.SnapshotTableSkipper
 	if safeSnapshotReload {
+		if scopedRebuild {
+			var ok bool
+			scopedResetter, ok = sink.(connector.ScopedSnapshotTargetResetter)
+			if !ok {
+				return fmt.Errorf("scoped snapshot rebuild requires durable scoped reset support")
+			}
+			sourceFilters, ok = src.(connector.SnapshotFilterExpressionProvider)
+			if !ok {
+				return fmt.Errorf("scoped snapshot rebuild requires source filter expressions")
+			}
+		}
 		var ok bool
 		targetResetter, ok = sink.(connector.TargetTableResetter)
 		if !ok {
@@ -1440,12 +1462,14 @@ func (j *Job) preflight(ctx context.Context, src connector.Source, sink connecto
 	type snapshotReloadTarget struct {
 		schema string
 		table  string
+		source connector.TableRef
+		filter string
 	}
 
 	reloadTargets := make(map[string]*snapshotReloadTarget)
 	skipTables := make([]connector.TableRef, 0)
 	for _, t := range lister.Tables() {
-		if safeSnapshotReload {
+		if safeSnapshotReload && !scopedRebuild {
 			if filtered, ok := src.(connector.SnapshotFilterProvider); ok && filtered.HasSnapshotFilter(t.Schema, t.Table) {
 				return fmt.Errorf("full target reset is unsafe for source table %s.%s with a snapshot filter; disable the full reset or remove the source filter", t.Schema, t.Table)
 			}
@@ -1489,12 +1513,24 @@ func (j *Job) preflight(ctx context.Context, src connector.Source, sink connecto
 			}
 
 			if safeSnapshotReload {
+				filter := ""
+				if scopedRebuild {
+					filter = sourceFilters.SnapshotFilterExpression(t.Schema, t.Table)
+					if err := scopedResetter.ValidateSnapshotSourceTable(ctx, t.Schema, t.Table, filter); err != nil {
+						return err
+					}
+				}
 				targetName := strings.ToLower(strings.TrimSpace(targetDB + "." + targetTbl))
 				group := reloadTargets[targetName]
+				if group != nil && scopedRebuild && group.source != t {
+					return fmt.Errorf("scoped snapshot rebuild does not support multiple sources sharing target %s", targetName)
+				}
 				if group == nil {
 					group = &snapshotReloadTarget{
 						schema: targetDB,
 						table:  targetTbl,
+						source: t,
+						filter: filter,
 					}
 					reloadTargets[targetName] = group
 				}
@@ -1503,6 +1539,12 @@ func (j *Job) preflight(ctx context.Context, src connector.Source, sink connecto
 	}
 	if safeSnapshotReload {
 		for targetName, group := range reloadTargets {
+			if scopedRebuild {
+				if err := scopedResetter.ResetSnapshotSourceTable(ctx, group.source.Schema, group.source.Table, group.filter); err != nil {
+					return fmt.Errorf("scoped reset target=%s: %w", targetName, err)
+				}
+				continue
+			}
 			log.Printf("[job %s] safe snapshot reload reset target=%s; resume mode uses saved snapshot cursor", j.Config.ID, targetName)
 			if err := targetResetter.ResetTargetTable(ctx, group.schema, group.table); err != nil {
 				return fmt.Errorf("reset target table failed %s.%s: %w", group.schema, group.table, err)
@@ -1588,10 +1630,31 @@ func (j *Job) startWithMode(mode config.JobMode) (err error) {
 	}
 
 	// pick connectors
+	if token := j.Config.Metadata[config.IcebergRebuildScopedKey]; token != "" && token == j.SubmissionID() {
+		store, err := j.ensureMetaStore(ctx)
+		if err != nil {
+			return j.failStart("system", err, cancel)
+		}
+		state, err := store.GetSnapshotState(ctx, j.ensureMetaKey())
+		if err != nil {
+			return j.failStart("system", err, cancel)
+		}
+		if state == nil {
+			if err := meta.CheckScopedRebuildEmptyCheckpoint(ctx, store, j.Config.ID, j.ensureMetaKey()); err != nil {
+				return j.failStart("system", err, cancel)
+			}
+			effectiveMode = config.JobModeSnapshotHandoff
+		} else if !state.Done {
+			effectiveMode = config.JobModeSnapshotHandoffResume
+		}
+	}
 	srcType, srcCfg := j.pickSource()
 	sinkType, sinkCfg := j.pickSink()
 
 	// build new metaKey (allowed to change)
+	j.mu.Lock()
+	j.runMode = effectiveMode
+	j.mu.Unlock()
 	storedMode := normalizeMode(j.Config.Mode)
 	log.Printf("[job %s] start mode=%s source=%s sink=%s", j.Config.ID, effectiveMode, srcType, sinkType)
 	metaKey := j.ensureMetaKey()

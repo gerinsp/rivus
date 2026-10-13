@@ -24,6 +24,16 @@ func newGuardTestStore() *guardTestStore {
 	return &guardTestStore{testOffsetStore: &testOffsetStore{}, intents: make(map[string]meta.IcebergCommitIntent)}
 }
 
+func (s *guardTestStore) ListIcebergCommitsForJob(_ context.Context, key, job string) ([]meta.IcebergCommitIntent, error) {
+	var rows []meta.IcebergCommitIntent
+	for _, intent := range s.intents {
+		if intent.StateKey == key || intent.JobID == job {
+			rows = append(rows, intent)
+		}
+	}
+	return rows, nil
+}
+
 func (s *guardTestStore) BeginIcebergCommit(_ context.Context, intent meta.IcebergCommitIntent) error {
 	if s.beginErr != nil {
 		return s.beginErr

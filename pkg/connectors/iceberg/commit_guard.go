@@ -182,6 +182,33 @@ func (s *Sink) checkIcebergRecovery(ctx context.Context) error {
 	}
 	for _, intent := range intents {
 		s.recoveryOperation = intent.OperationID
+		if intent.Kind == "rebuild" {
+			s.trinoRebuildMu.Lock()
+			latest, readErr := store.ListIcebergCommits(ctx, s.checkpointKey())
+			found := false
+			if readErr == nil {
+				for _, durable := range latest {
+					if durable.OperationID == intent.OperationID {
+						found = true
+						readErr = s.confirmTrinoRebuildIntent(ctx, durable)
+						break
+					}
+				}
+			}
+			s.trinoRebuildMu.Unlock()
+			if readErr != nil {
+				return util.Permanent(fmt.Errorf("Trino rebuild recovery operation=%s: %w", intent.OperationID, readErr))
+			}
+			if !found {
+				return util.Permanent(fmt.Errorf("Trino rebuild intent disappeared operation=%s", intent.OperationID))
+			}
+			if snapshot.CompletionConfirmed() {
+				if err := store.DeleteIcebergCommit(ctx, intent.StateKey, intent.OperationID); err != nil {
+					return util.Permanent(err)
+				}
+			}
+			continue
+		}
 		if intent.Status == meta.IcebergCommitCommitted && icebergIntentCovered(intent, offset, progress, snapshot) {
 			if err := store.DeleteIcebergCommit(ctx, s.checkpointKey(), intent.OperationID); err != nil {
 				return util.Permanent(fmt.Errorf("clear checkpointed Iceberg commit intent operation=%s: %w", intent.OperationID, err))

@@ -5,6 +5,7 @@ import {
   formatDateTime,
   formatDuration,
   jobDisplay,
+  jobRuntimeProgress,
   progressPill,
   setInnerHTMLIfChanged,
   statusPill,
@@ -91,7 +92,7 @@ function scheduleInventoryRefreshPoll(jobId) {
 }
 
 function renderGraphProgress(graph) {
-  const progress = graph?.progress;
+  const progress = jobRuntimeProgress(graph);
   if (!progress) return '';
 
   const summary = String(progress.summary || '').trim() || 'Waiting for update';

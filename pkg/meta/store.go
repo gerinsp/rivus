@@ -149,7 +149,7 @@ CREATE TABLE IF NOT EXISTS job_snapshot_progress (
 	}
 
 	// Defaults preserve old intents; absent identity must continue to fail closed.
-	for _, column := range []string{"source_table", "target_namespace", "target_table", "operation"} {
+	for _, column := range []string{"source_table", "target_namespace", "target_table", "operation", "target_uuid", "trino_query_id"} {
 		if _, err := s.sqlRunner().ExecContext(ctx, "ALTER TABLE iceberg_commit_intents ADD COLUMN "+column+" VARCHAR(255) NOT NULL DEFAULT ''"); err != nil && !isDuplicateColumnError(err) {
 			return err
 		}

@@ -139,6 +139,36 @@ func (s *Server) handleJobByID(w http.ResponseWriter, r *http.Request) {
 	}
 	id := parts[0]
 
+	if len(parts) == 2 && parts[1] == "name" && r.Method == http.MethodPatch {
+		var request struct {
+			Name string `json:"name"`
+		}
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&request); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid rename request"})
+			return
+		}
+		name, err := meta.ValidateJobName(request.Name)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		if err := s.jobManager.RequestRename(id, name); err != nil {
+			code := http.StatusInternalServerError
+			if errors.Is(err, core.ErrJobNotFound) {
+				code = http.StatusNotFound
+			}
+			if errors.Is(err, core.ErrJobRenameUnsupported) {
+				code = http.StatusNotImplemented
+			}
+			writeJSON(w, code, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"id": id, "name": name})
+		return
+	}
+
 	if len(parts) == 2 && parts[1] == "cancel" && r.Method == http.MethodPost {
 		if err := s.jobManager.RequestCancel(id); err != nil {
 			if err == core.ErrJobNotFound {
@@ -230,19 +260,19 @@ func (s *Server) handleJobByID(w http.ResponseWriter, r *http.Request) {
 		health := job.Health()
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"id":                  job.Config.ID,
-			"name":                job.Config.Name,
+			"name":                job.Name(),
 			"status":              job.GetStatus(),
 			"health_status":       health.Status,
 			"health_detail":       health.Detail,
-			"created":             job.Created,
-			"updated":             job.Updated,
+			"created":             job.CreatedTime(),
+			"updated":             job.UpdatedTime(),
 			"meta_key":            job.MetaKey(),
 			"checkpoint":          job.Checkpoint(),
 			"progress":            job.Progress(),
 			"iceberg_maintenance": job.TableMaintenanceStatus(),
 			"last_error":          job.GetLastError(),
 			"errors":              job.GetErrors(),
-			"config":              job.Config,
+			"config":              job.DisplayConfig(),
 		})
 		return
 	}

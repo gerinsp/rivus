@@ -4,6 +4,7 @@ import {
   fmtWholeNumber,
   idChip,
   jobDisplay,
+  jobRuntimeProgress,
   markSynced,
   operationErrorMessage,
   progressMetaParts,
@@ -67,6 +68,7 @@ function actionButtons(job) {
   return `
     <div class="flex min-w-max flex-nowrap items-center justify-end gap-2">
       <button type="button" class="${btnDetail}" data-job-action="details" data-job-id="${idAttr}">Details</button>
+      <button type="button" class="${btnDetail}" data-job-action="rename" data-job-name="${escapeHtml(job.name || '')}" data-job-id="${idAttr}">Rename</button>
       <button type="button" class="${btnLogs}" data-job-action="logs" data-job-id="${idAttr}">Logs</button>
       ${canPause ? `<button type="button" class="${btnPause}" data-job-action="pause" data-job-id="${idAttr}">Pause</button>` : ''}
       ${canCancel ? `<button type="button" class="${btnCancel}" data-job-action="cancel" data-job-id="${idAttr}">Cancel</button>` : ''}
@@ -78,10 +80,7 @@ function actionButtons(job) {
 }
 
 function renderJobProgress(job) {
-  const isQueued = String(job?.status || '').toUpperCase() === 'QUEUED';
-  const progress = isQueued
-    ? { phase: 'queued', summary: job?.progress?.summary && job?.progress?.phase === 'queued' ? job.progress.summary : 'Waiting in queue' }
-    : job?.progress;
+  const progress = jobRuntimeProgress(job);
   if (!progress) {
     if (!ACTIVE.has(job?.status)) return '';
     return `
@@ -481,6 +480,15 @@ export async function submitJob() {
   }
 }
 
+async function renameJob(id,currentName) {
+ const name=prompt('Job name',currentName);
+ if(name===null) return;
+ if(!name.trim()){setJobsNotice('Job name cannot be empty.','error');return;}
+ const res=await apiFetch('/api/jobs/'+encodeURIComponent(id)+'/name',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name.trim()})});
+ if(!res.ok){setJobsNotice(await operationErrorMessage(res,'Rename'),'error');return;}
+ await refreshDashboard();setJobsNotice('Job name updated.');
+}
+
 function handleJobClick(event) {
   const bulkArchiveButton = event.target.closest('[data-bulk-delete-archive]');
   if (bulkArchiveButton) {
@@ -501,6 +509,7 @@ function handleJobClick(event) {
   const action = jobButton.dataset.jobAction;
   if (!jobId || !action) return;
 
+  if (action === 'rename') renameJob(jobId, jobButton.dataset.jobName || '');
   if (action === 'details') showJobDetails(jobId);
   if (action === 'logs') showLogsForJob(jobId);
   if (action === 'pause') pauseJob(jobId);

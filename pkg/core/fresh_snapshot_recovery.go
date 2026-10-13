@@ -31,6 +31,18 @@ func (j *Job) checkFreshSnapshotRecovery(ctx context.Context, store meta.OffsetS
 	if err := meta.CheckOwnership(ctx, store); err != nil {
 		return blocked(err)
 	}
+	if token := j.Config.Metadata[config.IcebergRebuildScopedKey]; token != "" && token == j.SubmissionID() {
+		if err := config.ValidateIcebergSnapshotRebuild(j.Config); err != nil {
+			return blocked(err)
+		}
+		if err := meta.CheckScopedRebuildEmptyCheckpoint(ctx, store, j.Config.ID, key); err != nil {
+			return blocked(err)
+		}
+		if err := meta.CheckScopedRebuildIntents(ctx, store, j.Config.ID, key, token, true); err != nil {
+			return blocked(err)
+		}
+		return nil
+	}
 	// The public ID also covers intents from earlier configurations/state keys,
 	// matching the protection used by legacy checkpoint cleanup.
 	if err := checker.CheckJobStateCleanup(ctx, j.Config.ID); err != nil {
@@ -85,7 +97,11 @@ func (m *JobManager) rebuildPurgedIcebergJob(job *Job, admissionErr error) error
 	m.mu.Unlock()
 	setObservedJobStatus(job, JobStatusQueued)
 	setObservedFreshSnapshotProgress(job)
-	log.Printf("[job %s] purged binlog rebuild queued archive_id=%s submission_id=%s; previous checkpoint and confirmed intents archived; snapshot uses configured full target reset", job.Config.ID, result.ArchiveID, result.SubmissionID)
+	resetScope := "configured full target reset"
+	if config.IcebergSnapshotRebuildUsesTrino(job.Config) {
+		resetScope = "configured filtered Trino reset with durable statement verification"
+	}
+	log.Printf("[job %s] purged binlog rebuild queued archive_id=%s submission_id=%s; previous checkpoint and confirmed intents archived; snapshot uses %s", job.Config.ID, result.ArchiveID, result.SubmissionID, resetScope)
 	return nil
 }
 

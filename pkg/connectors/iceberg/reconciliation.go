@@ -20,6 +20,7 @@ type icebergIntentKey struct{}
 // than trusting a batch ID or an offset alone. Status is deliberately excluded.
 func icebergIntentFingerprint(intent meta.IcebergCommitIntent) string {
 	intent.Status = ""
+	intent.TrinoQueryID = "" // Mutable receipt, not part of the submitted statement.
 	encoded, _ := json.Marshal(intent)
 	digest := sha256.Sum256(encoded)
 	return fmt.Sprintf("%x", digest)

@@ -343,7 +343,7 @@ func (m *JobManager) SubmitMany(configs []*config.JobConfig) []SubmitResult {
 		}
 		results = append(results, SubmitResult{
 			ID:     job.Config.ID,
-			Name:   job.Config.Name,
+			Name:   job.Name(),
 			Status: job.GetStatus(),
 			Action: "submitted",
 		})
@@ -483,12 +483,12 @@ func (m *JobManager) List() []JobInfo {
 		health := j.Health()
 		out = append(out, JobInfo{
 			ID:           j.Config.ID,
-			Name:         j.Config.Name,
+			Name:         j.Name(),
 			Status:       j.GetStatus(),
 			HealthStatus: health.Status,
 			HealthDetail: health.Detail,
-			Created:      j.Created.Format("2006-01-02 15:04:05"),
-			Updated:      j.Updated.Format("2006-01-02 15:04:05"),
+			Created:      j.CreatedTime().Format("2006-01-02 15:04:05"),
+			Updated:      j.UpdatedTime().Format("2006-01-02 15:04:05"),
 			MetaKey:      j.MetaKey(),
 			SinkType:     sinkTypeFromConfig(j.Config),
 			ErrorCount:   len(errors),
@@ -1365,6 +1365,9 @@ func (m *JobManager) restoreJobSnapshot(job *Job, record meta.PersistedJob, resu
 		// identity. Always accept the durable value so a master that previously
 		// derived a local fallback converges with the worker that writes offsets.
 		job.metaKey = strings.TrimSpace(record.MetaKey)
+	}
+	if record.Name != "" {
+		job.displayName = record.Name
 	}
 	job.Created = created
 	job.Updated = updated

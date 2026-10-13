@@ -46,6 +46,14 @@ func TestSnapshotRollingEnabledForIcebergByDefaultAndCanBeDisabled(t *testing.T)
 	}
 }
 
+func TestScopedRebuildProtocolDisablesRollingSnapshotSource(t *testing.T) {
+	for _, raw := range []any{map[string]any{"snapshot_write_mode": config.IcebergRebuildScopedWriteMode}, config.IcebergConfig{SnapshotWriteMode: config.IcebergRebuildScopedWriteMode}} {
+		if snapshotRollingEnabledForSink("iceberg_native", raw) {
+			t.Fatal("scoped protocol selected rolling source checkpoints")
+		}
+	}
+}
+
 func TestDecodeMySQLConfigNormalizesTableConfigs(t *testing.T) {
 	cfg, err := decodeMySQLConfig(map[string]any{
 		"database": "legacy_db",

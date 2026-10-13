@@ -59,6 +59,8 @@ type Sink struct {
 	maintenanceOwnership connector.MaintenanceOwnershipLifecycle
 	snapshotSpoolDir     string
 	authoritativeRebuild bool
+	scopedRebuildToken   string
+	trinoRebuildMu       sync.Mutex
 
 	equalityCommitter cdcEqualityCommitter
 
@@ -236,6 +238,10 @@ var globalCommitLimiter struct {
 }
 
 func NewSink(jobID, stateKey, jobName string, cfg config.IcebergConfig, retry config.RetryPolicy, offsetSto meta.OffsetStore, progress connector.ProgressReporter) (*Sink, error) {
+	return newSinkWithRebuild(jobID, stateKey, jobName, cfg, retry, offsetSto, progress, "")
+}
+
+func newSinkWithRebuild(jobID, stateKey, jobName string, cfg config.IcebergConfig, retry config.RetryPolicy, offsetSto meta.OffsetStore, progress connector.ProgressReporter, scopedToken string) (*Sink, error) {
 	cfg.SnapshotWriteMode = normalizeSnapshotWriteMode(cfg.SnapshotWriteMode)
 	if !isValidSnapshotWriteMode(cfg.SnapshotWriteMode) {
 		return nil, fmt.Errorf("invalid iceberg snapshot_write_mode %q (valid: %s, %s, %s, %s, %s, %s)",
@@ -285,16 +291,17 @@ func NewSink(jobID, stateKey, jobName string, cfg config.IcebergConfig, retry co
 	}
 
 	sink := &Sink{
-		jobID:         jobID,
-		stateKey:      stateKey,
-		jobName:       strings.TrimSpace(jobName),
-		cfg:           cfg,
-		retry:         retry,
-		offsetSto:     offsetSto,
-		progress:      progress,
-		catalog:       cat,
-		sourceSchemas: make(map[string]*model.TableSchema),
-		states:        make(map[string]*tableState),
+		scopedRebuildToken: scopedToken,
+		jobID:              jobID,
+		stateKey:           stateKey,
+		jobName:            strings.TrimSpace(jobName),
+		cfg:                cfg,
+		retry:              retry,
+		offsetSto:          offsetSto,
+		progress:           progress,
+		catalog:            cat,
+		sourceSchemas:      make(map[string]*model.TableSchema),
+		states:             make(map[string]*tableState),
 	}
 	if strings.TrimSpace(stateKey) != "" || offsetSto != nil {
 		sink.recoveryPolicy = automaticRecoveryPolicy(retry)
@@ -1592,7 +1599,7 @@ func (s *Sink) handleSnapshotBarrier(ctx context.Context, ev model.Event) (err e
 
 	switch ev.Type {
 	case model.EventTypeSnapshotStart:
-		if s.authoritativeRebuild {
+		if s.authoritativeRebuild || s.scopedRebuildToken != "" {
 			if s.offsetSto == nil {
 				return fmt.Errorf("snapshot rebuild requires durable metadata")
 			}
@@ -1606,6 +1613,11 @@ func (s *Sink) handleSnapshotBarrier(ctx context.Context, ev model.Event) (err e
 			if state == nil || state.Done || state.StartFile == "" || state.StartPos == 0 {
 				return fmt.Errorf("snapshot rebuild BLOCKED: missing unfinished snapshot start after target reset")
 			}
+			if s.scopedRebuildToken != "" {
+				if err := s.confirmScopedResetBarrier(ctx); err != nil {
+					return err
+				}
+			}
 			if err := meta.CheckOwnership(ctx, s.offsetSto); err != nil {
 				return util.Permanent(err)
 			}
@@ -1616,6 +1628,9 @@ func (s *Sink) handleSnapshotBarrier(ctx context.Context, ev model.Event) (err e
 			s.mu.Lock()
 			for _, target := range s.states {
 				target.snapshotTruncateApplied = true
+				if s.scopedRebuildToken != "" {
+					target.snapshotReplaceApplied = true
+				}
 			}
 			s.mu.Unlock()
 		}
@@ -1639,6 +1654,11 @@ func (s *Sink) handleSnapshotBarrier(ctx context.Context, ev model.Event) (err e
 		}
 		if err := connector.ConfirmSnapshotCompletion(ctx, s.offsetSto, s.checkpointKey()); err != nil {
 			return err
+		}
+		if s.scopedRebuildToken != "" {
+			if err := s.cleanupScopedRebuildIntents(ctx); err != nil {
+				return err
+			}
 		}
 		if s.maintenance != nil {
 			s.maintenance.resumeSubmissions()
@@ -2184,6 +2204,9 @@ func (s *Sink) flushSnapshotRowsOnce(ctx context.Context, state *tableState, row
 }
 
 func (s *Sink) flushSnapshotReducedBatchOnce(ctx context.Context, state *tableState, batch *reducedBatch, snapshotStartOffset int64) (flushResult, error) {
+	if s.scopedRebuildToken != "" {
+		return s.flushScopedSnapshot(ctx, state, batch.rows)
+	}
 	switch s.snapshotWriteModeForTableState(state) {
 	case snapshotWriteModeAppend:
 		return s.flushSnapshotAppendOnce(ctx, state, batch.rows)
@@ -2376,6 +2399,11 @@ type trinoStatementColumn struct {
 }
 
 func (s *Sink) execTrinoStatement(ctx context.Context, query, schema string) error {
+	_, err := s.execTrinoStatementTracked(ctx, query, schema, nil)
+	return err
+}
+
+func (s *Sink) execTrinoStatementTracked(ctx context.Context, query, schema string, accepted func(string) error) ([][]json.RawMessage, error) {
 	cfg := s.cfg.TrinoDelete
 	endpoint := strings.TrimRight(strings.TrimSpace(cfg.URI), "/") + "/v1/statement"
 	client := s.trinoHTTPClient()
@@ -2387,49 +2415,85 @@ func (s *Sink) execTrinoStatement(ctx context.Context, query, schema string) err
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewBufferString(query))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	s.setTrinoHeaders(req, schema)
 	req.Header.Set("Content-Type", "text/plain; charset=utf-8")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("trino statement request auth_mode=%s user=%s uri=%s: %w", authMode, user, endpoint, err)
+		return nil, fmt.Errorf("trino statement request auth_mode=%s user=%s uri=%s: %w", authMode, user, endpoint, err)
 	}
 	defer resp.Body.Close()
 
 	statement, err := decodeTrinoStatementResponse(resp)
 	if err != nil {
-		return fmt.Errorf("trino statement response auth_mode=%s user=%s uri=%s: %w", authMode, user, endpoint, err)
+		return nil, fmt.Errorf("trino statement response auth_mode=%s user=%s uri=%s: %w", authMode, user, endpoint, err)
+	}
+	queryID := statement.ID
+	if accepted != nil {
+		if queryID == "" {
+			return nil, fmt.Errorf("Trino response has no query identity; outcome UNKNOWN")
+		}
+		if err := accepted(queryID); err != nil {
+			return nil, fmt.Errorf("persist Trino query identity before polling: %w", err)
+		}
 	}
 	if err := statementError(statement); err != nil {
-		return err
+		return nil, err
+	}
+	var data [][]json.RawMessage
+	collect := func(statement trinoStatementResponse) error {
+		for _, row := range statement.Data {
+			var values []json.RawMessage
+			if err := json.Unmarshal(row, &values); err != nil {
+				return err
+			}
+			data = append(data, values)
+		}
+		return nil
+	}
+	if err := collect(statement); err != nil {
+		return nil, err
 	}
 
 	nextURI := statement.NextURI
 	for nextURI != "" {
+		if accepted != nil {
+			base, baseErr := url.Parse(endpoint)
+			next, nextErr := url.Parse(nextURI)
+			if baseErr != nil || nextErr != nil || base.Scheme != next.Scheme || base.Host != next.Host || next.User != nil {
+				return nil, fmt.Errorf("Trino polling URI does not match configured coordinator")
+			}
+		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, nextURI, nil)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		s.setTrinoHeaders(req, schema)
 
 		resp, err := client.Do(req)
 		if err != nil {
-			return fmt.Errorf("trino statement poll auth_mode=%s user=%s uri=%s: %w", authMode, user, nextURI, err)
+			return nil, fmt.Errorf("trino statement poll auth_mode=%s user=%s uri=%s: %w", authMode, user, nextURI, err)
 		}
 		statement, err = decodeTrinoStatementResponse(resp)
 		resp.Body.Close()
 		if err != nil {
-			return fmt.Errorf("trino statement poll response auth_mode=%s user=%s uri=%s: %w", authMode, user, nextURI, err)
+			return nil, fmt.Errorf("trino statement poll response auth_mode=%s user=%s uri=%s: %w", authMode, user, nextURI, err)
+		}
+		if accepted != nil && statement.ID != queryID {
+			return nil, fmt.Errorf("Trino query identity changed while polling")
 		}
 		if err := statementError(statement); err != nil {
-			return err
+			return nil, err
+		}
+		if err := collect(statement); err != nil {
+			return nil, err
 		}
 		nextURI = statement.NextURI
 	}
 
-	return nil
+	return data, nil
 }
 
 func (s *Sink) trinoAuthMode() string {
@@ -3564,12 +3628,31 @@ func countIcebergTableRows(ctx context.Context, tbl *icetable.Table) (int64, err
 	}
 
 	var total int64
+	deleted := []icetable.FileScanTask{}
 	for _, task := range tasks {
 		if task.File == nil {
 			continue
 		}
-		total += task.File.Count()
+		if len(task.DeleteFiles) > 0 || len(task.EqualityDeleteFiles) > 0 {
+			deleted = append(deleted, task)
+		} else {
+			total += task.File.Count()
+		}
 	}
+	if len(deleted) > 0 {
+		_, records, err := tbl.Scan().ReadTasks(ctx, deleted)
+		if err != nil {
+			return 0, err
+		}
+		for record, err := range records {
+			if err != nil {
+				return 0, err
+			}
+			total += record.NumRows()
+			record.Release()
+		}
+	}
+
 	return total, nil
 }
 

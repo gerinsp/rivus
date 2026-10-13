@@ -410,3 +410,13 @@ export async function logout() {
 export function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+// Saved progress remains available in the API; lifecycle labels prevent it
+// from being mistaken for activity by a stopped or stopping pipeline.
+export function jobRuntimeProgress(job) {
+ const status=String(job?.status||'').toUpperCase();
+ const summaries={STOPPING:'Stopping job',STOPPED:'Job stopped',PAUSED:'Job paused',FAILED:'Job failed',DONE:'Job complete'};
+ if (summaries[status]) return {phase:status.toLowerCase(),summary:summaries[status]};
+ if(status==='QUEUED') return {phase:'queued',summary:job?.progress?.phase==='queued' ? job.progress.summary : 'Waiting in queue'};
+ return job?.progress;
+}

@@ -14,6 +14,7 @@ import (
 	"github.com/gerinsp/rivus/pkg/connector"
 	"github.com/gerinsp/rivus/pkg/meta"
 	"github.com/gerinsp/rivus/pkg/model"
+	"github.com/gerinsp/rivus/pkg/util"
 )
 
 type automaticStore struct {
@@ -213,6 +214,66 @@ func TestAutomaticRecoveryMissingProofExhaustsWithoutReplay(t *testing.T) {
 		t.Fatal("exhaustion discarded recovery state")
 	}
 	assertAutomaticData(t, base, 1, 1)
+}
+
+func TestAutomaticRecoveryRetainsInitialCommitFailure(t *testing.T) {
+	for _, scenario := range []string{"missing-proof", "metadata-unavailable", "deadline", "ownership-lost", "invalid-replay-identities", "committed-mark-failed"} {
+		t.Run(scenario, func(t *testing.T) {
+			cat := recoveryCatalog(t)
+			store := &automaticStore{guardTestStore: newGuardTestStore()}
+			s := automaticSink(t, cat, store)
+			state := s.states["app.orders"]
+			recovered := state.table
+			initial := errors.New("original commit transport failure")
+			var verification error
+			var last connector.ProgressInfo
+			s.progress = func(p connector.ProgressInfo) { last = p }
+			batch := cdcIcebergBatch("app.orders", []model.Event{recoveryEvent(1, 0)})
+			if scenario == "invalid-replay-identities" {
+				batch.replayKeys = ""
+			}
+			if scenario == "committed-mark-failed" {
+				store.markErr = initial
+			}
+			calls := 0
+			err := s.guardedIcebergCommit(withIcebergBatch(context.Background(), batch), commitProgress{
+				operation: "append", sourceKey: "app.orders", targetNamespace: "bronze", targetTable: "orders", recoveredTable: &recovered,
+			}, func(context.Context) error {
+				calls++
+				switch scenario {
+				case "metadata-unavailable":
+					store.listFailures = 10
+				case "deadline":
+					verification = context.DeadlineExceeded
+					s.recoveryWait = func(context.Context, time.Duration) error { return verification }
+				case "ownership-lost":
+					verification = meta.ErrWorkerOwnershipLost
+					store.ownershipErr = verification
+				case "committed-mark-failed":
+					return nil
+				}
+				return initial
+			})
+			if !errors.Is(err, initial) || !util.IsPermanent(err) || !strings.Contains(err.Error(), "initial commit error:") {
+				t.Fatalf("recovery lost initial cause: %v", err)
+			}
+			if verification != nil && !errors.Is(err, verification) {
+				t.Fatalf("recovery lost verification cause: %v", err)
+			}
+			if scenario != "invalid-replay-identities" && (last.RecoveryStatus != "BLOCKED" || !strings.Contains(last.RecoveryLastError, initial.Error())) {
+				t.Fatalf("blocked progress lost initial cause: %#v", last)
+			}
+			if calls != 1 || len(store.intents) != 1 || store.saveCount != 0 || recovered != state.table {
+				t.Fatal("failed recovery retried the write or changed recovery state/checkpoint/table")
+			}
+			for _, intent := range store.intents {
+				if intent.Status != meta.IcebergCommitPrepared {
+					t.Fatal("failed verification confirmed an uncertain commit")
+				}
+			}
+			assertAutomaticData(t, cat, 0, 0)
+		})
+	}
 }
 
 func TestAutomaticRecoveryProofAppearsAfterAttempts(t *testing.T) {

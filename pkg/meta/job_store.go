@@ -294,8 +294,7 @@ func (s *MySQLJobStore) SaveJob(ctx context.Context, job PersistedJob) error {
 	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
 	ON DUPLICATE KEY UPDATE
 	  submission_id = VALUES(submission_id),
-	  job_name = VALUES(job_name),
-	  config_json = VALUES(config_json),
+	  config_json = JSON_SET(VALUES(config_json),'$.name',job_name),
 	  meta_key = VALUES(meta_key),
 	  desired_state = VALUES(desired_state),
 	  execution_role = VALUES(execution_role),
@@ -337,10 +336,6 @@ func (s *MySQLJobStore) SaveClaimedJob(ctx context.Context, job PersistedJob, ow
 	if id == "" {
 		return false, fmt.Errorf("persisted job id is empty")
 	}
-	name := job.Name
-	if name == "" {
-		name = cfg.Name
-	}
 	desired := job.DesiredState
 	if desired == "" {
 		desired = DesiredStateStopped
@@ -360,14 +355,14 @@ func (s *MySQLJobStore) SaveClaimedJob(ctx context.Context, job PersistedJob, ow
 
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE job_registry
-		SET job_name=?, meta_key=?, desired_state=?, execution_role=?, resume_requested=FALSE,
+		SET meta_key=?, desired_state=?, execution_role=?, resume_requested=FALSE,
 		    last_status=CASE
 		      WHEN last_status='PAUSING' AND ? IN ('CREATED','QUEUED','PENDING','RUNNING') THEN last_status
 		      ELSE ?
 		    END,
 		    errors_json=?, progress_json=?, updated_at=NOW()
 		WHERE job_id=? AND submission_id=? AND lease_owner=? AND lease_until >= UTC_TIMESTAMP(6)`,
-		name, nullableString(job.MetaKey), string(desired), string(executionRole),
+		nullableString(job.MetaKey), string(desired), string(executionRole),
 		status, status, string(errorsJSON), progressJSON, id, job.SubmissionID, owner)
 	if err != nil {
 		return false, err
@@ -414,9 +409,7 @@ func (s *MySQLJobStore) loadJobs(ctx context.Context, query string, args ...any)
 		if cfg.ID == "" {
 			cfg.ID = jobID
 		}
-		if cfg.Name == "" {
-			cfg.Name = name
-		}
+		cfg.Name = name
 
 		var errorHistory []PersistedJobError
 		if errorsJSON.Valid && errorsJSON.String != "" && errorsJSON.String != "null" {

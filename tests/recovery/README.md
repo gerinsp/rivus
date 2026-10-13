@@ -89,3 +89,45 @@ docker --context colima compose -f tests/recovery/compose.yml down --volumes
 CI menjalankan enam compatibility cases di MySQL Docker fixtures setiap push/PR; build baseline memakai full Git history. CI tidak menjalankan Colima-specific mysqld fault suite. Tests lintas binary memakai deterministic source events dan real metadata/Hadoop catalog, bukan actual source CDC pada tiap case; actual MySQL CDC tetap diuji oleh baseline. Schema tests memverifikasi metadata barrier, bukan sink data commit. Unit regressions tambahan menjaga STOPPING restoration, legacy partial-prefix rejection, marker/submission matching dan last verification cause ketika timeout.
 
 Rollback yang fail closed berarti data/checkpoint dilindungi, bukan job pasti bisa running pada image lama. Version 2 receipt dan `rebuild-truncate-append-v1` memerlukan compatible worker. Old worker dapat claim lalu fail; rolling upgrade availability belum dijamin. Semua earlier releases, REST/S3, Doris migration dan setiap scheduling kombinasi old/new belum diuji. Runbook compatibility dan remaining production cases: `/Users/gerin/app/rivus-oss-learning/24-upgrade-rollback-compatibility.md`.
+
+## Filtered Trino rebuild fixture
+
+**Local verification PASS; rollout diverifikasi terpisah.** Fixture tambahan memakai Trino 483, PostgreSQL JDBC Iceberg catalog, native iceberg-go SQL catalog yang sama, dan warehouse files yang dibagi melalui mount Colima. Adapter `local://` hanya ada pada test dengan build tag `integration`; production catalog constructor tidak diubah. Port PostgreSQL/Trino hanya loopback `49318`/`49319`. PostgreSQL dan Trino credentials hanya fixture. Sisakan sekitar 8–10 GB disk sebelum image pull/build agar VM tidak mengalami I/O error.
+
+Sesi terbaru memakai profil terpisah `rivus-recovery`, karena profil default mengalami I/O/boot error setelah disk host penuh. Volume default, termasuk `mysql_prisma`, tidak dihapus. Default tetap stopped; pemulihannya merupakan pekerjaan terpisah. Docker context aktif tidak diubah.
+
+```sh
+colima start --profile rivus-recovery --activate=false --memory 3 --cpu 2 --disk 20
+export RIVUS_RECOVERY_TRINO_ROOT=/tmp/colima-rivus-recovery
+mkdir -p "$RIVUS_RECOVERY_TRINO_ROOT/rivus-recovery-trino-data" "$RIVUS_RECOVERY_TRINO_ROOT/rivus-recovery-trino-warehouse"
+docker --context colima-rivus-recovery compose -f tests/recovery/compose.yml -f tests/recovery/trino-compose.yml up -d --wait
+env RIVUS_RECOVERY_TRINO_INTEGRATION=1 GOMAXPROCS=2 go test -p=1 -ldflags='-s -w' -tags=integration ./pkg/connectors/iceberg -run '^TestScopedTrinoReal' -count=1 -v -timeout=8m
+```
+
+`RIVUS_RECOVERY_TRINO_ROOT` harus merupakan host directory yang di-mount ke VM dengan path sama. Untuk profil default gunakan `/tmp/colima`; profil terpisah memakai `/tmp/colima-rivus-recovery`. Fixture Trino berjalan sebagai root hanya untuk izin write pada shared mount lokal. JVM heap dibatasi 1 GB. Healthcheck HTTP bukan pengganti keberhasilan SQL pertama.
+
+Sembilan execution cases disiapkan: filtered DELETE/MERGE; terminal response hilang; submit response hilang; target memiliki duplicate PK; SIGKILL setelah terminal response dan sesudah COMMITTED pada reset/MERGE; serta master resubmit purged → snapshot populated/empty source → CDC. SIGKILL cases memakai subprocess sink dan ledger/fence nyata; lifecycle pipeline memakai JobManager/MySQL nyata, tetapi seluruh snapshot-worker progress crash boundaries belum dicakup oleh subprocess tersebut. Query-history disappearance atau missing query identity tetap BLOCKED, tanpa POST retry.
+
+Status aktual: sembilan real Trino execution cases **PASS**, termasuk empat actual SIGKILL/restart cases, lost terminal/submit responses, duplicate target PK admission, dan purged-resubmit pipeline menuju CDC. Test awal menemukan duplicate preserved PK masih diterima serta native row count menghitung physical records tanpa delete files; keduanya dibetulkan tanpa melemahkan expected row/payload assertions. Factory regression tambahan memakai REST HTTP test double dan accepted QueryInfo untuk membuktikan submission token terikat sebelum constructor melakukan reconciliation. No production fault injection.
+
+Verifikasi yang sudah PASS pada worktree terbaru: `go test ./...` (dengan `-p=1 -ldflags='-s -w'` untuk mengurangi penggunaan disk), 20 MySQL archive/reset cases, dua MySQL query-ID persistence/fence cases, empat worker fence cases, enam actual `ff300c0` binary/schema cases, dan 19 native crash/restart cases. Satu metadata-container SIGKILL case tidak dijalankan karena safety guard-nya mengharuskan context default `colima`. Jangan mengaktifkan container faults pada profil baru sebelum guard/target context diperbarui dan diverifikasi.
+
+Evidence lokal: `/private/tmp/rivus-scoped-full-unit-tests.log`, `rivus-scoped-metadata-integration.log`, `rivus-scoped-query-metadata-integration.log`, `rivus-scoped-worker-fence-integration.log`, `rivus-scoped-native-integration.log`, dan `rivus-scoped-compatibility-integration.log`. Tidak ada exactly-once claim atau rollout dari hasil ini.
+
+## UNKNOWN recovery melalui target baru
+
+`TestRecoveryTrinoRealIsolatedTargetKeepsUnknownAndHandsOffCDC` menjalankan normal new-job submission ke namespace baru sementara job lama FAILED/STOPPED mempertahankan PREPARED intent dan unavailable old checkpoint. Source/metadata MySQL, Trino 483/JDBC catalog dan Iceberg files nyata digunakan. Rolling snapshot memakai cutoff September, menguji populated/empty source, sink-confirmed completion, CDC checkpoint, dan original target/checkpoint/UNKNOWN evidence tetap utuh. Bukan same-ID resubmit atau scoped WIP rebuild.
+
+```sh
+env RIVUS_RECOVERY_TRINO_ROOT=/tmp/colima-rivus-recovery RIVUS_RECOVERY_TRINO_INTEGRATION=1 GOMAXPROCS=2 go test -p=1 -ldflags='-s -w' -tags=integration ./pkg/connectors/iceberg -run '^TestRecoveryTrinoRealIsolatedTargetKeepsUnknownAndHandsOffCDC$' -count=1 -v -timeout=2m
+```
+
+PASS pada current worktree dan exported production commit 74467d5 (production code unchanged; fixture-only test helpers/dependencies). Fixture memakai dua source tables; tidak membuktikan completeness 363 production selections, source retention untuk snapshot panjang, REST/S3 network faults, rolling-spool SIGKILL atau consumer cutover. Shared mount image 483 memakai physical `local.location=/`, agar `local:///warehouse/...` dipetakan ke shared `/warehouse/...`. HTTP health saja sempat lolos sebelum catalog startup gagal; test harus menunggu actual SQL success.
+
+## Job presentation dan final verification
+
+`TestJobPresentationRealRenameSurvivesWorkerUpdates` memakai metadata MySQL nyata: rename tidak mengganti submission, lease, checkpoint atau source/sink config; stale-name worker status write serta control-plane UPSERT tidak menimpa nama baru. `TestJobPresentationRealExplicitStopKeepsRecoveryEvidence` membuktikan explicit stop idempotent mempertahankan PREPARED/checkpoint. UI regressions memastikan STOPPED/STOPPING/FAILED/PAUSED/DONE tidak menampilkan saved CDC progress sebagai aktivitas berjalan; actual progress tetap tersedia pada API.
+
+Final local worktree verification: full `go test ./... -count=1` PASS; related core rename/view race PASS; 60 integration leaf scenarios PASS, satu metadata-container SIGKILL case SKIP karena default-context guard; dua query-ID persistence/fence cases terpisah PASS. Jumlah execution yang lulus **62**, tanpa menghitung skipped case. Combined suite mencakup enam pinned ff300c0 binary/schema compatibility cases dan sembilan Trino cases. Evidence `/private/tmp/rivus-recovery-and-ui-full-unit-final.log`, `rivus-recovery-and-ui-integration-final.log`, `rivus-trino-query-final.log`, `rivus-job-name-race-final.log`, `rivus-job-status-ui-green.log`.
+
+Guard otomatis untuk arbitrary STOPPING tanpa worker lease tidak ditambahkan: asynchronous Delete pada control plane dapat tetap berjalan. Explicit Cancel menyelesaikan durable STOPPED fence; pending deletion tetap dilindungi oleh reservation dan receipt cleanup checks. Runtime connector log/snapshot job-name labels tetap label saat constructor dibuat; rename mengubah display/durable config serta future constructors tanpa restart connector.

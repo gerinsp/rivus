@@ -184,6 +184,16 @@ type SnapshotFilterProvider interface {
 	HasSnapshotFilter(schema, table string) bool
 }
 
+type SnapshotFilterExpressionProvider interface {
+	SnapshotFilterExpression(schema, table string) string
+}
+
+// Validate all selected tables before any reset, including empty sources.
+type ScopedSnapshotTargetResetter interface {
+	ValidateSnapshotSourceTable(context.Context, string, string, string) error
+	ResetSnapshotSourceTable(context.Context, string, string, string) error
+}
+
 type SnapshotPrimaryKeySkipper interface {
 	SkipSnapshotTableWithoutPrimaryKey(schema, table string, sourceSchema *model.TableSchema) bool
 }

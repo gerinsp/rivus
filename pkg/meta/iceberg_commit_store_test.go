@@ -61,12 +61,22 @@ func (c commitIntentSQLConn) ExecContext(_ context.Context, query string, args [
 			SnapshotTable: args[9].Value.(string), SnapshotStartOffset: args[10].Value.(int64),
 			SnapshotEndOffset: args[11].Value.(int64), Status: IcebergCommitPrepared,
 			SourceTable: args[12].Value.(string), TargetNamespace: args[13].Value.(string), TargetTable: args[14].Value.(string), Operation: args[15].Value.(string), ReplayKeys: args[16].Value.(string),
+			TargetUUID: args[17].Value.(string),
 		}
 		c.state.intents[intent.OperationID] = intent
 		return driver.RowsAffected(1), nil
 	case strings.Contains(query, "INSERT INTO job_snapshot_progress"):
 		return driver.RowsAffected(1), nil
 	case strings.Contains(query, "UPDATE iceberg_commit_intents"):
+		if strings.Contains(query, "SET trino_query_id") {
+			intent, ok := c.state.intents[args[2].Value.(string)]
+			if !ok || intent.StateKey != args[1].Value.(string) || intent.Kind != "rebuild" || intent.Status != IcebergCommitPrepared || (intent.TrinoQueryID != "" && intent.TrinoQueryID != args[0].Value.(string)) {
+				return driver.RowsAffected(0), nil
+			}
+			intent.TrinoQueryID = args[0].Value.(string)
+			c.state.intents[intent.OperationID] = intent
+			return driver.RowsAffected(1), nil
+		}
 		intent, ok := c.state.intents[args[1].Value.(string)]
 		if !ok || intent.StateKey != args[0].Value.(string) || intent.Status != IcebergCommitPrepared {
 			return driver.RowsAffected(0), nil
@@ -93,6 +103,14 @@ func (c commitIntentSQLConn) ExecContext(_ context.Context, query string, args [
 }
 
 func (c commitIntentSQLConn) QueryContext(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	if strings.Contains(query, "SELECT trino_query_id") {
+		intent, ok := c.state.intents[args[1].Value.(string)]
+		var values [][]driver.Value
+		if ok && intent.StateKey == args[0].Value.(string) && intent.Kind == "rebuild" && intent.Status == IcebergCommitPrepared {
+			values = append(values, []driver.Value{intent.TrinoQueryID})
+		}
+		return &commitIntentSQLRows{values: values, queryIdentity: true}, nil
+	}
 	if !strings.Contains(query, "FROM iceberg_commit_intents") {
 		return nil, errors.New("unexpected SQL: " + query)
 	}
@@ -104,15 +122,21 @@ func (c commitIntentSQLConn) QueryContext(_ context.Context, query string, args 
 		values = append(values, []driver.Value{intent.OperationID, intent.JobID, intent.StateKey, intent.BatchID,
 			intent.Kind, intent.SourceStartFile, int64(intent.SourceStartPos), intent.SourceEndFile,
 			int64(intent.SourceEndPos), intent.SnapshotTable, intent.SnapshotStartOffset,
-			intent.SnapshotEndOffset, intent.Status, intent.SourceTable, intent.TargetNamespace, intent.TargetTable, intent.Operation, intent.ReplayKeys})
+			intent.SnapshotEndOffset, intent.Status, intent.SourceTable, intent.TargetNamespace, intent.TargetTable, intent.Operation, intent.ReplayKeys, intent.TargetUUID, intent.TrinoQueryID})
 	}
 	return &commitIntentSQLRows{values: values}, nil
 }
 
-type commitIntentSQLRows struct{ values [][]driver.Value }
+type commitIntentSQLRows struct {
+	values        [][]driver.Value
+	queryIdentity bool
+}
 
 func (r *commitIntentSQLRows) Columns() []string {
-	return []string{"operation_id", "job_id", "state_key", "batch_id", "kind", "source_start_file", "source_start_pos", "source_end_file", "source_end_pos", "snapshot_table", "snapshot_start_offset", "snapshot_end_offset", "status", "source_table", "target_namespace", "target_table", "operation", "replay_keys"}
+	if r.queryIdentity {
+		return []string{"trino_query_id"}
+	}
+	return []string{"operation_id", "job_id", "state_key", "batch_id", "kind", "source_start_file", "source_start_pos", "source_end_file", "source_end_pos", "snapshot_table", "snapshot_start_offset", "snapshot_end_offset", "status", "source_table", "target_namespace", "target_table", "operation", "replay_keys", "target_uuid", "trino_query_id"}
 }
 
 func (r *commitIntentSQLRows) Close() error { return nil }

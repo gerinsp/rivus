@@ -37,8 +37,12 @@ func compatibilityInput(t *testing.T) recoveryWorkerInput {
 }
 
 func TestCompatibilityOldRebuildModeRejected(t *testing.T) {
-    _, err := NewSink("compatibility", "", "", config.IcebergConfig{SnapshotWriteMode: "rebuild-truncate-append-v1"}, config.RetryPolicy{}, nil, nil)
-    if err == nil || !strings.Contains(err.Error(), "invalid iceberg snapshot_write_mode") { t.Fatalf("old worker did not reject rebuild before catalog discovery: %v", err) }
+    for _, mode := range []string{"rebuild-truncate-append-v1", "rebuild-scoped-trino-v1"} {
+        t.Run(mode, func(t *testing.T) {
+            _, err := NewSink("compatibility", "", "", config.IcebergConfig{SnapshotWriteMode: mode}, config.RetryPolicy{}, nil, nil)
+            if err == nil || !strings.Contains(err.Error(), "invalid iceberg snapshot_write_mode") { t.Fatalf("old worker did not reject rebuild before catalog discovery: %v", err) }
+        })
+    }
 }
 
 func TestCompatibilityOldVersion2ReceiptBlocked(t *testing.T) {

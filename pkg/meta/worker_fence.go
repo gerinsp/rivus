@@ -145,3 +145,7 @@ func (s *FencedOffsetStore) MarkIcebergCommitCommitted(ctx context.Context, key,
 func (s *FencedOffsetStore) DeleteIcebergCommit(ctx context.Context, key, id string) error {
 	return s.write(ctx, key, func(store *MySQLOffsetStore) error { return store.DeleteIcebergCommit(ctx, key, id) })
 }
+
+func (s *FencedOffsetStore) RecordIcebergTrinoQuery(ctx context.Context, key, id, queryID string) error {
+	return s.write(ctx, key, func(store *MySQLOffsetStore) error { return store.RecordIcebergTrinoQuery(ctx, key, id, queryID) })
+}
