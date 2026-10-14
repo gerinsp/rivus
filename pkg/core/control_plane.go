@@ -250,6 +250,26 @@ func (m *JobManager) resubmitDurableJob(job *Job) (*Job, error) {
 	if freshSnapshot {
 		role = meta.JobExecutionRoleSnapshot
 	}
+	if !freshSnapshot && role == meta.JobExecutionRoleSnapshot && job.Config.Sink != nil &&
+		job.Config.Sink.Config["snapshot_write_mode"] == config.IcebergRebuildScopedWriteMode {
+		upgrader, ok := m.jobStore.(meta.JobNativeRebuildStore)
+		if !ok {
+			return nil, fmt.Errorf("job store cannot upgrade the scoped snapshot writer")
+		}
+		offsets, key, err := job.checkpointReader()
+		if err != nil {
+			return nil, err
+		}
+		upgradeCtx, stop := context.WithTimeout(context.Background(), 10*time.Second)
+		cfg, err := upgrader.UpgradeJobNativeRebuild(upgradeCtx, offsets, job.Config.ID, job.SubmissionID(), key)
+		stop()
+		if err != nil {
+			return nil, err
+		}
+		job.mu.Lock()
+		job.displayConfig = cfg
+		job.mu.Unlock()
+	}
 
 	updateCtx, updateCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer updateCancel()

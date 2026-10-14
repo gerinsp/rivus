@@ -86,7 +86,20 @@ func TestScopedTrinoCrashWorker(t *testing.T) {
 		t.Fatal(err)
 	}
 	crash := &scopedCrashStore{FencedOffsetStore: store.(*meta.FencedOffsetStore), stage: input.Stage}
-	s := scopedCrashSink(t, input, scopedRealCatalog(t), crash)
+	var cat icecatalog.Catalog = scopedRealCatalog(t)
+	if input.Phase == "native" && input.Stage == "after-catalog" {
+		cat = nativeKillCatalog{cat}
+	}
+	s := scopedCrashSink(t, input, cat, crash)
+	if input.Phase == "native" {
+		s.scopedNativeWrites = true
+		s.states["app.orders"].snapshotReplaceApplied, s.states["app.orders"].snapshotTruncateApplied = true, true
+		rows := []map[string]interface{}{{"id": int64(3), "status": "prefix", "created_at": time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC)}}
+		if _, err := s.flushScopedSnapshot(withIcebergBatch(ctx, snapshotIcebergBatch("app.orders", 0, 1)), s.states["app.orders"], rows); err != nil {
+			t.Fatal(err)
+		}
+		t.Fatal("native worker did not reach SIGKILL barrier")
+	}
 	if input.Stage == "after-terminal" {
 		http.DefaultClient = &http.Client{Transport: &scopedResponseLoss{base: http.DefaultTransport, stage: "kill-terminal"}}
 	}

@@ -138,7 +138,7 @@ func (s *MySQLJobStore) RequestJobRebuild(ctx context.Context, offsets OffsetSto
 	if config.IcebergSnapshotRebuildUsesTrino(&cfg) {
 		delete(cfg.Metadata, config.IcebergRebuildFullResetKey)
 		cfg.Metadata[config.IcebergRebuildScopedKey] = result.SubmissionID
-		cfg.Sink.Config["snapshot_write_mode"] = config.IcebergRebuildScopedWriteMode
+		cfg.Sink.Config["snapshot_write_mode"] = config.IcebergRebuildScopedNativeWriteMode
 		cfg.Sink.Config["snapshot_rolling_enabled"] = false
 	} else {
 		delete(cfg.Metadata, config.IcebergRebuildScopedKey)

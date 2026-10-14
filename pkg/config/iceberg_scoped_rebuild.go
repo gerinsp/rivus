@@ -12,6 +12,10 @@ import (
 const IcebergRebuildScopedKey = "iceberg_rebuild_scoped"
 const IcebergRebuildScopedWriteMode = "rebuild-scoped-trino-v1"
 
+// Older workers reject this mode before opening connectors. Reset still uses
+// durable Trino receipts; snapshot data is written as guarded native batches.
+const IcebergRebuildScopedNativeWriteMode = "rebuild-scoped-native-v2"
+
 func IcebergSnapshotRebuildUsesTrino(cfg *JobConfig) bool {
 	if cfg == nil || cfg.Sink == nil {
 		return false
@@ -119,7 +123,7 @@ func validateScopedIcebergRebuild(cfg *JobConfig) error {
 		return fmt.Errorf("scoped Trino rebuild requires coordinator configuration and matching replacement filters")
 	}
 	mode := strings.ToLower(strings.TrimSpace(sink.SnapshotWriteMode))
-	if mode != "auto" && mode != IcebergRebuildScopedWriteMode {
+	if mode != "auto" && mode != IcebergRebuildScopedWriteMode && mode != IcebergRebuildScopedNativeWriteMode {
 		return fmt.Errorf("scoped Trino rebuild requires auto snapshot mode")
 	}
 	selections := append([]string(nil), source.Tables...)

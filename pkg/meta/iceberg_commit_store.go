@@ -44,6 +44,18 @@ type IcebergJobCommitIntentStore interface {
 	ListIcebergCommitsForJob(ctx context.Context, stateKey, jobID string) ([]IcebergCommitIntent, error)
 }
 
+type IcebergCommitReader interface {
+	GetIcebergCommit(ctx context.Context, stateKey, operationID string) (*IcebergCommitIntent, error)
+}
+
+func (s *MySQLOffsetStore) GetIcebergCommit(ctx context.Context, key, id string) (*IcebergCommitIntent, error) {
+	intents, err := s.listIcebergCommits(ctx, "state_key = ? AND operation_id = ?", key, id)
+	if err != nil || len(intents) == 0 {
+		return nil, err
+	}
+	return &intents[0], nil
+}
+
 func (s *MySQLOffsetStore) RecordIcebergTrinoQuery(ctx context.Context, key, id, queryID string) error {
 	if queryID == "" {
 		return fmt.Errorf("empty Trino query identity")

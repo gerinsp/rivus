@@ -108,6 +108,9 @@ func (s *Sink) loadProvenIcebergTable(ctx context.Context, intent meta.IcebergCo
 	if err != nil {
 		return nil, fmt.Errorf("load recovery target: %w", err)
 	}
+	if intent.TargetUUID != "" && tbl.Metadata().TableUUID().String() != intent.TargetUUID {
+		return nil, fmt.Errorf("native recovery target generation changed")
+	}
 	key, want := "rivus.commit."+intent.OperationID, icebergIntentFingerprint(intent)
 	if recoverableMetadataOperation(intent.Operation) {
 		if tbl.Properties()[key] == want {

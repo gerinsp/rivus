@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -118,15 +119,16 @@ func TestScopedRebuildTrinoDurableOutcomeAndRestart(t *testing.T) {
 			s.offsetSto = store
 			s.scopedRebuildToken = "submission"
 			state := s.states["app.orders"]
-			posts, reads := 0, 0
-			var submitted string
+			var posts, reads atomic.Int64
+			var submitted atomic.Value
+			submitted.Store("")
 			var server *httptest.Server
 			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch {
 				case r.Method == http.MethodPost && r.URL.Path == "/v1/statement":
-					posts++
+					posts.Add(1)
 					body, _ := io.ReadAll(r.Body)
-					submitted = string(body)
+					submitted.Store(string(body))
 					if len(store.intents) != 1 {
 						t.Error("Trino write started without its durable PREPARED intent")
 					}
@@ -156,12 +158,12 @@ func TestScopedRebuildTrinoDurableOutcomeAndRestart(t *testing.T) {
 					}
 					json.NewEncoder(w).Encode(map[string]any{"id": "query_1", "stats": map[string]string{"state": "FINISHED"}})
 				case r.Method == http.MethodGet && r.URL.Path == "/v1/query/query_1":
-					reads++
+					reads.Add(1)
 					if scenario == "missing-query-proof" {
 						http.Error(w, "query history expired", http.StatusNotFound)
 						return
 					}
-					json.NewEncoder(w).Encode(map[string]any{"queryId": "query_1", "state": "FINISHED", "query": submitted})
+					json.NewEncoder(w).Encode(map[string]any{"queryId": "query_1", "state": "FINISHED", "query": submitted.Load().(string)})
 				default:
 					t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 					http.Error(w, "unexpected", 500)
@@ -180,8 +182,8 @@ func TestScopedRebuildTrinoDurableOutcomeAndRestart(t *testing.T) {
 			if (err == nil) != (scenario == "success" || scenario == "changed-statement") {
 				t.Fatalf("first outcome: %v", err)
 			}
-			if posts != 1 || store.saveCount != 0 || len(store.intents) != 1 {
-				t.Fatalf("unsafe writes/checkpoint posts=%d saved=%d intents=%d", posts, store.saveCount, len(store.intents))
+			if posts.Load() != 1 || store.saveCount != 0 || len(store.intents) != 1 {
+				t.Fatalf("unsafe writes/checkpoint posts=%d saved=%d intents=%d", posts.Load(), store.saveCount, len(store.intents))
 			}
 			store.markErr, store.queryErr, store.ownershipErr = nil, nil, nil
 			restarted := automaticSink(t, base, store.automaticStore)
@@ -191,11 +193,11 @@ func TestScopedRebuildTrinoDurableOutcomeAndRestart(t *testing.T) {
 			}
 			err = restarted.executeRebuildStatement(ctx, restarted.states["app.orders"], "reset", query)
 			blocked := scenario == "lost-submit-response" || scenario == "query-id-save-failed" || scenario == "ownership-lost" || scenario == "missing-query-proof" || scenario == "changed-statement" || scenario == "missing-query-id"
-			if (err != nil) != blocked || posts != 1 || store.saveCount != 0 {
-				t.Fatalf("restart outcome=%v posts=%d checkpoint saves=%d", err, posts, store.saveCount)
+			if (err != nil) != blocked || posts.Load() != 1 || store.saveCount != 0 {
+				t.Fatalf("restart outcome=%v posts=%d checkpoint saves=%d", err, posts.Load(), store.saveCount)
 			}
 			if scenario == "lost-poll-response" || scenario == "mark-failed" {
-				if reads != 1 {
+				if reads.Load() != 1 {
 					t.Fatalf("restart did not verify query outcome: reads=%d", reads)
 				}
 			}

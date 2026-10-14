@@ -8,7 +8,7 @@ import (
 
 // Non-mutating admission for the current rebuild epoch. Ordinary cleanup is
 // never relaxed: a sink must reconcile PREPARED statements before any source ACK.
-func CheckScopedRebuildIntents(ctx context.Context, store OffsetStore, jobID, key, submission string, allowPrepared bool) error {
+func CheckScopedRebuildIntents(ctx context.Context, store OffsetStore, jobID, key, submission string, allowPrepared bool, native ...bool) error {
 	if submission == "" {
 		return fmt.Errorf("scoped rebuild submission missing")
 	}
@@ -26,6 +26,9 @@ func CheckScopedRebuildIntents(ctx context.Context, store OffsetStore, jobID, ke
 		}
 		for _, intent := range rows {
 			valid := intent.Status == IcebergCommitCommitted || (allowPrepared && intent.Status == IcebergCommitPrepared)
+			if len(native) > 0 && native[0] && valid && IsScopedNativeSnapshotIntent(intent, jobID, key, submission) {
+				continue
+			}
 			if intent.JobID != jobID || intent.StateKey != key || intent.Kind != "rebuild" || !strings.HasPrefix(intent.BatchID, "rebuild:"+submission+":") || !valid {
 				return fmt.Errorf("scoped rebuild startup BLOCKED by unrelated or unresolved intent operation=%s", intent.OperationID)
 			}
@@ -35,6 +38,17 @@ func CheckScopedRebuildIntents(ctx context.Context, store OffsetStore, jobID, ke
 		}
 	}
 	return CheckOwnership(ctx, store)
+}
+
+func ScopedNativeSnapshotBatchID(submission, table string, start, end int64) string {
+	return fmt.Sprintf("rebuild:%s:%s:native:%d-%d", submission, table, start, end)
+}
+
+func IsScopedNativeSnapshotIntent(intent IcebergCommitIntent, jobID, key, submission string) bool {
+	return submission != "" && intent.JobID == jobID && intent.StateKey == key && intent.Kind == "snapshot" &&
+		(intent.Operation == "append" || intent.Operation == "delete-append-equality") && intent.TargetUUID != "" &&
+		intent.SourceTable == intent.SnapshotTable && intent.SnapshotStartOffset >= 0 && intent.SnapshotEndOffset > intent.SnapshotStartOffset &&
+		intent.BatchID == ScopedNativeSnapshotBatchID(submission, intent.SnapshotTable, intent.SnapshotStartOffset, intent.SnapshotEndOffset)
 }
 
 func CheckScopedRebuildEmptyCheckpoint(ctx context.Context, store OffsetStore, jobID, key string) error {

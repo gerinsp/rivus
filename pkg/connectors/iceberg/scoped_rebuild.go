@@ -3,11 +3,14 @@ package iceberg
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
+
+	icetable "github.com/apache/iceberg-go/table"
 
 	"github.com/gerinsp/rivus/pkg/meta"
 	"github.com/gerinsp/rivus/pkg/util"
@@ -90,22 +93,12 @@ func (s *Sink) executeRebuildStatement(ctx context.Context, state *tableState, p
 	})
 }
 
-func (s *Sink) confirmTrinoRebuildIntent(ctx context.Context, intent meta.IcebergCommitIntent) error {
-	if err := meta.CheckOwnership(ctx, s.offsetSto); err != nil {
-		return util.Permanent(err)
-	}
+func (s *Sink) validateTrinoRebuildIntentIdentity(intent meta.IcebergCommitIntent) error {
 	if s.scopedRebuildToken == "" || !strings.HasPrefix(intent.BatchID, "rebuild:"+s.scopedRebuildToken+":") || intent.JobID != s.jobID || intent.StateKey != s.checkpointKey() {
 		return util.Permanent(fmt.Errorf("scoped Trino rebuild belongs to another submission"))
 	}
 	if (intent.Status != meta.IcebergCommitPrepared && intent.Status != meta.IcebergCommitCommitted) || intent.TrinoQueryID == "" {
 		return util.Permanent(fmt.Errorf("Trino rebuild BLOCKED operation=%s: no durable query identity; absent evidence does not authorize replay", intent.OperationID))
-	}
-	tbl, err := s.catalog.LoadTable(ctx, namespaceIdentifier(intent.TargetNamespace, intent.TargetTable))
-	if err != nil {
-		return err
-	}
-	if tbl.Metadata().TableUUID().String() != intent.TargetUUID {
-		return fmt.Errorf("Trino rebuild target generation changed operation=%s", intent.OperationID)
 	}
 	dot := strings.LastIndexByte(intent.SourceTable, '.')
 	if dot < 1 {
@@ -114,6 +107,23 @@ func (s *Sink) confirmTrinoRebuildIntent(ctx context.Context, intent meta.Iceber
 	namespace, target := s.ResolveTarget(intent.SourceTable[:dot], intent.SourceTable[dot+1:])
 	if namespace != intent.TargetNamespace || target != intent.TargetTable {
 		return fmt.Errorf("Trino rebuild target mapping changed")
+	}
+	return nil
+}
+
+func (s *Sink) confirmTrinoRebuildIntent(ctx context.Context, intent meta.IcebergCommitIntent) error {
+	if err := meta.CheckOwnership(ctx, s.offsetSto); err != nil {
+		return util.Permanent(err)
+	}
+	if err := s.validateTrinoRebuildIntentIdentity(intent); err != nil {
+		return err
+	}
+	tbl, err := s.catalog.LoadTable(ctx, namespaceIdentifier(intent.TargetNamespace, intent.TargetTable))
+	if err != nil {
+		return err
+	}
+	if tbl.Metadata().TableUUID().String() != intent.TargetUUID {
+		return fmt.Errorf("Trino rebuild target generation changed operation=%s", intent.OperationID)
 	}
 	if intent.Status == meta.IcebergCommitCommitted {
 		return meta.CheckOwnership(ctx, s.offsetSto)
@@ -132,15 +142,23 @@ func (s *Sink) confirmTrinoRebuildIntent(ctx context.Context, intent meta.Iceber
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return fmt.Errorf("Trino query outcome unavailable operation=%s query=%s status=%d", intent.OperationID, intent.TrinoQueryID, response.StatusCode)
-	}
-	var info struct{ QueryID, State, Query string }
-	if err := json.NewDecoder(response.Body).Decode(&info); err != nil {
-		return err
-	}
-	comment := trinoOperationComment(intent.OperationID)
-	if info.QueryID != intent.TrinoQueryID || info.State != "FINISHED" || !strings.HasPrefix(info.Query, comment) || trinoStatementDigest(strings.TrimPrefix(info.Query, comment)) != intent.ReplayKeys {
-		return fmt.Errorf("Trino query lacks matching terminal success operation=%s", intent.OperationID)
+		// A retained main-line Iceberg RowDelta is positive commit evidence,
+		// even after coordinator query history expires. Limit this fallback to
+		// our single-table MERGE, whose digest is bound before POST and whose
+		// query ID is durably recorded from that POST's response. Never infer
+		// rejection from missing history, or accept a marker on another branch.
+		if response.StatusCode != http.StatusNotFound || !provenTrinoMergeSnapshot(tbl, intent, s.scopedRebuildToken) {
+			return fmt.Errorf("Trino query outcome unavailable operation=%s query=%s status=%d", intent.OperationID, intent.TrinoQueryID, response.StatusCode)
+		}
+	} else {
+		var info struct{ QueryID, State, Query string }
+		if err := json.NewDecoder(response.Body).Decode(&info); err != nil {
+			return err
+		}
+		comment := trinoOperationComment(intent.OperationID)
+		if info.QueryID != intent.TrinoQueryID || info.State != "FINISHED" || !strings.HasPrefix(info.Query, comment) || trinoStatementDigest(strings.TrimPrefix(info.Query, comment)) != intent.ReplayKeys {
+			return fmt.Errorf("Trino query lacks matching terminal success operation=%s", intent.OperationID)
+		}
 	}
 	tbl, err = s.catalog.LoadTable(ctx, namespaceIdentifier(intent.TargetNamespace, intent.TargetTable))
 	if err != nil {
@@ -170,4 +188,25 @@ func (s *Sink) confirmTrinoRebuildIntent(ctx context.Context, intent meta.Iceber
 		return err
 	}
 	return nil
+}
+
+func provenTrinoMergeSnapshot(tbl *icetable.Table, intent meta.IcebergCommitIntent, token string) bool {
+	if token == "" || intent.Kind != "rebuild" || intent.Operation != "trino-merge" || intent.TrinoQueryID == "" ||
+		intent.TargetUUID != tbl.Metadata().TableUUID().String() || len(intent.ReplayKeys) != 64 ||
+		intent.BatchID != "rebuild:"+token+":"+intent.SourceTable+":merge:"+intent.ReplayKeys {
+		return false
+	}
+	if _, err := hex.DecodeString(intent.ReplayKeys); err != nil {
+		return false
+	}
+	for snap := tbl.CurrentSnapshot(); snap != nil; {
+		if snap.Summary != nil && (snap.Summary.Operation == "append" || snap.Summary.Operation == "overwrite") && snap.Summary.Properties["trino_query_id"] == intent.TrinoQueryID {
+			return true
+		}
+		if snap.ParentSnapshotID == nil {
+			break
+		}
+		snap = tbl.SnapshotByID(*snap.ParentSnapshotID)
+	}
+	return false
 }

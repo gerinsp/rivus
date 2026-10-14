@@ -135,6 +135,7 @@ func TestScopedTrinoRealPurgedResubmitSnapshotsAndHandsOffCDC(t *testing.T) {
 		if err != nil {
 			return nil, err
 		}
+		native := workerCfg.SnapshotWriteMode == config.IcebergRebuildScopedNativeWriteMode
 		workerCfg, err = rebuildSnapshotConfig(jctx, workerCfg)
 		if err != nil {
 			return nil, err
@@ -142,6 +143,7 @@ func TestScopedTrinoRealPurgedResubmitSnapshotsAndHandsOffCDC(t *testing.T) {
 		s := &Sink{jobID: jctx.JobID, stateKey: jctx.MetaKey, catalog: cat, offsetSto: jctx.MetaStore, cfg: workerCfg, retry: jctx.Retry, progress: jctx.ReportProgress, states: map[string]*tableState{}, sourceSchemas: map[string]*model.TableSchema{}}
 		if jctx.Metadata[config.IcebergRebuildScopedKey] == jctx.SubmissionID {
 			s.scopedRebuildToken = jctx.SubmissionID
+			s.scopedNativeWrites = native
 		}
 		s.equalityCommitter = rivusEqualityCommitter{sink: s}
 		return s, nil
@@ -232,5 +234,5 @@ func TestScopedTrinoRealPurgedResubmitSnapshotsAndHandsOffCDC(t *testing.T) {
 	if intents, err := store.ListIcebergCommits(ctx, id); err != nil || len(intents) != 0 {
 		t.Fatalf("confirmed receipts not cleaned: %d %v", len(intents), err)
 	}
-	t.Log("real MySQL purged-checkpoint admission, atomic archive, filtered Trino reset/MERGE, empty source, snapshot acknowledgment and native CDC handoff verified")
+	t.Log("real MySQL purged-checkpoint admission, atomic archive, filtered Trino reset/native data, empty source, snapshot acknowledgment and native CDC handoff verified")
 }

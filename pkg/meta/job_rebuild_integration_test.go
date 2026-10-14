@@ -51,7 +51,7 @@ func TestJobRebuildRealMySQLArchivesAtomicallyAndFencesOldSubmission(t *testing.
 				cfg := &config.JobConfig{ID: id, Mode: config.JobModeInitial, Source: &config.ConnectorSpec{Type: "mysql", Config: map[string]any{"database": "app", "table": "orders"}}, Sink: &config.ConnectorSpec{Type: "iceberg_native", Config: map[string]any{"snapshot_write_mode": "truncate-append"}}}
 				marker, writeMode := config.IcebergRebuildFullResetKey, config.IcebergRebuildSnapshotWriteMode
 				if protocol == "filtered-trino" {
-					marker, writeMode = config.IcebergRebuildScopedKey, config.IcebergRebuildScopedWriteMode
+					marker, writeMode = config.IcebergRebuildScopedKey, config.IcebergRebuildScopedNativeWriteMode
 					cfg.Source.Config["table_configs"] = map[string]any{"app.orders": map[string]any{"filter": "`created_at` >= '2026-09-01 00:00:00'"}}
 					cfg.Sink.Config = map[string]any{"snapshot_write_mode": "auto", "snapshot_replace_delete_executor": "trino", "trino_delete": map[string]any{"uri": "http://127.0.0.1:49319", "catalog": "fixture"}, "snapshot_replace_filters": map[string]any{"app.orders": map[string]any{"column": "created_at", "op": ">=", "value": "2026-09-01 00:00:00"}}, "snapshot_truncate_exclude_tables": []string{"app.orders"}}
 				}

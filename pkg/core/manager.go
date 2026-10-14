@@ -1369,6 +1369,9 @@ func (m *JobManager) restoreJobSnapshot(job *Job, record meta.PersistedJob, resu
 	if record.Name != "" {
 		job.displayName = record.Name
 	}
+	if record.Config != nil {
+		job.displayConfig = record.Config
+	}
 	job.Created = created
 	job.Updated = updated
 	job.status = status

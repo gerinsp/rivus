@@ -108,6 +108,14 @@ func (s *Sink) guardedIcebergCommit(ctx context.Context, progress commitProgress
 		Status:      meta.IcebergCommitPrepared,
 		SourceTable: progress.sourceKey, TargetNamespace: progress.targetNamespace, TargetTable: progress.targetTable, Operation: progress.operation, ReplayKeys: batch.replayKeys,
 	}
+	if s.scopedNativeWrites && batch.kind == "snapshot" {
+		intent.BatchID = meta.ScopedNativeSnapshotBatchID(s.scopedRebuildToken, batch.snapshotTable, batch.snapshotStart, batch.snapshotEnd)
+		state := s.states[progress.sourceKey]
+		if state == nil || state.table == nil {
+			return util.Permanent(fmt.Errorf("native rebuild target identity missing"))
+		}
+		intent.TargetUUID = state.table.Metadata().TableUUID().String()
+	}
 	if batch.sourceStart.Valid() {
 		intent.SourceStartFile, intent.SourceStartPos = batch.sourceStart.BinlogFile, batch.sourceStart.BinlogPos
 	}
@@ -180,18 +188,49 @@ func (s *Sink) checkIcebergRecovery(ctx context.Context) error {
 			return util.Permanent(fmt.Errorf("read snapshot state for Iceberg commit recovery: %w", err))
 		}
 	}
+	committedTargets := make(map[string]string)
+	committedEvidence := make(map[string]meta.IcebergCommitIntent)
 	for _, intent := range intents {
 		s.recoveryOperation = intent.OperationID
+		if s.scopedNativeWrites && intent.Kind == "snapshot" && !meta.IsScopedNativeSnapshotIntent(intent, s.jobID, s.checkpointKey(), s.scopedRebuildToken) {
+			return util.Permanent(fmt.Errorf("native snapshot receipt belongs to another epoch operation=%s", intent.OperationID))
+		}
 		if intent.Kind == "rebuild" {
 			s.trinoRebuildMu.Lock()
-			latest, readErr := store.ListIcebergCommits(ctx, s.checkpointKey())
 			found := false
-			if readErr == nil {
-				for _, durable := range latest {
-					if durable.OperationID == intent.OperationID {
-						found = true
-						readErr = s.confirmTrinoRebuildIntent(ctx, durable)
-						break
+			var readErr error
+			if intent.Status == meta.IcebergCommitCommitted {
+				found = true
+				readErr = s.validateTrinoRebuildIntentIdentity(intent)
+				target := intent.TargetNamespace + "." + intent.TargetTable
+				if readErr == nil && committedTargets[target] == "" {
+					tbl, err := s.catalog.LoadTable(ctx, namespaceIdentifier(intent.TargetNamespace, intent.TargetTable))
+					readErr = err
+					if err == nil {
+						committedTargets[target] = tbl.Metadata().TableUUID().String()
+						committedEvidence[target] = intent
+					}
+				}
+				if readErr == nil && committedTargets[target] != intent.TargetUUID {
+					readErr = fmt.Errorf("Trino rebuild target generation changed operation=%s", intent.OperationID)
+				}
+			} else if reader, ok := store.(meta.IcebergCommitReader); ok {
+				latest, err := reader.GetIcebergCommit(ctx, s.checkpointKey(), intent.OperationID)
+				readErr = err
+				if err == nil && latest != nil {
+					found = true
+					readErr = s.confirmTrinoRebuildIntent(ctx, *latest)
+				}
+			} else {
+				latest, err := store.ListIcebergCommits(ctx, s.checkpointKey())
+				readErr = err
+				if err == nil {
+					for _, durable := range latest {
+						if durable.OperationID == intent.OperationID {
+							found = true
+							readErr = s.confirmTrinoRebuildIntent(ctx, durable)
+							break
+						}
 					}
 				}
 			}
@@ -201,6 +240,12 @@ func (s *Sink) checkIcebergRecovery(ctx context.Context) error {
 			}
 			if !found {
 				return util.Permanent(fmt.Errorf("Trino rebuild intent disappeared operation=%s", intent.OperationID))
+			}
+			if intent.Operation == "trino-merge" {
+				if s.scopedLegacyMerges == nil {
+					s.scopedLegacyMerges = make(map[string]bool)
+				}
+				s.scopedLegacyMerges[intent.SourceTable] = true
 			}
 			if snapshot.CompletionConfirmed() {
 				if err := store.DeleteIcebergCommit(ctx, intent.StateKey, intent.OperationID); err != nil {
@@ -243,8 +288,19 @@ func (s *Sink) checkIcebergRecovery(ctx context.Context) error {
 		}
 		log.Printf("[iceberg][job %s] reconciled accepted operation=%s batch=%s; resuming source replay", s.jobID, intent.OperationID, intent.BatchID)
 	}
+	// Generation checks are shared across confirmed statements for one table,
+	// then refreshed once before startup admits source replay.
+	for target, intent := range committedEvidence {
+		tbl, err := s.catalog.LoadTable(ctx, namespaceIdentifier(intent.TargetNamespace, intent.TargetTable))
+		if err != nil {
+			return util.Permanent(err)
+		}
+		if tbl.Metadata().TableUUID().String() != committedTargets[target] {
+			return util.Permanent(fmt.Errorf("Trino rebuild target generation changed during reconciliation"))
+		}
+	}
 
-	return nil
+	return meta.CheckOwnership(ctx, s.offsetSto)
 }
 
 // Normal checkpoint cleanup must not install startup replay receipts. Live

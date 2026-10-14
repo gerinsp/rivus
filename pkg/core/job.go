@@ -120,10 +120,11 @@ type CheckpointBinlogDiagnostics struct {
 }
 
 type Job struct {
-	displayName string
-	Config      *config.JobConfig
-	Created     time.Time
-	Updated     time.Time
+	displayName   string
+	displayConfig *config.JobConfig
+	Config        *config.JobConfig
+	Created       time.Time
+	Updated       time.Time
 
 	mu                   sync.RWMutex
 	status               JobStatus

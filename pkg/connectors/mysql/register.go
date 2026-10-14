@@ -40,7 +40,7 @@ func snapshotRollingEnabledForSink(sinkType string, sinkConfig any) bool {
 		return false
 	}
 	if typed, ok := sinkConfig.(config.IcebergConfig); ok {
-		if typed.SnapshotWriteMode == config.IcebergRebuildScopedWriteMode {
+		if typed.SnapshotWriteMode == config.IcebergRebuildScopedWriteMode || typed.SnapshotWriteMode == config.IcebergRebuildScopedNativeWriteMode {
 			return false
 		}
 		return typed.SnapshotRollingEnabled == nil || *typed.SnapshotRollingEnabled
@@ -49,7 +49,7 @@ func snapshotRollingEnabledForSink(sinkType string, sinkConfig any) bool {
 	if !ok {
 		return true
 	}
-	if mode, _ := configMap["snapshot_write_mode"].(string); mode == config.IcebergRebuildScopedWriteMode {
+	if mode, _ := configMap["snapshot_write_mode"].(string); mode == config.IcebergRebuildScopedWriteMode || mode == config.IcebergRebuildScopedNativeWriteMode {
 		return false
 	}
 	value, exists := configMap["snapshot_rolling_enabled"]

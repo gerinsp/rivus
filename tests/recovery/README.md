@@ -131,3 +131,13 @@ PASS pada current worktree dan exported production commit 74467d5 (production co
 Final local worktree verification: full `go test ./... -count=1` PASS; related core rename/view race PASS; 60 integration leaf scenarios PASS, satu metadata-container SIGKILL case SKIP karena default-context guard; dua query-ID persistence/fence cases terpisah PASS. Jumlah execution yang lulus **62**, tanpa menghitung skipped case. Combined suite mencakup enam pinned ff300c0 binary/schema compatibility cases dan sembilan Trino cases. Evidence `/private/tmp/rivus-recovery-and-ui-full-unit-final.log`, `rivus-recovery-and-ui-integration-final.log`, `rivus-trino-query-final.log`, `rivus-job-name-race-final.log`, `rivus-job-status-ui-green.log`.
 
 Guard otomatis untuk arbitrary STOPPING tanpa worker lease tidak ditambahkan: asynchronous Delete pada control plane dapat tetap berjalan. Explicit Cancel menyelesaikan durable STOPPED fence; pending deletion tetap dilindungi oleh reservation dan receipt cleanup checks. Runtime connector log/snapshot job-name labels tetap label saat constructor dibuat; rename mengubah display/durable config serta future constructors tanpa restart connector.
+
+## Native scoped snapshot writer
+
+Use the same isolated profile and Trino fixture above. New cases: `TestScopedNativeRealBulkLargeRowPartitionMoveAndExpiredHistory`, `TestScopedNativeRealSIGKILLResumesWithoutResetOrDuplicate`, and `TestNativeRebuildUpgradeRealPreservesEpochCursorAndReceipts`. The existing scoped pipeline now exercises the default v2 native data writer; legacy v1 execution/crash cases remain. Source/target/metadata are loopback fixture services only.
+
+```sh
+env RIVUS_RECOVERY_INTEGRATION=1 RIVUS_RECOVERY_TRINO_INTEGRATION=1 RIVUS_RECOVERY_TRINO_ROOT=/tmp/colima-rivus-recovery GOMAXPROCS=2 go test -p=1 -ldflags='-s -w' -tags=integration ./pkg/connectors/iceberg ./pkg/meta -run '^(TestScopedTrinoReal|TestScopedNativeReal|TestNativeRebuildUpgradeReal|TestJobRebuildRealMySQL)' -count=1 -v -timeout=4m
+```
+
+39 integration leaf cases passed on October 14. Full unit suite passed. The large-row case includes a 1.33 MB value, preserved outside/NULL-date rows, a PK moving partitions, positive catalog proof after query-history expiry, one native bulk commit and no new MERGE mutation. Two native SIGKILL cases confirm that the reset and accepted prefix are not repeated; changing chunk size during replay retains the accepted range.

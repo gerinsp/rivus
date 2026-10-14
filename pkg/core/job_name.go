@@ -28,6 +28,9 @@ func (j *Job) DisplayConfig() *config.JobConfig {
 		return nil
 	}
 	cfg := *j.Config
+	if j.displayConfig != nil {
+		cfg = *j.displayConfig
+	}
 	if j.displayName != "" {
 		cfg.Name = j.displayName
 	}

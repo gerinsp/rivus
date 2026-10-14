@@ -17,6 +17,7 @@ func Register(reg *connector.Registry) {
 		if err != nil {
 			return nil, err
 		}
+		native := icfg.SnapshotWriteMode == config.IcebergRebuildScopedNativeWriteMode
 		icfg, err = rebuildSnapshotConfig(jctx, icfg)
 		if err != nil {
 			return nil, err
@@ -26,7 +27,7 @@ func Register(reg *connector.Registry) {
 		if jctx.SubmissionID != "" && jctx.Metadata[config.IcebergRebuildScopedKey] == jctx.SubmissionID {
 			scopedToken = jctx.SubmissionID
 		}
-		sink, err := newSinkWithRebuild(jctx.JobID, jctx.MetaKey, jctx.JobName, icfg, jctx.Retry, jctx.MetaStore, jctx.ReportProgress, scopedToken)
+		sink, err := newSinkWithRebuildMode(jctx.JobID, jctx.MetaKey, jctx.JobName, icfg, jctx.Retry, jctx.MetaStore, jctx.ReportProgress, scopedToken, native)
 		if err != nil {
 			return nil, err
 		}
@@ -45,7 +46,7 @@ func Register(reg *connector.Registry) {
 }
 
 func rebuildSnapshotConfig(jctx connector.JobContext, cfg config.IcebergConfig) (config.IcebergConfig, error) {
-	scoped := cfg.SnapshotWriteMode == config.IcebergRebuildScopedWriteMode
+	scoped := cfg.SnapshotWriteMode == config.IcebergRebuildScopedWriteMode || cfg.SnapshotWriteMode == config.IcebergRebuildScopedNativeWriteMode
 	scopedBound := jctx.SubmissionID != "" && jctx.Metadata[config.IcebergRebuildScopedKey] == jctx.SubmissionID
 	if scoped != scopedBound || (scoped && jctx.Metadata[config.IcebergRebuildFullResetKey] != "") {
 		return cfg, fmt.Errorf("scoped rebuild protocol and submission marker must match")

@@ -60,6 +60,8 @@ type Sink struct {
 	snapshotSpoolDir     string
 	authoritativeRebuild bool
 	scopedRebuildToken   string
+	scopedNativeWrites   bool
+	scopedLegacyMerges   map[string]bool
 	trinoRebuildMu       sync.Mutex
 
 	equalityCommitter cdcEqualityCommitter
@@ -242,6 +244,10 @@ func NewSink(jobID, stateKey, jobName string, cfg config.IcebergConfig, retry co
 }
 
 func newSinkWithRebuild(jobID, stateKey, jobName string, cfg config.IcebergConfig, retry config.RetryPolicy, offsetSto meta.OffsetStore, progress connector.ProgressReporter, scopedToken string) (*Sink, error) {
+	return newSinkWithRebuildMode(jobID, stateKey, jobName, cfg, retry, offsetSto, progress, scopedToken, false)
+}
+
+func newSinkWithRebuildMode(jobID, stateKey, jobName string, cfg config.IcebergConfig, retry config.RetryPolicy, offsetSto meta.OffsetStore, progress connector.ProgressReporter, scopedToken string, native bool) (*Sink, error) {
 	cfg.SnapshotWriteMode = normalizeSnapshotWriteMode(cfg.SnapshotWriteMode)
 	if !isValidSnapshotWriteMode(cfg.SnapshotWriteMode) {
 		return nil, fmt.Errorf("invalid iceberg snapshot_write_mode %q (valid: %s, %s, %s, %s, %s, %s)",
@@ -292,6 +298,7 @@ func newSinkWithRebuild(jobID, stateKey, jobName string, cfg config.IcebergConfi
 
 	sink := &Sink{
 		scopedRebuildToken: scopedToken,
+		scopedNativeWrites: native,
 		jobID:              jobID,
 		stateKey:           stateKey,
 		jobName:            strings.TrimSpace(jobName),
@@ -1686,6 +1693,11 @@ func (s *Sink) handleSnapshotBatch(ctx context.Context, ev model.Event) (err err
 	state, err := s.ensureOperationalState(ctx, sourceKey)
 	if err != nil {
 		return err
+	}
+	if s.scopedNativeWrites {
+		if err := s.validateScopedSnapshotKeys(state, ev.Rows); err != nil {
+			return util.Permanent(err)
+		}
 	}
 	if err := s.flushPriorPendingForTarget(ctx, state); err != nil {
 		return err

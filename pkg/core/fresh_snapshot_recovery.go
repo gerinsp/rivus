@@ -38,7 +38,7 @@ func (j *Job) checkFreshSnapshotRecovery(ctx context.Context, store meta.OffsetS
 		if err := meta.CheckScopedRebuildEmptyCheckpoint(ctx, store, j.Config.ID, key); err != nil {
 			return blocked(err)
 		}
-		if err := meta.CheckScopedRebuildIntents(ctx, store, j.Config.ID, key, token, true); err != nil {
+		if err := meta.CheckScopedRebuildIntents(ctx, store, j.Config.ID, key, token, true, j.Config.Sink.Config["snapshot_write_mode"] == config.IcebergRebuildScopedNativeWriteMode); err != nil {
 			return blocked(err)
 		}
 		return nil

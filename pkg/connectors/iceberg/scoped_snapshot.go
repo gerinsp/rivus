@@ -293,6 +293,9 @@ func (s *Sink) flushScopedSnapshot(ctx context.Context, state *tableState, rows 
 	if !reset {
 		return flushResult{}, util.Permanent(fmt.Errorf("scoped snapshot cannot write before durable reset confirmation"))
 	}
+	if s.scopedNativeWrites {
+		return s.flushScopedNativeSnapshot(ctx, state, rows)
+	}
 	queries, err := s.snapshotMergeTrinoQueries(state, rows)
 	if err != nil {
 		return flushResult{}, util.Permanent(err)
@@ -320,13 +323,19 @@ func (s *Sink) confirmScopedResetBarrier(ctx context.Context) error {
 	}
 	confirmed := map[string]bool{}
 	for _, intent := range intents {
+		if s.scopedNativeWrites && meta.IsScopedNativeSnapshotIntent(intent, s.jobID, s.checkpointKey(), s.scopedRebuildToken) && intent.Status == meta.IcebergCommitCommitted {
+			continue // Native receipts were verified by startup reconciliation.
+		}
 		if intent.Kind != "rebuild" || intent.Status != meta.IcebergCommitCommitted {
 			return util.Permanent(fmt.Errorf("scoped snapshot start BLOCKED by unresolved operation=%s", intent.OperationID))
 		}
-		if err := s.confirmTrinoRebuildIntent(ctx, intent); err != nil {
+		if err := s.validateTrinoRebuildIntentIdentity(intent); err != nil {
 			return util.Permanent(err)
 		}
 		if intent.Operation == "trino-reset" && intent.BatchID == "rebuild:"+s.scopedRebuildToken+":"+intent.SourceTable+":reset" {
+			if err := s.confirmTrinoRebuildIntent(ctx, intent); err != nil {
+				return util.Permanent(err)
+			}
 			s.mu.Lock()
 			state := s.states[intent.SourceTable]
 			s.mu.Unlock()
@@ -378,7 +387,8 @@ func (s *Sink) cleanupScopedRebuildIntents(ctx context.Context) error {
 		return err
 	}
 	for _, intent := range intents {
-		if intent.Kind != "rebuild" {
+		native := s.scopedNativeWrites && meta.IsScopedNativeSnapshotIntent(intent, s.jobID, s.checkpointKey(), s.scopedRebuildToken)
+		if intent.Kind != "rebuild" && !native {
 			continue
 		}
 		if intent.Status != meta.IcebergCommitCommitted {
