@@ -101,7 +101,13 @@ func (s *Sink) applyEqualityDelta(ctx context.Context, state *tableState, batch 
 	return nil
 }
 
-func (s *Sink) commitEqualityDelta(ctx context.Context, state *tableState, batch *reducedBatch) (*icetable.Table, error) {
+func (s *Sink) commitEqualityDelta(ctx context.Context, state *tableState, batch *reducedBatch) (updated *icetable.Table, err error) {
+	catalogAttempted := false
+	defer func() {
+		if err != nil && !catalogAttempted {
+			err = icebergPreparationFailed(err)
+		}
+	}()
 	if state == nil || state.table == nil {
 		return nil, fmt.Errorf("table handle is nil for equality delta")
 	}
@@ -179,7 +185,8 @@ func (s *Sink) commitEqualityDelta(ctx context.Context, state *tableState, batch
 	// failure. Leave staged files for orphan cleanup rather than risk deleting
 	// files that an accepted commit references.
 	cleanupStaged = false
-	updated, err := txn.Commit(ctx)
+	catalogAttempted = true
+	updated, err = txn.Commit(ctx)
 	if err != nil {
 		if updated == nil && errors.Is(err, icetable.ErrCommitFailed) {
 			cleanupStaged = true

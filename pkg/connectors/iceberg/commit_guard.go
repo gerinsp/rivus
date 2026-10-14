@@ -144,6 +144,13 @@ func (s *Sink) guardedIcebergCommit(ctx context.Context, progress commitProgress
 		}
 		return nil
 	}
+	var preparation *icebergPreparationError
+	if errors.As(err, &preparation) {
+		if deleteErr := store.DeleteIcebergCommit(finishCtx, intent.StateKey, operationID); deleteErr != nil {
+			return util.Permanent(fmt.Errorf("Iceberg preparation failed before catalog call; intent cleanup failed operation=%s: %w; preparation error: %w", operationID, deleteErr, err))
+		}
+		return err
+	}
 	if errors.Is(err, icetable.ErrCommitFailed) && !util.IsPermanent(err) {
 		if deleteErr := store.DeleteIcebergCommit(finishCtx, intent.StateKey, operationID); deleteErr != nil {
 			return util.Permanent(fmt.Errorf("Iceberg rejected commit intent cleanup failed operation=%s: %w", operationID, deleteErr))

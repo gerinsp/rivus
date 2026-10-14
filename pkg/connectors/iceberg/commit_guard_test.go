@@ -3,14 +3,76 @@ package iceberg
 import (
 	"context"
 	"errors"
+	"io"
+	"os"
 	"strings"
 	"testing"
 
+	iceio "github.com/apache/iceberg-go/io"
 	icetable "github.com/apache/iceberg-go/table"
 
 	"github.com/gerinsp/rivus/pkg/meta"
 	"github.com/gerinsp/rivus/pkg/model"
 )
+
+type failedEqualityPreparationFS struct{ iceio.LocalFS }
+
+func (failedEqualityPreparationFS) Create(string) (iceio.FileWriter, error) {
+	return failedEqualityPreparationWriter{}, nil
+}
+
+func (failedEqualityPreparationFS) Remove(string) error { return os.ErrNotExist }
+
+type failedEqualityPreparationWriter struct{}
+
+func (failedEqualityPreparationWriter) Write(p []byte) (int, error) {
+	return len(p), nil
+}
+func (failedEqualityPreparationWriter) Close() error {
+	return errors.New("fixture equality-delete upload failed")
+}
+func (failedEqualityPreparationWriter) ReadFrom(r io.Reader) (int64, error) {
+	return io.Copy(io.Discard, r)
+}
+
+func TestIcebergGuardEqualityPreparationFailureDoesNotBecomeUnknown(t *testing.T) {
+	for _, fault := range []string{"delete-file", "data-row", "catalog-response"} {
+		t.Run(fault, func(t *testing.T) {
+			ctx := context.Background()
+			tbl, cat := newEqualityDeltaTestTable(t)
+			if fault == "delete-file" {
+				tbl = icetable.New(tbl.Identifier(), tbl.Metadata(), tbl.MetadataLocation(), func(context.Context) (iceio.IO, error) {
+					return failedEqualityPreparationFS{}, nil
+				}, cat)
+			}
+			store := newGuardTestStore()
+			s := &Sink{jobID: "job", stateKey: "state", offsetSto: store}
+			state := &tableState{sourceKey: "app.orders", table: tbl}
+			batch := &reducedBatch{pkCols: []string{"id"}, deleteKeys: []map[string]interface{}{{"id": int64(10)}}, rows: []map[string]interface{}{{"id": int64(10), "status": "updated"}}}
+			if fault == "data-row" {
+				batch.rows[0]["id"] = "invalid-integer"
+			}
+			if fault == "catalog-response" {
+				cat.commitErr = errors.New("fixture catalog response lost")
+			}
+			ctx = withIcebergBatch(ctx, icebergBatch{kind: "cdc", batchID: "fixture", sourceEnd: &model.SourceOffset{BinlogFile: "mysql-bin.000001", BinlogPos: 42}})
+			err := s.withCommitSlot(ctx, commitProgress{operation: "delete-append-equality", icebergCommit: true}, func(ctx context.Context) error {
+				_, err := s.commitEqualityDelta(ctx, state, batch)
+				return err
+			})
+			if err == nil || store.saveCount != 0 {
+				t.Fatalf("error=%v checkpoint saves=%d", err, store.saveCount)
+			}
+			if fault == "catalog-response" {
+				if cat.commitAttempts != 1 || len(store.intents) != 1 || !strings.Contains(err.Error(), "outcome UNKNOWN") {
+					t.Fatalf("ambiguous request lost protection: calls=%d intents=%d error=%v", cat.commitAttempts, len(store.intents), err)
+				}
+			} else if cat.commitAttempts != 0 || len(store.intents) != 0 || strings.Contains(err.Error(), "outcome UNKNOWN") {
+				t.Fatalf("preparation became unknown: calls=%d intents=%d error=%v", cat.commitAttempts, len(store.intents), err)
+			}
+		})
+	}
+}
 
 type guardTestStore struct {
 	*testOffsetStore
@@ -18,6 +80,7 @@ type guardTestStore struct {
 	snapshotProgress *meta.SnapshotProgress
 	beginErr         error
 	markErr          error
+	deleteErr        error
 }
 
 func newGuardTestStore() *guardTestStore {
@@ -97,8 +160,29 @@ func TestIcebergGuardCommitSucceededButIntentUpdateFailedBlocksRestart(t *testin
 }
 
 func (s *guardTestStore) DeleteIcebergCommit(_ context.Context, _, operationID string) error {
+	if s.deleteErr != nil {
+		return s.deleteErr
+	}
 	delete(s.intents, operationID)
 	return nil
+}
+
+func TestIcebergPreparationCleanupFailureRetainsReceiptAndBothCauses(t *testing.T) {
+	store := newGuardTestStore()
+	store.deleteErr = meta.ErrWorkerOwnershipLost
+	s := &Sink{jobID: "job", stateKey: "state", offsetSto: store}
+	cause := errors.New("fixture preparation failure")
+	err := s.withCommitSlot(context.Background(), commitProgress{operation: "delete-append-equality", icebergCommit: true}, func(context.Context) error {
+		return icebergPreparationFailed(cause)
+	})
+	if !errors.Is(err, cause) || !errors.Is(err, meta.ErrWorkerOwnershipLost) || len(store.intents) != 1 || store.saveCount != 0 {
+		t.Fatalf("cleanup lost evidence: error=%v intents=%d checkpoint saves=%d", err, len(store.intents), store.saveCount)
+	}
+	for _, i := range store.intents {
+		if i.Status != meta.IcebergCommitPrepared {
+			t.Fatal("cleanup failure marked an unaccepted write committed")
+		}
+	}
 }
 
 func (s *guardTestStore) ListIcebergCommits(_ context.Context, _ string) ([]meta.IcebergCommitIntent, error) {

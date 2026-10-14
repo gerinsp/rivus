@@ -451,7 +451,13 @@ func (s *Sink) commitSnapshotSpool(ctx context.Context, state *tableState, spool
 	return s.commitSnapshotSpoolWithDeletes(ctx, state, spool, readBatchRows, nil)
 }
 
-func (s *Sink) commitSnapshotSpoolWithDeletes(ctx context.Context, state *tableState, spool *snapshotSpool, readBatchRows int64, deletes *reducedBatch) (*icetable.Table, error) {
+func (s *Sink) commitSnapshotSpoolWithDeletes(ctx context.Context, state *tableState, spool *snapshotSpool, readBatchRows int64, deletes *reducedBatch) (updated *icetable.Table, err error) {
+	catalogAttempted := false
+	defer func() {
+		if err != nil && !catalogAttempted {
+			err = icebergPreparationFailed(err)
+		}
+	}()
 	if readBatchRows <= 0 {
 		readBatchRows = 1
 	}
@@ -549,7 +555,8 @@ func (s *Sink) commitSnapshotSpoolWithDeletes(ctx context.Context, state *tableS
 	// snapshot. Normal orphan-file maintenance can safely remove them later if
 	// the catalog did not accept the commit.
 	cleanupStaged = false
-	updated, err := txn.Commit(ctx)
+	catalogAttempted = true
+	updated, err = txn.Commit(ctx)
 	if updated == nil && errors.Is(err, icetable.ErrCommitFailed) {
 		// A rejected commit cannot reference these data files. Other errors
 		// can have an unknown outcome, so leave their files for orphan cleanup.
