@@ -39,14 +39,20 @@ func TestScopedRebuildFactoryBindsSubmissionBeforeReconciliation(t *testing.T) {
 	}))
 	defer server.Close()
 	rolling := false
-	cfg := config.IcebergConfig{RestURI: server.URL, Warehouse: "fixture", SnapshotWriteMode: config.IcebergRebuildScopedWriteMode, SnapshotRollingEnabled: &rolling, TrinoDelete: config.IcebergTrinoDeleteConfig{URI: server.URL, Catalog: "fixture", User: "fixture"}, Overrides: map[string]config.IcebergTarget{"app.orders": {Namespace: "bronze", Table: "orders"}}}
-	reg := connector.NewRegistry()
-	Register(reg)
-	sink, err := reg.NewSink("iceberg_native", connector.JobContext{JobID: intent.JobID, MetaKey: intent.StateKey, SubmissionID: "current", Metadata: map[string]string{config.IcebergRebuildScopedKey: "current"}, MetaStore: store, Retry: config.RetryPolicy{MaxAttempts: 1}}, cfg)
-	if err != nil {
-		t.Fatalf("actual factory failed startup reconciliation: %v", err)
-	}
-	if sink.(*Sink).scopedRebuildToken != "current" || store.intents[intent.OperationID].Status != meta.IcebergCommitCommitted {
-		t.Fatal("factory did not recover accepted query with bound submission")
+	for _, mode := range []string{config.IcebergRebuildScopedWriteMode, config.IcebergRebuildScopedNativeWriteMode} {
+		store.intents[intent.OperationID] = intent
+		cfg := config.IcebergConfig{RestURI: server.URL, Warehouse: "fixture", SnapshotWriteMode: mode, SnapshotRollingEnabled: &rolling, TrinoDelete: config.IcebergTrinoDeleteConfig{URI: server.URL, Catalog: "fixture", User: "fixture"}, Overrides: map[string]config.IcebergTarget{"app.orders": {Namespace: "bronze", Table: "orders"}}}
+		reg := connector.NewRegistry()
+		Register(reg)
+		sink, err := reg.NewSink("iceberg_native", connector.JobContext{JobID: intent.JobID, MetaKey: intent.StateKey, SubmissionID: "current", Metadata: map[string]string{config.IcebergRebuildScopedKey: "current"}, MetaStore: store, Retry: config.RetryPolicy{MaxAttempts: 1}}, cfg)
+		if err != nil {
+			t.Fatalf("actual factory failed startup reconciliation: %v", err)
+		}
+		if sink.(*Sink).scopedRebuildToken != "current" || store.intents[intent.OperationID].Status != meta.IcebergCommitCommitted {
+			t.Fatal("factory did not recover accepted query with bound submission")
+		}
+		if sink.(*Sink).scopedNativeWrites != (mode == config.IcebergRebuildScopedNativeWriteMode) {
+			t.Fatal("factory did not bind native protocol")
+		}
 	}
 }

@@ -147,7 +147,8 @@ func (s *Sink) confirmTrinoRebuildIntent(ctx context.Context, intent meta.Iceber
 		// our single-table MERGE, whose digest is bound before POST and whose
 		// query ID is durably recorded from that POST's response. Never infer
 		// rejection from missing history, or accept a marker on another branch.
-		if response.StatusCode != http.StatusNotFound || !provenTrinoMergeSnapshot(tbl, intent, s.scopedRebuildToken) {
+		expired := response.StatusCode == http.StatusNotFound || response.StatusCode == http.StatusGone
+		if !expired || !provenTrinoMergeSnapshot(tbl, intent, s.scopedRebuildToken) {
 			return fmt.Errorf("Trino query outcome unavailable operation=%s query=%s status=%d", intent.OperationID, intent.TrinoQueryID, response.StatusCode)
 		}
 	} else {

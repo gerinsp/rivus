@@ -1405,6 +1405,69 @@ func TestClaimedRecreatedJobReplacesStaleWorkerConfig(t *testing.T) {
 	_ = manager.Cancel(jobID)
 }
 
+func TestClaimedSameSubmissionReplacesStaleWorkerConfig(t *testing.T) {
+	store := newMemoryJobStore()
+	reg, _ := newTestRegistry()
+	manager := NewJobManager(
+		reg,
+		WithJobStore(store),
+		WithWorkerRole(WorkerRoleSnapshot),
+		WithWorkerID("snapshot-replace"),
+	)
+	const jobID = "replace-stale-worker-job"
+	oldCfg := newTestJobConfig(jobID)
+	oldCfg.Sink.Config = map[string]any{"flush_seconds": 1200, "snapshot_write_mode": config.IcebergRebuildScopedWriteMode}
+	oldJob := NewJob(oldCfg, reg)
+	oldJob.submissionID = uuid.NewString()
+	manager.mu.Lock()
+	manager.jobs[jobID] = oldJob
+	manager.executionRoles[jobID] = meta.JobExecutionRoleSnapshot
+	manager.mu.Unlock()
+
+	newCfg := newTestJobConfig(jobID)
+	newCfg.Sink.Config = map[string]any{"flush_seconds": 300, "snapshot_write_mode": config.IcebergRebuildScopedNativeWriteMode}
+	newSubmissionID := oldJob.SubmissionID()
+	if err := store.SaveJob(context.Background(), meta.PersistedJob{
+		ID:            jobID,
+		SubmissionID:  newSubmissionID,
+		Name:          newCfg.Name,
+		Config:        newCfg,
+		DesiredState:  meta.DesiredStateRunning,
+		ExecutionRole: meta.JobExecutionRoleSnapshot,
+		LastStatus:    string(JobStatusCreated),
+	}); err != nil {
+		t.Fatalf("seed recreated job: %v", err)
+	}
+	claimed, err := store.ClaimJobs(context.Background(), meta.JobExecutionRoleSnapshot, "snapshot-replace", 1, time.Minute)
+	if err != nil {
+		t.Fatalf("claim recreated job: %v", err)
+	}
+	if len(claimed) != 1 {
+		t.Fatalf("claimed jobs = %d, want 1", len(claimed))
+	}
+	if err := manager.startClaimedWorkerJob(claimed[0]); err != nil {
+		t.Fatalf("start recreated job: %v", err)
+	}
+
+	replacement, err := manager.Get(jobID)
+	if err != nil {
+		t.Fatalf("get replacement job: %v", err)
+	}
+	if replacement == oldJob {
+		t.Fatal("stale in-memory job was reused")
+	}
+	if replacement.SubmissionID() != newSubmissionID {
+		t.Fatalf("replacement submission id = %q, want %q", replacement.SubmissionID(), newSubmissionID)
+	}
+	if got := replacement.Config.Sink.Config["flush_seconds"]; got != 300 {
+		t.Fatalf("replacement flush_seconds = %v, want 300", got)
+	}
+	if replacement.Config.Sink.Config["snapshot_write_mode"] != config.IcebergRebuildScopedNativeWriteMode {
+		t.Fatal("cached v1 writer survived protocol upgrade")
+	}
+	_ = manager.Cancel(jobID)
+}
+
 func TestRestorePersistedFailedJobRetainsErrorHistory(t *testing.T) {
 	failedAt := time.Now().Add(-time.Minute).UTC()
 	store := newMemoryJobStore()
@@ -2445,4 +2508,23 @@ func waitForConditionWithin(t *testing.T, timeout time.Duration, desc string, fn
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s", desc)
+}
+
+func TestClaimedConfigUpgradeWaitsForPriorRunDrain(t *testing.T) {
+	reg, _ := newTestRegistry()
+	manager := NewJobManager(reg, WithWorkerRole(WorkerRoleSnapshot))
+	old := NewJob(newTestJobConfig("upgrading"), reg)
+	old.submissionID = "same-epoch"
+	old.runDone = make(chan struct{})
+	defer close(old.runDone)
+	manager.jobs["upgrading"] = old
+	upgraded := newTestJobConfig("upgrading")
+	upgraded.Sink.Config["snapshot_write_mode"] = config.IcebergRebuildScopedNativeWriteMode
+	err := manager.startClaimedWorkerJob(meta.PersistedJob{ID: "upgrading", SubmissionID: "same-epoch", Config: upgraded})
+	if !errors.Is(err, ErrJobStillStopping) {
+		t.Fatalf("upgrade while draining: %v", err)
+	}
+	if manager.jobs["upgrading"] != old || old.isPersistenceDeleted() {
+		t.Fatal("active cached job replaced before drain")
+	}
 }

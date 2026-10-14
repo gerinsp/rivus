@@ -24,7 +24,7 @@ type expiredTrinoHistory struct{ base http.RoundTripper }
 
 func (p expiredTrinoHistory) RoundTrip(r *http.Request) (*http.Response, error) {
 	if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/query/") {
-		return &http.Response{StatusCode: 404, Body: http.NoBody, Header: make(http.Header), Request: r}, nil
+		return &http.Response{StatusCode: http.StatusGone, Body: http.NoBody, Header: make(http.Header), Request: r}, nil
 	}
 	return p.base.RoundTrip(r)
 }

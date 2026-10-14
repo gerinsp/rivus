@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1814,7 +1815,15 @@ func (m *JobManager) startClaimedWorkerJob(record meta.PersistedJob) error {
 	m.mu.RLock()
 	staleJob := m.jobs[cfg.ID]
 	m.mu.RUnlock()
-	if staleJob != nil && !sameJobSubmission(staleJob, record.SubmissionID) {
+	if staleJob != nil && sameJobSubmission(staleJob, record.SubmissionID) && !sameJobExecutionConfig(staleJob.Config, cfg) && staleJob.runActive() {
+		// In-place config upgrades are admitted only after ownership release.
+		// A still-draining local run must finish before its config is replaced.
+		return fmt.Errorf("cached job config changed while the previous run is draining: %w", ErrJobStillStopping)
+	}
+	// An in-place protocol upgrade keeps the submission and checkpoint epoch.
+	// Replace its cached execution config too, without mutating the config read
+	// by API/runtime goroutines or admitting a new run before the old one drains.
+	if staleJob != nil && (!sameJobSubmission(staleJob, record.SubmissionID) || !sameJobExecutionConfig(staleJob.Config, cfg)) {
 		log.Printf(
 			"[job-manager] replacing stale worker submission job=%s old_submission=%s new_submission=%s",
 			cfg.ID,
@@ -1915,6 +1924,21 @@ func (m *JobManager) startClaimedWorkerJob(record meta.PersistedJob) error {
 		return nil
 	}
 	return m.startJob(job, mode, false)
+}
+
+func sameJobExecutionConfig(a, b *config.JobConfig) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	left, right := *a, *b
+	// Renaming is a display change and must not replace an active pipeline.
+	left.Name, right.Name = "", ""
+	l, err := json.Marshal(left)
+	if err != nil {
+		return false
+	}
+	r, err := json.Marshal(right)
+	return err == nil && bytes.Equal(l, r)
 }
 
 func sameJobSubmission(job *Job, submissionID string) bool {

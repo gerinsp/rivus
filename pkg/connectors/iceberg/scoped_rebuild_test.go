@@ -198,7 +198,7 @@ func TestScopedRebuildTrinoDurableOutcomeAndRestart(t *testing.T) {
 			}
 			if scenario == "lost-poll-response" || scenario == "mark-failed" {
 				if reads.Load() != 1 {
-					t.Fatalf("restart did not verify query outcome: reads=%d", reads)
+					t.Fatalf("restart did not verify query outcome: reads=%d", reads.Load())
 				}
 			}
 			for _, intent := range store.intents {

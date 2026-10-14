@@ -2,6 +2,9 @@ package iceberg
 
 import (
 	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -91,6 +94,63 @@ func TestScopedTrinoExpiredHistoryRequiresPositiveMainSnapshot(t *testing.T) {
 		if provenTrinoMergeSnapshot(tbl, changed, "epoch") {
 			t.Fatalf("accepted mismatched %s evidence", fault)
 		}
+	}
+}
+
+func TestScopedTrinoExpiredHistoryHTTPOutcomes(t *testing.T) {
+	for _, tc := range []struct {
+		status       int
+		missingProof bool
+		wantSuccess  bool
+	}{
+		{http.StatusNotFound, false, true},
+		{http.StatusGone, false, true},
+		{http.StatusGone, true, false},
+		{http.StatusNotFound, true, false},
+		{http.StatusForbidden, false, false},
+		{http.StatusInternalServerError, false, false},
+	} {
+		t.Run(fmt.Sprintf("status_%d_missing_%t", tc.status, tc.missingProof), func(t *testing.T) {
+			ctx := context.Background()
+			cat := recoveryCatalog(t)
+			store := &automaticStore{guardTestStore: newGuardTestStore()}
+			s := automaticSink(t, cat, store)
+			s.scopedRebuildToken = "epoch"
+			tbl := s.states["app.orders"].table
+			reader, release, err := buildRecordReader(tbl.Schema(), []map[string]interface{}{{"id": int64(1), "status": "accepted"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer release()
+			tbl, err = commitAppend(ctx, tbl, reader, map[string]string{"trino_query_id": "original-query"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			digest := strings.Repeat("a", 64)
+			intent := meta.IcebergCommitIntent{OperationID: "op", JobID: "job", StateKey: "state", Status: meta.IcebergCommitPrepared, Kind: "rebuild", Operation: "trino-merge", SourceTable: "app.orders", TargetNamespace: "bronze", TargetTable: "orders", ReplayKeys: digest, TargetUUID: tbl.Metadata().TableUUID().String(), TrinoQueryID: "original-query", BatchID: "rebuild:epoch:app.orders:merge:" + digest}
+			if tc.missingProof {
+				intent.TrinoQueryID = "unproven-query"
+			}
+			store.intents[intent.OperationID] = intent
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet {
+					t.Error("recovery attempted a mutation")
+				}
+				w.WriteHeader(tc.status)
+			}))
+			defer server.Close()
+			s.cfg.TrinoDelete.URI = server.URL
+			err = s.confirmTrinoRebuildIntent(ctx, intent)
+			if (err == nil) != tc.wantSuccess {
+				t.Fatalf("confirmation error=%v success=%t", err, tc.wantSuccess)
+			}
+			if (store.intents["op"].Status == meta.IcebergCommitCommitted) != tc.wantSuccess {
+				t.Fatal("incorrect durable outcome")
+			}
+			if store.saveCount != 0 {
+				t.Fatal("commit proof advanced source checkpoint")
+			}
+		})
 	}
 }
 

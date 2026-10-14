@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/gerinsp/rivus/pkg/config"
 	"github.com/gerinsp/rivus/pkg/connector"
 	"github.com/gerinsp/rivus/pkg/meta"
 	"sync"
@@ -98,4 +99,17 @@ func TestConcurrentRenameAndJobViews(t *testing.T) {
 		}
 	}
 	wg.Wait()
+}
+
+func TestExecutionConfigComparisonIgnoresDisplayRename(t *testing.T) {
+	a := newTestJobConfig("job")
+	b := newTestJobConfig("job")
+	b.Name = "renamed"
+	if !sameJobExecutionConfig(a, b) {
+		t.Fatal("display rename changed execution config")
+	}
+	b.Sink.Config["snapshot_write_mode"] = config.IcebergRebuildScopedNativeWriteMode
+	if sameJobExecutionConfig(a, b) {
+		t.Fatal("writer upgrade did not change execution config")
+	}
 }
