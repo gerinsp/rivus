@@ -35,6 +35,13 @@ func (j *Job) checkFreshSnapshotRecovery(ctx context.Context, store meta.OffsetS
 		if err := config.ValidateIcebergSnapshotRebuild(j.Config); err != nil {
 			return blocked(err)
 		}
+		snapshot, err := store.GetSnapshotState(ctx, key)
+		if err != nil {
+			return blocked(err)
+		}
+		if snapshot.CompletionConfirmed() {
+			return blocked(fmt.Errorf("completed scoped snapshot requires an archived new epoch: %w", meta.ErrJobStateCleanupBlocked))
+		}
 		if err := meta.CheckScopedRebuildEmptyCheckpoint(ctx, store, j.Config.ID, key); err != nil {
 			return blocked(err)
 		}

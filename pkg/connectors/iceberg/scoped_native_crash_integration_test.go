@@ -24,12 +24,17 @@ func TestScopedNativeRealSIGKILLResumesWithoutResetOrDuplicate(t *testing.T) {
 	if os.Getenv("RIVUS_RECOVERY_TRINO_INTEGRATION") != "1" {
 		t.Skip("isolated Trino fixture opt-in")
 	}
-	for _, stage := range []string{"after-catalog", "after-mark"} {
+	for _, stage := range []string{"after-catalog", "after-mark", "bulk-after-catalog", "bulk-after-mark"} {
 		t.Run(stage, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 65*time.Second)
 			defer cancel()
 			ns := "scope_crash_native_" + strings.ReplaceAll(uuid.NewString(), "-", "")
-			input := scopedCrashInput{Namespace: ns, JobID: ns, SubmissionID: uuid.NewString(), Owner: "native-crash", Stage: stage, Phase: "native"}
+			bulk := strings.HasPrefix(stage, "bulk-")
+			actualStage := strings.TrimPrefix(stage, "bulk-")
+			input := scopedCrashInput{Namespace: ns, JobID: ns, SubmissionID: uuid.NewString(), Owner: "native-crash", Stage: actualStage, Phase: "native"}
+			if bulk {
+				input.Phase = "native-bulk"
+			}
 			client := &Sink{cfg: config.IcebergConfig{TrinoDelete: config.IcebergTrinoDeleteConfig{URI: scopedTrinoURI, Catalog: "fixture", User: "fixture"}}}
 			scopedQuery(t, client, `CREATE SCHEMA fixture.`+ns, "")
 			scopedQuery(t, client, `CREATE TABLE fixture.`+ns+`.orders (id BIGINT,status VARCHAR,created_at TIMESTAMP(6)) WITH(format_version=2)`, ns)
@@ -81,6 +86,11 @@ func TestScopedNativeRealSIGKILLResumesWithoutResetOrDuplicate(t *testing.T) {
 			if err := s.ResetSnapshotSourceTable(ctx, "app", "orders", "`created_at` >= '2026-09-01 00:00:00'"); err != nil {
 				t.Fatal(err)
 			}
+			if bulk {
+				if _, err := s.ensureSnapshotRollingWriteProperties(ctx, s.states["app.orders"], 50000); err != nil {
+					t.Fatal(err)
+				}
+			}
 			data, _ := json.Marshal(input)
 			path := filepath.Join(t.TempDir(), "input.json")
 			if err := os.WriteFile(path, data, 0600); err != nil {
@@ -105,7 +115,7 @@ func TestScopedNativeRealSIGKILLResumesWithoutResetOrDuplicate(t *testing.T) {
 			for _, i := range intents {
 				if i.Kind == "snapshot" {
 					found = true
-					if !meta.IsScopedNativeSnapshotIntent(i, ns, ns, input.SubmissionID) || (i.Status == meta.IcebergCommitCommitted) != (stage == "after-mark") {
+					if !meta.IsScopedNativeSnapshotIntent(i, ns, ns, input.SubmissionID) || (i.Status == meta.IcebergCommitCommitted) != (actualStage == "after-mark") {
 						t.Fatalf("wrong native crash receipt: %+v", i)
 					}
 				}
@@ -145,7 +155,11 @@ func TestScopedNativeRealSIGKILLResumesWithoutResetOrDuplicate(t *testing.T) {
 			}
 			var native int
 			db.QueryRowContext(ctx, "SELECT COUNT(*) FROM iceberg_commit_intents WHERE job_id=? AND kind='snapshot'", ns).Scan(&native)
-			if native != 2 {
+			wantCommits := 2
+			if bulk {
+				wantCommits = 1
+			}
+			if native != wantCommits {
 				t.Fatalf("accepted prefix rewritten after crash: %d commits", native)
 			}
 		})

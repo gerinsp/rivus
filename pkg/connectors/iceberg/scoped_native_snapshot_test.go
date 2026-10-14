@@ -191,3 +191,62 @@ func TestScopedNativeProtocolRemainsFencedAndNonRolling(t *testing.T) {
 		}
 	}
 }
+
+func TestScopedNativeUnpartitionedBulkAvoidsTargetReadsAndCommitsOnce(t *testing.T) {
+	ctx := context.Background()
+	cat := recoveryCatalog(t)
+	store := &automaticStore{guardTestStore: newGuardTestStore()}
+	s := automaticSink(t, cat, store)
+	s.scopedRebuildToken, s.scopedNativeWrites = "epoch", true
+	s.cfg.SnapshotBatchSize, s.cfg.MaxBatchBytes = 1, 1024
+	s.cfg.SnapshotSpoolDirectory = t.TempDir()
+	s.cfg.SnapshotReplaceFilters = map[string]config.IcebergSnapshotReplaceFilterConfig{"app.orders": {Column: "id", Op: ">=", Value: "1"}}
+	state := s.states["app.orders"]
+	state.snapshotReplaceApplied, state.snapshotTruncateApplied = true, true
+	seed, release, err := buildRecordReader(state.table.Schema(), []map[string]interface{}{{"id": int64(1), "status": "old"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	state.table, err = commitAppend(ctx, state.table, seed, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("unpartitioned bulk snapshot scanned target")
+		w.WriteHeader(500)
+	}))
+	defer server.Close()
+	s.cfg.TrinoDelete.URI = server.URL
+	rows := []map[string]interface{}{{"id": int64(1), "status": "updated"}, {"id": int64(2), "status": "new"}, {"id": int64(3), "status": "new"}}
+	replayRows := make([]map[string]interface{}, len(rows))
+	for i, row := range rows {
+		replayRows[i] = cloneMap(row)
+	}
+	if err := s.handleSnapshotBatch(ctx, model.Event{Schema: "app", Table: "orders", Rows: rows}); err != nil {
+		t.Fatal(err)
+	}
+	native := 0
+	for _, i := range store.intents {
+		if i.Kind == "snapshot" {
+			native++
+			if i.SnapshotStartOffset != 0 || i.SnapshotEndOffset != 3 || !meta.IsScopedNativeSnapshotIntent(i, "job", "state", "epoch") {
+				t.Fatal("bulk receipt lost span/epoch")
+			}
+		}
+	}
+	if native != 1 || store.saveCount != 0 {
+		t.Fatalf("native commits=%d checkpoint saves=%d", native, store.saveCount)
+	}
+	assertAutomaticData(t, cat, 3, 2)
+	restarted := automaticSink(t, cat, store)
+	restarted.scopedRebuildToken, restarted.scopedNativeWrites = "epoch", true
+	restarted.states["app.orders"].snapshotReplaceApplied, restarted.states["app.orders"].snapshotTruncateApplied = true, true
+	if err := restarted.checkIcebergRecovery(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.handleSnapshotBatch(ctx, model.Event{Schema: "app", Table: "orders", Rows: replayRows}); err != nil {
+		t.Fatal(err)
+	}
+	assertAutomaticData(t, cat, 3, 2)
+}

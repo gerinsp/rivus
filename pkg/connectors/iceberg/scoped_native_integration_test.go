@@ -129,7 +129,7 @@ func TestScopedNativeRealBulkLargeRowPartitionMoveAndExpiredHistory(t *testing.T
 		rows = append(rows, map[string]interface{}{"id": n, "status": strings.Repeat("wide ", 200), "created_at": time.Date(2026, 9, 3, 0, 0, 0, 0, time.UTC)})
 	}
 	started := time.Now()
-	restarted.cfg.SnapshotBatchSize = 10000
+	restarted.cfg.SnapshotBatchSize = 500
 	restarted.cfg.MaxBatchBytes = 32 * 1024 * 1024
 	if err := restarted.handleSnapshotBatch(ctx, model.Event{Type: model.EventTypeSnapshotBatch, Schema: "app", Table: "orders", Rows: rows}); err != nil {
 		t.Fatal(err)

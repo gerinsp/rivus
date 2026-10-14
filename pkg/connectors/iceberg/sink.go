@@ -325,7 +325,7 @@ func newSinkWithRebuildMode(jobID, stateKey, jobName string, cfg config.IcebergC
 	if err != nil {
 		return nil, err
 	}
-	if snapshotRollingEnabled(cfg) {
+	if snapshotRollingEnabled(cfg) || native {
 		spoolDir, err := prepareSnapshotSpoolDirectory(cfg.SnapshotSpoolDirectory, jobID, stateKey)
 		if err != nil {
 			return nil, err
@@ -1722,8 +1722,23 @@ func (s *Sink) handleSnapshotBatch(ctx context.Context, ev model.Event) (err err
 	startedAt := time.Now()
 	result := flushResult{operation: "snapshot-batch"}
 	for _, span := range s.unrecoveredSnapshotRows(sourceKey, ev.SnapshotStartOffset, ev.Rows) {
+		chunks := splitRowsByLimits(span.rows, s.cfg.SnapshotBatchSize, int64(s.cfg.MaxBatchBytes))
+		if s.scopedNativeWrites && len(chunks) > 1 {
+			spanCtx := withIcebergBatch(ctx, snapshotIcebergBatch(sourceKey, span.start, span.start+int64(len(span.rows))))
+			if err := s.refreshStateTable(spanCtx, state); err != nil {
+				return err
+			}
+			chunkResult, err := s.flushScopedNativeSnapshotSpool(spanCtx, state, span.rows, ev.Timestamp, span.start)
+			if err != nil {
+				return err
+			}
+			result.operation = chunkResult.operation
+			result.rowCount += chunkResult.rowCount
+			result.deleteCount += chunkResult.deleteCount
+			continue
+		}
 		rowOffset := 0
-		for _, rows := range splitRowsByLimits(span.rows, s.cfg.SnapshotBatchSize, int64(s.cfg.MaxBatchBytes)) {
+		for _, rows := range chunks {
 			batchStartOffset := span.start + int64(rowOffset)
 			chunkCtx := withIcebergBatch(ctx, snapshotIcebergBatch(sourceKey, batchStartOffset, batchStartOffset+int64(len(rows))))
 			var chunkResult flushResult

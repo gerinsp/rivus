@@ -355,6 +355,10 @@ func (s *Sink) handleSnapshotTableComplete(ctx context.Context, ev model.Event) 
 }
 
 func (s *Sink) finalizeSnapshotSpool(ctx context.Context, state *tableState) error {
+	return s.finalizeSnapshotSpoolWithDeletes(ctx, state, nil)
+}
+
+func (s *Sink) finalizeSnapshotSpoolWithDeletes(ctx context.Context, state *tableState, deletes *reducedBatch) error {
 	spool := state.snapshotSpool
 	state.snapshotSpool = nil
 	if spool == nil {
@@ -381,7 +385,11 @@ func (s *Sink) finalizeSnapshotSpool(ctx context.Context, state *tableState) err
 	spool.bytes = info.Size()
 
 	sizing := planSnapshotWriteSizing(spool, s.cfg.SnapshotTargetFileSizeBytes, s.cfg.SnapshotParquetRowGroupRows)
-	effectiveRows, err := s.ensureSnapshotRollingWriteProperties(ctx, state, int(sizing.rowGroupRows))
+	propertiesCtx := ctx
+	if s.scopedNativeWrites {
+		propertiesCtx = withIcebergBatch(ctx, icebergBatch{kind: "internal"})
+	}
+	effectiveRows, err := s.ensureSnapshotRollingWriteProperties(propertiesCtx, state, int(sizing.rowGroupRows))
 	if err != nil {
 		return err
 	}
@@ -395,6 +403,12 @@ func (s *Sink) finalizeSnapshotSpool(ctx context.Context, state *tableState) err
 		sizing.rowGroupRows, sizing.readBatchRows, s.cfg.SnapshotTargetFileSizeBytes)
 
 	result := flushResult{operation: "snapshot-rolling-append", rowCount: int(spool.rowCount)}
+	if s.scopedNativeWrites {
+		result.operation = "append"
+	}
+	if deletes != nil {
+		result.operation, result.deleteCount = "delete-append-equality", deletes.deleteCount
+	}
 	var updated *icetable.Table
 	var startedAt time.Time
 	var duration time.Duration
@@ -411,9 +425,10 @@ func (s *Sink) finalizeSnapshotSpool(ctx context.Context, state *tableState) err
 			targetNamespace: state.targetNamespace,
 			targetTable:     state.targetTable,
 			rowCount:        result.rowCount,
+			deleteCount:     result.deleteCount,
 		}, func(ctx context.Context) error {
 			var commitErr error
-			updated, commitErr = s.commitSnapshotSpool(ctx, state, spool, sizing.readBatchRows)
+			updated, commitErr = s.commitSnapshotSpoolWithDeletes(ctx, state, spool, sizing.readBatchRows, deletes)
 			return commitErr
 		})
 		if err != nil && (updated != nil || !errors.Is(err, icetable.ErrCommitFailed)) {
@@ -433,6 +448,10 @@ func (s *Sink) finalizeSnapshotSpool(ctx context.Context, state *tableState) err
 }
 
 func (s *Sink) commitSnapshotSpool(ctx context.Context, state *tableState, spool *snapshotSpool, readBatchRows int64) (*icetable.Table, error) {
+	return s.commitSnapshotSpoolWithDeletes(ctx, state, spool, readBatchRows, nil)
+}
+
+func (s *Sink) commitSnapshotSpoolWithDeletes(ctx context.Context, state *tableState, spool *snapshotSpool, readBatchRows int64, deletes *reducedBatch) (*icetable.Table, error) {
 	if readBatchRows <= 0 {
 		readBatchRows = 1
 	}
@@ -485,6 +504,18 @@ func (s *Sink) commitSnapshotSpool(ctx context.Context, state *tableState, spool
 			removeStagedIcebergFiles(writeFS, stagedFiles)
 		}
 	}()
+	var deleteFiles []iceberglib.DataFile
+	if deletes != nil {
+		deleteFiles, err = writeEqualityDeleteFiles(ctx, state.table, writeFS, deletes.deleteKeys, deletes.deleteRows, deletes.pkCols)
+		if err != nil {
+			return nil, err
+		}
+		if len(deleteFiles) == 0 {
+			return nil, fmt.Errorf("native snapshot built no equality delete files")
+		}
+		stagedFiles = append(stagedFiles, deleteFiles...)
+	}
+	var dataFiles []iceberglib.DataFile
 	for dataFile, writeErr := range icetable.WriteRecords(
 		ctx,
 		state.table,
@@ -497,14 +528,18 @@ func (s *Sink) commitSnapshotSpool(ctx context.Context, state *tableState, spool
 			return nil, writeErr
 		}
 		stagedFiles = append(stagedFiles, dataFile)
+		dataFiles = append(dataFiles, dataFile)
 	}
-	if len(stagedFiles) == 0 {
+	if len(dataFiles) == 0 {
 		return nil, fmt.Errorf("rolled snapshot built no data files for %s", state.sourceKey)
 	}
 
 	txn := state.table.NewTransaction()
 	delta := txn.NewRowDelta(icebergCommitProperties(ctx, s.snapshotProps(state)))
-	delta.AddRows(stagedFiles...)
+	delta.AddRows(dataFiles...)
+	if len(deleteFiles) > 0 {
+		delta.AddDeletes(deleteFiles...)
+	}
 	if err := delta.Commit(ctx); err != nil {
 		return nil, err
 	}

@@ -87,14 +87,23 @@ func TestScopedTrinoCrashWorker(t *testing.T) {
 	}
 	crash := &scopedCrashStore{FencedOffsetStore: store.(*meta.FencedOffsetStore), stage: input.Stage}
 	var cat icecatalog.Catalog = scopedRealCatalog(t)
-	if input.Phase == "native" && input.Stage == "after-catalog" {
+	if strings.HasPrefix(input.Phase, "native") && input.Stage == "after-catalog" {
 		cat = nativeKillCatalog{cat}
 	}
 	s := scopedCrashSink(t, input, cat, crash)
-	if input.Phase == "native" {
+	if strings.HasPrefix(input.Phase, "native") {
 		s.scopedNativeWrites = true
 		s.states["app.orders"].snapshotReplaceApplied, s.states["app.orders"].snapshotTruncateApplied = true, true
 		rows := []map[string]interface{}{{"id": int64(3), "status": "prefix", "created_at": time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC)}}
+		if input.Phase == "native-bulk" {
+			s.cfg = normalizeIcebergConfig(s.cfg)
+			s.cfg.SnapshotBatchSize = 1
+			rows = append(rows, map[string]interface{}{"id": int64(5), "status": "suffix", "created_at": time.Date(2026, 9, 3, 0, 0, 0, 0, time.UTC)})
+			if err := s.handleSnapshotBatch(ctx, model.Event{Schema: "app", Table: "orders", Rows: rows}); err != nil {
+				t.Fatal(err)
+			}
+			t.Fatal("bulk worker did not reach SIGKILL barrier")
+		}
 		if _, err := s.flushScopedSnapshot(withIcebergBatch(ctx, snapshotIcebergBatch("app.orders", 0, 1)), s.states["app.orders"], rows); err != nil {
 			t.Fatal(err)
 		}

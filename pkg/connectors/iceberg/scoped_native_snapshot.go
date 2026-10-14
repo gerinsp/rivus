@@ -55,54 +55,106 @@ func (s *Sink) flushScopedNativeSnapshot(ctx context.Context, state *tableState,
 	if err := meta.CheckOwnership(ctx, s.offsetSto); err != nil {
 		return flushResult{}, util.Permanent(err)
 	}
-	_, filtered := s.snapshotReplaceFilterForState(state)
-	if !filtered && !s.scopedLegacyMerges[state.sourceKey] {
-		return s.flushSnapshotAppendOnce(ctx, state, rows)
-	}
-	before, err := s.scopedSnapshotBeforeImages(ctx, state, rows)
+	batch, err := s.scopedSnapshotReplacementKeys(ctx, state, rows)
 	if err != nil {
 		return flushResult{}, err
 	}
-	if len(before) == 0 {
+	if batch == nil {
 		return s.flushSnapshotAppendOnce(ctx, state, rows)
 	}
-	// A partitioned equality delete only covers files with the same spec.
-	// Before-images locate changed partition values, but cannot make one spec
-	// apply to files from a different historical spec. Fail before any write.
+	batch.rows = rows
+	if err := s.applyEqualityDelta(ctx, state, batch, "delete-append-equality"); err != nil {
+		return flushResult{}, err
+	}
+	return flushResult{operation: "delete-append-equality", rowCount: len(rows), deleteCount: batch.deleteCount}, nil
+}
+
+func (s *Sink) scopedSnapshotReplacementKeys(ctx context.Context, state *tableState, rows []map[string]interface{}) (*reducedBatch, error) {
+	_, filtered := s.snapshotReplaceFilterForState(state)
+	if !filtered && !s.scopedLegacyMerges[state.sourceKey] {
+		return nil, nil
+	}
+	// Unpartitioned equality deletes apply globally. Write incoming keys directly
+	// with the append; no target scan is needed, including partial v1 recovery.
+	before := rows
+	if !state.table.Spec().IsUnpartitioned() {
+		var err error
+		before, err = s.scopedSnapshotBeforeImages(ctx, state, rows)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if len(before) == 0 {
+		return nil, nil
+	}
 	spec := state.table.Spec()
 	if !spec.IsUnpartitioned() && len(state.table.Metadata().PartitionSpecs()) > 1 {
 		tasks, err := state.table.Scan().PlanFiles(ctx)
 		if err != nil {
-			return flushResult{}, err
+			return nil, err
 		}
 		for _, task := range tasks {
 			if int(task.File.SpecID()) != spec.ID() {
-				return flushResult{}, util.Permanent(fmt.Errorf("native snapshot key replacement blocked by active data using a historical partition spec"))
+				return nil, util.Permanent(fmt.Errorf("native snapshot key replacement blocked by active data using a historical partition spec"))
 			}
 		}
 	}
 	pk, err := s.primaryKeysFor(state.sourceKey, state.sourceSchema)
 	if err != nil {
-		return flushResult{}, util.Permanent(err)
+		return nil, util.Permanent(err)
 	}
-	batch := &reducedBatch{rows: rows, pkCols: pk, deleteCount: len(before)}
+	batch := &reducedBatch{pkCols: pk, deleteCount: len(before)}
 	seen := make(map[string]bool, len(before))
 	for _, row := range before {
 		key, text, err := keyFromRow(row, pk)
 		if err != nil {
-			return flushResult{}, util.Permanent(err)
+			return nil, util.Permanent(err)
 		}
 		if seen[text] {
-			return flushResult{}, util.Permanent(fmt.Errorf("native snapshot target has duplicate primary keys in %s", state.sourceKey))
+			return nil, util.Permanent(fmt.Errorf("native snapshot target has duplicate primary keys in %s", state.sourceKey))
 		}
 		seen[text] = true
 		batch.deleteKeys = append(batch.deleteKeys, key)
 		batch.deleteRows = append(batch.deleteRows, pendingDelete{key: key, row: row})
 	}
-	if err := s.applyEqualityDelta(ctx, state, batch, "delete-append-equality"); err != nil {
+	return batch, nil
+}
+
+// Bound Arrow/spool buffers by the configured limits, then commit all staged
+// files for one source span together. No source ACK/cursor is saved by staging.
+func (s *Sink) flushScopedNativeSnapshotSpool(ctx context.Context, state *tableState, rows []map[string]interface{}, ts time.Time, start int64) (flushResult, error) {
+	if !state.snapshotReplaceApplied || !state.snapshotTruncateApplied {
+		return flushResult{}, util.Permanent(fmt.Errorf("scoped snapshot cannot write before durable reset confirmation"))
+	}
+	if err := meta.CheckOwnership(ctx, s.offsetSto); err != nil {
+		return flushResult{}, util.Permanent(err)
+	}
+	batch, err := s.scopedSnapshotReplacementKeys(ctx, state, rows)
+	if err != nil {
 		return flushResult{}, err
 	}
-	return flushResult{operation: "delete-append-equality", rowCount: len(rows), deleteCount: len(before)}, nil
+	if s.snapshotSpoolDir == "" {
+		dir, err := prepareSnapshotSpoolDirectory(s.cfg.SnapshotSpoolDirectory, s.jobID, s.stateKey)
+		if err != nil {
+			return flushResult{}, err
+		}
+		s.snapshotSpoolDir = dir
+	}
+	s.resetSnapshotSpool(state)
+	defer s.resetSnapshotSpool(state)
+	for _, chunk := range splitRowsByLimits(rows, s.cfg.SnapshotBatchSize, int64(s.cfg.MaxBatchBytes)) {
+		if err := s.appendSnapshotSpoolChunk(ctx, state, chunk, ts); err != nil {
+			return flushResult{}, err
+		}
+	}
+	if err := s.finalizeSnapshotSpoolWithDeletes(ctx, state, batch); err != nil {
+		return flushResult{}, err
+	}
+	result := flushResult{operation: "append", rowCount: len(rows)}
+	if batch != nil {
+		result.operation, result.deleteCount = "delete-append-equality", batch.deleteCount
+	}
+	return result, nil
 }
 
 func (s *Sink) scopedSnapshotBeforeImages(ctx context.Context, state *tableState, rows []map[string]interface{}) ([]map[string]interface{}, error) {
