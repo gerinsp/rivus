@@ -115,7 +115,11 @@ func (s *Sink) scopedSnapshotReplacementKeys(ctx context.Context, state *tableSt
 		}
 		seen[text] = true
 		batch.deleteKeys = append(batch.deleteKeys, key)
-		batch.deleteRows = append(batch.deleteRows, pendingDelete{key: key, row: row})
+		// Global equality deletes need keys only. Retaining these full source
+		// rows would keep wide payloads alive after their spool is written.
+		if !spec.IsUnpartitioned() {
+			batch.deleteRows = append(batch.deleteRows, pendingDelete{key: key, row: row})
+		}
 	}
 	return batch, nil
 }
@@ -146,6 +150,11 @@ func (s *Sink) flushScopedNativeSnapshotSpool(ctx context.Context, state *tableS
 		if err := s.appendSnapshotSpoolChunk(ctx, state, chunk, ts); err != nil {
 			return flushResult{}, err
 		}
+		// The spool now owns this payload. Release the source maps before
+		// building Parquet, as the normal rolling path does. Commit retries
+		// reread the spool; an error returns a failed ACK and source restart
+		// rereads the unacknowledged range. Staging never advances its cursor.
+		clearRows(chunk)
 	}
 	if err := s.finalizeSnapshotSpoolWithDeletes(ctx, state, batch); err != nil {
 		return flushResult{}, err

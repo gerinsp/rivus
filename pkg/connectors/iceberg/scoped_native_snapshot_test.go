@@ -2,6 +2,7 @@ package iceberg
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,78 @@ import (
 	"github.com/gerinsp/rivus/pkg/meta"
 	"github.com/gerinsp/rivus/pkg/model"
 )
+
+type snapshotPayloadReleaseStore struct {
+	*automaticStore
+	beforeBegin func(meta.IcebergCommitIntent) error
+}
+
+func (s *snapshotPayloadReleaseStore) BeginIcebergCommit(ctx context.Context, intent meta.IcebergCommitIntent) error {
+	if err := s.beforeBegin(intent); err != nil {
+		return err
+	}
+	return s.automaticStore.BeginIcebergCommit(ctx, intent)
+}
+
+func TestScopedNativeBulkReleasesPayloadWithoutEarlyAcknowledgement(t *testing.T) {
+	for _, filtered := range []bool{false, true} {
+		for _, failBegin := range []bool{false, true} {
+			t.Run(fmt.Sprintf("filtered_%t_fail_%t", filtered, failBegin), func(t *testing.T) {
+				ctx := context.Background()
+				cat := recoveryCatalog(t)
+				store := &automaticStore{guardTestStore: newGuardTestStore()}
+				s := automaticSink(t, cat, store)
+				s.scopedRebuildToken, s.scopedNativeWrites = "epoch", true
+				s.cfg.SnapshotBatchSize = 1
+				s.cfg.SnapshotSpoolDirectory = t.TempDir()
+				if filtered {
+					s.cfg.SnapshotReplaceFilters = map[string]config.IcebergSnapshotReplaceFilterConfig{"app.orders": {Column: "id", Op: ">=", Value: "1"}}
+				}
+				state := s.states["app.orders"]
+				state.snapshotReplaceApplied, state.snapshotTruncateApplied = true, true
+				rows := []map[string]interface{}{{"id": int64(1), "status": strings.Repeat("payload", 10000)}, {"id": int64(2), "status": "second"}}
+				if filtered {
+					batch, err := s.scopedSnapshotReplacementKeys(ctx, state, rows)
+					if err != nil || batch == nil || len(batch.deleteKeys) != 2 {
+						t.Fatalf("replacement keys: %v", err)
+					}
+					if len(batch.deleteRows) != 0 {
+						t.Error("unpartitioned equality deletes retain full source rows")
+					}
+				}
+				ack := make(chan error, 1)
+				visited := false
+				s.offsetSto = &snapshotPayloadReleaseStore{automaticStore: store, beforeBegin: func(intent meta.IcebergCommitIntent) error {
+					if intent.Kind != "snapshot" {
+						return nil
+					}
+					visited = true
+					for _, row := range rows {
+						if row != nil {
+							t.Error("source payload still retained when native write begins")
+						}
+					}
+					if len(ack) != 0 || store.saveCount != 0 || store.snapshotProgress != nil {
+						t.Error("staging acknowledged or checkpointed uncommitted data")
+					}
+					if failBegin {
+						return errors.New("fixture metadata write failure")
+					}
+					return nil
+				}}
+				err := s.handleSnapshotBatch(ctx, model.Event{Schema: "app", Table: "orders", Rows: rows, Ack: ack})
+				if !visited || (err != nil) != failBegin || (<-ack != nil) != failBegin {
+					t.Fatalf("visited=%t error=%v expected failure=%t", visited, err, failBegin)
+				}
+				if failBegin {
+					assertAutomaticData(t, cat, 0, 0)
+				} else {
+					assertAutomaticData(t, cat, 2, 1)
+				}
+			})
+		}
+	}
+}
 
 func TestScopedNativeSnapshotLargeRowAndPartialBatchRestart(t *testing.T) {
 	ctx := context.Background()
