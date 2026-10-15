@@ -40,6 +40,8 @@ const (
 	defaultIcebergCatalogName = "raw"
 	catalogInitTimeout        = time.Minute
 	catalogInitAttemptTimeout = 15 * time.Second
+	checkpointCleanupTimeout  = 2 * time.Second
+	checkpointCleanupInterval = 30 * time.Second
 )
 
 type Sink struct {
@@ -76,6 +78,8 @@ type Sink struct {
 	recoveryEventPayloads      map[string]string
 	lastCheckpointCommitAt     time.Time
 	lastCheckpointBlockedLogAt time.Time
+	pendingCheckpointCleanup   *meta.Offset
+	lastCheckpointCleanupAt    time.Time
 }
 
 func (s *Sink) MaintenanceOwnershipLifecycle() connector.MaintenanceOwnershipLifecycle {
@@ -553,6 +557,11 @@ func (s *Sink) commitPendingOffset(ctx context.Context, force bool) error {
 	if s.offsetSto == nil {
 		return nil
 	}
+	// Retry maintenance on idle ticks as well as source checkpoints. Its
+	// watermark only comes from a successfully saved checkpoint.
+	if err := s.cleanupPendingCheckpoint(ctx); err != nil {
+		return err
+	}
 
 	s.mu.Lock()
 	if s.pendingOffset == nil {
@@ -593,22 +602,20 @@ func (s *Sink) commitPendingOffset(ctx context.Context, force bool) error {
 	}
 
 	saveCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
 
 	checkpointKey := s.checkpointKey()
-	if err := connector.SaveSourceOffset(saveCtx, s.offsetSto, checkpointKey, &off); err != nil {
+	err := connector.SaveSourceOffset(saveCtx, s.offsetSto, checkpointKey, &off)
+	cancel()
+	if err != nil {
 		if errors.Is(err, meta.ErrWorkerOwnershipLost) {
 			return util.Permanent(err)
 		}
 		log.Printf("[iceberg][job %s] save offset error key=%s pos=%s:%d: %v", s.jobID, checkpointKey, off.BinlogFile, off.BinlogPos, err)
 		return nil
 	}
-	if err := s.cleanupCheckpointedIcebergCommits(saveCtx, &meta.Offset{BinlogFile: off.BinlogFile, BinlogPos: off.BinlogPos}); err != nil {
-		return err
-	}
-
 	s.mu.Lock()
 	s.lastCheckpointCommitAt = time.Now()
+	s.pendingCheckpointCleanup = &meta.Offset{BinlogFile: off.BinlogFile, BinlogPos: off.BinlogPos}
 	if s.pendingOffset != nil && s.pendingOffset.BinlogFile == off.BinlogFile && s.pendingOffset.BinlogPos == off.BinlogPos {
 		s.pendingOffset = nil
 	}
@@ -616,6 +623,44 @@ func (s *Sink) commitPendingOffset(ctx context.Context, force bool) error {
 
 	log.Printf("[iceberg][job %s] committed offset key=%s pos=%s:%d", s.jobID, checkpointKey, off.BinlogFile, off.BinlogPos)
 	s.reportCheckpointCommitted(&off)
+	return s.cleanupPendingCheckpoint(ctx)
+}
+
+// Covered COMMITTED receipts are safe to retain until a later tick or restart.
+// Cleanup must neither borrow the checkpoint's remaining timeout nor turn a
+// transient metadata error into a failed pipeline after that checkpoint saved.
+// Keep the worker lifetime and ownership fence: only maintenance is deferred.
+func (s *Sink) cleanupPendingCheckpoint(ctx context.Context) error {
+	s.mu.Lock()
+	if s.pendingCheckpointCleanup == nil || time.Since(s.lastCheckpointCleanupAt) < checkpointCleanupInterval {
+		s.mu.Unlock()
+		return nil
+	}
+	off := *s.pendingCheckpointCleanup
+	s.lastCheckpointCleanupAt = time.Now()
+	s.mu.Unlock()
+
+	cleanupCtx, cancel := context.WithTimeout(ctx, checkpointCleanupTimeout)
+	err := s.cleanupCheckpointedIcebergCommits(cleanupCtx, &off)
+	cancel()
+	if err != nil {
+		if errors.Is(err, meta.ErrWorkerOwnershipLost) {
+			return util.Permanent(err)
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		log.Printf("[iceberg][job %s] checkpoint receipt cleanup deferred pos=%s:%d retry_after=%s: %v", s.jobID, off.BinlogFile, off.BinlogPos, checkpointCleanupInterval, err)
+		return nil
+	}
+	s.mu.Lock()
+	if s.pendingCheckpointCleanup != nil && *s.pendingCheckpointCleanup == off {
+		s.pendingCheckpointCleanup = nil
+	}
+	// Back off only after a failure. Healthy checkpoints retain their normal
+	// immediate cleanup, including the final checkpoint before an idle period.
+	s.lastCheckpointCleanupAt = time.Time{}
+	s.mu.Unlock()
 	return nil
 }
 

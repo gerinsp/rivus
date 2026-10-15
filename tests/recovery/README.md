@@ -141,3 +141,17 @@ env RIVUS_RECOVERY_INTEGRATION=1 RIVUS_RECOVERY_TRINO_INTEGRATION=1 RIVUS_RECOVE
 ```
 
 39 integration leaf cases passed on October 14. Full unit suite passed. The large-row case includes a 1.33 MB value, preserved outside/NULL-date rows, a PK moving partitions, positive catalog proof after query-history expiry, one native bulk commit and no new MERGE mutation. Two native SIGKILL cases confirm that the reset and accepted prefix are not repeated; changing chunk size during replay retains the accepted range.
+
+## Checkpoint cleanup and shutdown regression
+
+`TestCheckpointCleanupRealMySQLTimeoutAndRetry` blocks a real fenced receipt DELETE inside MySQL until its cleanup deadline expires. The saved checkpoint must remain acknowledged, all receipts must survive the timeout, and a later retry must delete only COMMITTED receipts covered by that saved checkpoint. A newer checkpoint blocked by pending events must not authorize cleanup. Cleanup uses a separate two-second budget and backs off for 30 seconds after failure; healthy cleanup remains immediate. Startup reconciliation handles receipts retained across restart.
+
+`TestWorkerFenceRealMySQLStoppingRenewsUntilFinalStatus` checks that a draining worker can keep its lease until the final status is saved. STOPPING does not authorize new checkpoint writes, a different owner/submission cannot renew, and the final FAILED state stops renewal. This covers the race where a terminal callback saved STOPPING and a concurrent renewal detached it before it could save the final state.
+
+With the isolated metadata fixture running:
+
+```sh
+RIVUS_RECOVERY_INTEGRATION=1 go test -p=1 -tags=integration ./pkg/connectors/iceberg ./pkg/meta -run '^(TestCheckpointCleanupReal|TestWorkerFenceRealMySQLStopping)' -count=1 -v -timeout=1m
+```
+
+These tests exercise local MySQL faults and worker fencing. They do not establish the cause of production database latency or measure production throughput.

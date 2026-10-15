@@ -1764,6 +1764,13 @@ func (m *JobManager) renewWorkerJobLeases(ctx context.Context, store meta.JobWor
 		switch job.GetStatus() {
 		case JobStatusCreated, JobStatusQueued, JobStatusPending, JobStatusRunning, JobStatusPausing:
 			owned = append(owned, job)
+		case JobStatusFailed, JobStatusStopped, JobStatusDone:
+			// The terminal callback first persists STOPPING while the pipeline
+			// drains. Keep its lease until the final status is saved; otherwise
+			// a concurrent renewal can detach that callback and strand STOPPING.
+			if job.runActive() {
+				owned = append(owned, job)
+			}
 		}
 	}
 	m.mu.RUnlock()

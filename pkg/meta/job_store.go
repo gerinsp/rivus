@@ -530,7 +530,7 @@ func (s *MySQLJobStore) RenewJobLease(ctx context.Context, jobID, submissionID, 
 		UPDATE job_registry
 		SET lease_until=?
 		WHERE job_id=? AND submission_id=? AND lease_owner=?
-		  AND (desired_state=? OR last_status='PAUSING')`,
+		  AND (desired_state=? OR last_status IN ('PAUSING','STOPPING'))`,
 		time.Now().UTC().Add(leaseDuration), jobID, submissionID, owner, string(DesiredStateRunning))
 	if err != nil {
 		return false, err

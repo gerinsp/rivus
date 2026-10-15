@@ -189,6 +189,49 @@ func TestWorkerFenceRealMySQLClaimDoesNotScanLockedRunningJobs(t *testing.T) {
 	}
 }
 
+func TestWorkerFenceRealMySQLStoppingRenewsUntilFinalStatus(t *testing.T) {
+	db, base, fenced, key := realFenceFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	registry, err := NewMySQLJobStore(fenceIntegrationDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer registry.Close()
+	var submission string
+	if err := db.QueryRowContext(ctx, "SELECT submission_id FROM job_registry WHERE job_id=?", key).Scan(&submission); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "UPDATE job_registry SET desired_state='STOPPED',last_status='STOPPING' WHERE job_id=?", key); err != nil {
+		t.Fatal(err)
+	}
+	if renewed, err := registry.RenewJobLease(ctx, key, submission, "fence-owner", time.Minute); err != nil || !renewed {
+		t.Fatalf("draining owner could not renew: renewed=%t error=%v", renewed, err)
+	}
+	// Retaining shutdown ownership must not permit new data/checkpoint writes
+	// after STOPPED was requested, nor let another submission renew the lease.
+	if err := fenced.SaveOffset(ctx, key, Offset{BinlogFile: "mysql-bin.000001", BinlogPos: 42}); !errors.Is(err, ErrWorkerOwnershipLost) {
+		t.Fatalf("stopped worker wrote a checkpoint: %v", err)
+	}
+	for _, token := range []struct{ submission, owner string }{{"stale", "fence-owner"}, {submission, "different-owner"}} {
+		if renewed, err := registry.RenewJobLease(ctx, key, token.submission, token.owner, time.Minute); err != nil || renewed {
+			t.Fatalf("wrong shutdown token renewed: renewed=%t error=%v", renewed, err)
+		}
+	}
+	saved, err := registry.SaveClaimedJob(ctx, PersistedJob{ID: key, SubmissionID: submission, Config: &config.JobConfig{ID: key}, MetaKey: key,
+		DesiredState: DesiredStateStopped, ExecutionRole: JobExecutionRoleStreaming, LastStatus: "FAILED"}, "fence-owner")
+	if err != nil || !saved {
+		t.Fatalf("final drained state was not saved: saved=%t error=%v", saved, err)
+	}
+	if renewed, err := registry.RenewJobLease(ctx, key, submission, "fence-owner", time.Minute); err != nil || renewed {
+		t.Fatalf("final terminal state kept renewing: renewed=%t error=%v", renewed, err)
+	}
+	off, err := base.GetOffset(ctx, key)
+	if err != nil || off == nil || off.BinlogPos != 4 {
+		t.Fatalf("shutdown changed checkpoint: offset=%+v error=%v", off, err)
+	}
+}
+
 func claimWhileRunningJobLocked(t *testing.T, legacy bool) {
 	t.Helper()
 	db, _, _, runningKey := realFenceFixture(t)

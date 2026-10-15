@@ -100,3 +100,32 @@ func TestRunWorkerRenewsLeasesWhileClaimOrStartupIsBlocked(t *testing.T) {
 		t.Fatal("RunWorker did not stop after cancellation")
 	}
 }
+
+func TestWorkerRenewsTerminalJobUntilPipelineDrains(t *testing.T) {
+	for _, status := range []JobStatus{JobStatusFailed, JobStatusStopped, JobStatusDone} {
+		t.Run(string(status), func(t *testing.T) {
+			store := &blockingClaimStore{}
+			manager := NewJobManager(nil, WithJobStore(store), WithWorkerRole(WorkerRoleStreaming), WithWorkerID("drain-owner"))
+			job := NewJob(newTestJobConfig("draining-job"), nil)
+			job.status = status
+			done := make(chan struct{})
+			job.setRunDone(done)
+			manager.jobs[job.Config.ID] = job
+			manager.executionRoles[job.Config.ID] = meta.JobExecutionRoleStreaming
+			manager.workerLeases[job.Config.ID] = job.SubmissionID()
+			if err := manager.renewWorkerJobLeases(context.Background(), store); err != nil {
+				t.Fatal(err)
+			}
+			if store.renewals() != 1 {
+				t.Fatal("terminal job lost its lease before final drained status could be saved")
+			}
+			close(done)
+			if err := manager.renewWorkerJobLeases(context.Background(), store); err != nil {
+				t.Fatal(err)
+			}
+			if store.renewals() != 1 {
+				t.Fatal("fully drained terminal job kept renewing its lease")
+			}
+		})
+	}
+}
