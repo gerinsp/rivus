@@ -106,7 +106,7 @@ Prerequisites:
 - Docker with Compose support.
 - A MySQL source with binlog access for CDC jobs.
 - Sink infrastructure for the job you want to run: Apache Doris or an Iceberg REST catalog plus object storage.
-- Go 1.25 or newer only when building from source.
+- Go 1.25.9 or newer only when building from source.
 
 Clone the repository, create an environment file, and start the reference stack:
 

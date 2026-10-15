@@ -34,7 +34,9 @@ const scopedTrinoURI = "http://127.0.0.1:49319"
 
 // Test-only mapping of the Trino local filesystem to its shared host directory.
 // The catalog, metadata, manifests, Parquet and SQL execution remain real.
-type scopedFixtureFS struct{ iceio.LocalFS }
+// Expose only URI-aware methods: embedding LocalFS would also promote optional
+// fast paths such as ReadFile, bypassing the fixture's local:///warehouse map.
+type scopedFixtureFS struct{}
 
 func scopedFixturePath(name string) string {
 	u, err := url.Parse(name)
@@ -48,15 +50,17 @@ func scopedFixturePath(name string) string {
 	return filepath.Join(root, "rivus-recovery-trino-warehouse", strings.TrimPrefix(u.Path, "/warehouse/"))
 }
 func (f scopedFixtureFS) Open(name string) (iceio.File, error) {
-	return f.LocalFS.Open(scopedFixturePath(name))
+	return (iceio.LocalFS{}).Open(scopedFixturePath(name))
 }
 func (f scopedFixtureFS) Create(name string) (iceio.FileWriter, error) {
-	return f.LocalFS.Create(scopedFixturePath(name))
+	return (iceio.LocalFS{}).Create(scopedFixturePath(name))
 }
 func (f scopedFixtureFS) WriteFile(name string, data []byte) error {
-	return f.LocalFS.WriteFile(scopedFixturePath(name), data)
+	return (iceio.LocalFS{}).WriteFile(scopedFixturePath(name), data)
 }
-func (f scopedFixtureFS) Remove(name string) error { return f.LocalFS.Remove(scopedFixturePath(name)) }
+func (f scopedFixtureFS) Remove(name string) error {
+	return (iceio.LocalFS{}).Remove(scopedFixturePath(name))
+}
 
 func init() {
 	iceio.Register("local", func(context.Context, *url.URL, map[string]string) (iceio.IO, error) { return scopedFixtureFS{}, nil })

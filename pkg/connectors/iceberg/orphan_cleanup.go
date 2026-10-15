@@ -118,7 +118,7 @@ func cleanupTableOrphans(ctx context.Context, sink *Sink, target config.IcebergT
 		icetable.WithFilesOlderThan(olderThan),
 	}
 	if maxConcurrency > 0 {
-		cleanupOpts = append(cleanupOpts, icetable.WithMaxConcurrency(maxConcurrency))
+		cleanupOpts = append(cleanupOpts, icetable.WithCleanupMaxConcurrency(maxConcurrency))
 	}
 	cleanup, err := tbl.DeleteOrphanFiles(ctx, cleanupOpts...)
 	if err != nil {

@@ -1760,7 +1760,7 @@ func TestEqualityDeletePartitionDataDayTransform(t *testing.T) {
 		t.Fatalf("equalityDeletePartitionData returned error: %v", err)
 	}
 
-	expectedDays := int32(eventDate.Unix() / int64((24 * time.Hour).Seconds()))
+	expectedDays := iceberglib.Date(eventDate.Unix() / int64((24 * time.Hour).Seconds()))
 	if got, want := partitionData[1000], expectedDays; got != want {
 		t.Fatalf("partition day = %v (%T), want %v", got, got, want)
 	}
