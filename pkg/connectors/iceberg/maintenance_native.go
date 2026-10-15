@@ -89,6 +89,7 @@ type nativeTaskOutcome struct {
 
 type activeFileInventory struct {
 	SnapshotID                int64
+	PartitionFields           []string
 	DataFiles                 int
 	SmallFiles                int
 	SmallBytes                int64
@@ -365,7 +366,11 @@ func isDNSLookupFailure(err error) bool {
 
 func scanActiveFileInventoryOnce(ctx context.Context, tbl *icetable.Table, settings nativeMaintenanceSettings) (activeFileInventory, error) {
 	var inventory activeFileInventory
-	if tbl == nil || tbl.CurrentSnapshot() == nil {
+	if tbl == nil {
+		return inventory, nil
+	}
+	inventory.PartitionFields = maintenancePartitionFields(tbl)
+	if tbl.CurrentSnapshot() == nil {
 		return inventory, nil
 	}
 	inventory.SnapshotID = tbl.CurrentSnapshot().SnapshotID
@@ -410,6 +415,36 @@ func scanActiveFileInventoryOnce(ctx context.Context, tbl *icetable.Table, setti
 		return inventory, err
 	}
 	return inventory, nil
+}
+
+// A non-nil empty list means the table is known to be unpartitioned. Nil is
+// reserved for inventory that has not read the table metadata yet.
+func maintenancePartitionFields(tbl *icetable.Table) []string {
+	fields := make([]string, 0)
+	spec := tbl.Spec()
+	for _, partition := range spec.Fields() {
+		if _, void := partition.Transform.(iceberglib.VoidTransform); void {
+			continue
+		}
+		names := make([]string, 0, len(partition.SourceIDs))
+		for _, id := range partition.SourceIDs {
+			name, ok := tbl.Schema().FindColumnName(id)
+			if !ok {
+				names = nil
+				break
+			}
+			names = append(names, name)
+		}
+		label := partition.Name
+		if len(names) > 0 {
+			label = strings.Join(names, ", ")
+			if _, identity := partition.Transform.(iceberglib.IdentityTransform); !identity {
+				label = fmt.Sprintf("%s(%s)", partition.Transform, label)
+			}
+		}
+		fields = append(fields, label)
+	}
+	return fields
 }
 
 func inventoryApplicableDeletes(inventory *activeFileInventory, tasks []icetable.FileScanTask) {
@@ -479,7 +514,7 @@ func saveActiveFileInventory(ctx context.Context, store *meta.IcebergMaintenance
 	return store.UpdateInventory(ctx, tableKey, inventory.SnapshotID, inventory.DataFiles, inventory.SmallFiles,
 		inventory.SmallBytes, inventory.EqualityDeletes, inventory.PositionDeletes,
 		inventory.ApplicableEqualityDeletes, inventory.ApplicablePositionDeletes,
-		inventory.CompactableFiles, inventory.CompactableBytes, inventory.CompactionGroups)
+		inventory.CompactableFiles, inventory.CompactableBytes, inventory.CompactionGroups, inventory.PartitionFields)
 }
 
 func inventoryTriggersCompaction(inventory activeFileInventory, settings nativeMaintenanceSettings) bool {

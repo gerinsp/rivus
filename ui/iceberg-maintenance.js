@@ -32,7 +32,7 @@ function maintenanceStateLabel(state) {
     running: 'Maintenance running',
     inventory_pending: 'Waiting for inventory scan',
     stale: 'Inventory stale',
-    partitioned: 'Files spread across partitions',
+    partitioned: 'No eligible file groups',
     healthy: 'Healthy',
     paused: 'Paused',
     error: 'Inventory error',
@@ -79,6 +79,32 @@ function maintenanceReason(table) {
     remove_orphan_files: 'Orphan cleanup is being evaluated',
   };
   return labels[String(operation).trim()] || String(operation).trim();
+}
+
+function partitioningLabel(table) {
+  const fields = table?.partition_fields;
+  if (!Array.isArray(fields) || !fields.every((field) => typeof field === 'string' && field.trim())) {
+    return 'Partitioning pending scan';
+  }
+  return fields.length ? `Partitioned · ${fields.join(', ')}` : 'Unpartitioned';
+}
+
+function compactionEligibility(table) {
+  const files = table?.compactable_files;
+  const groups = table?.compaction_groups;
+  if (!table?.checked_at || files == null || groups == null
+      || !Number.isInteger(files) || files < 0 || !Number.isInteger(groups) || groups < 0) {
+    return 'Eligibility pending scan';
+  }
+  const stale = ['stale', 'inventory_pending', 'scanning', 'error'].includes(String(table.state || '').toLowerCase());
+  const when = stale ? ' at last scan' : '';
+  if (groups === 0) {
+    const reason = Array.isArray(table.partition_fields) && table.partition_fields.length > 0
+      ? 'No eligible groups within partitions.'
+      : 'No eligible file groups.';
+    return `${fmtWholeNumber(files)} files eligible${when}. ${reason}`;
+  }
+  return `${fmtWholeNumber(files)} files in ${fmtWholeNumber(groups)} eligible group${groups === 1 ? '' : 's'}${when}.`;
 }
 
 function maintenanceMetric(label, value, detail) {
@@ -192,7 +218,7 @@ export function renderIcebergMaintenance(job, options = {}) {
     const retainedPosition = applicablePosition == null ? 0 : Math.max(0, Number(table?.active_position_delete_files || 0) - applicablePosition);
     const equalityLabel = applicableEquality == null ? '–' : fmtWholeNumber(applicableEquality);
     const positionLabel = applicablePosition == null ? '–' : fmtWholeNumber(applicablePosition);
-    const reason = maintenanceReason(table);
+    const reason = maintenanceReason(table) || compactionEligibility(table);
     const reasonCell = table?.error
       ? `<div class="max-w-md break-words text-[11px] leading-4 text-rose-600">${escapeHtml(table.error)}</div>`
       : reason
@@ -202,13 +228,12 @@ export function renderIcebergMaintenance(job, options = {}) {
       ? '<div class="mt-1 text-[11px] text-rose-600">Needs retry</div>'
       : String(table?.state || '').toLowerCase() === 'stale'
         ? '<div class="mt-1 text-[11px] text-amber-700">Refresh required</div>'
-        : String(table?.state || '').toLowerCase() === 'partitioned'
-          ? '<div class="mt-1 text-[11px] text-slate-500">Small files are split across partitions</div>'
         : '';
     return `
       <tr class="border-b border-slate-100 align-top last:border-0">
         <td class="px-4 py-3">
           <div class="mono text-xs font-semibold text-slate-800">${escapeHtml(table?.identifier || '-')}</div>
+          <div class="mt-1 max-w-sm break-words text-[11px] leading-4 text-slate-500">${escapeHtml(partitioningLabel(table))}</div>
           <div class="mt-1 text-[11px] text-slate-500">Checked ${escapeHtml(table?.checked_at ? formatDateTime(table.checked_at) : '-')}</div>
         </td>
         <td class="mono px-4 py-3 text-right text-xs font-semibold text-slate-800">${fmtWholeNumber(table?.active_data_files || 0)}</td>
@@ -286,8 +311,8 @@ export function renderIcebergMaintenance(job, options = {}) {
     <div class="grid gap-3 bg-slate-50 px-5 py-4 sm:grid-cols-2 xl:grid-cols-5 sm:px-6">
       ${maintenanceMetric('Active data files', fmtWholeNumber(maintenance.active_data_files || 0))}
       ${maintenanceMetric('Applicable equality deletes', fmtWholeNumber(maintenance.applicable_equality_delete_files || 0), Number(maintenance.applicable_counts_pending || 0) ? `${fmtWholeNumber(maintenance.applicable_counts_pending)} tables pending scan` : '')}
-      ${maintenanceMetric('Eligible small files', fmtWholeNumber(maintenance.eligible_small_files || 0), `Below ${fmtBytes(Number(maintenance.small_file_size_bytes || 0))}`)}
-      ${maintenanceMetric('Eligible small bytes', fmtBytes(Number(maintenance.eligible_small_bytes || 0)), `Minimum ${fmtBytes(Number(maintenance.small_files_min_total_bytes || 0))}`)}
+      ${maintenanceMetric('Small files', fmtWholeNumber(maintenance.eligible_small_files || 0), `Below ${fmtBytes(Number(maintenance.small_file_size_bytes || 0))}`)}
+      ${maintenanceMetric('Small-file bytes', fmtBytes(Number(maintenance.eligible_small_bytes || 0)), 'Across all partitions')}
       ${maintenanceMetric(listLimited ? 'Tables ready (shown)' : 'Tables ready', fmtWholeNumber(maintenance.tables_ready || 0), `${fmtWholeNumber(maintenance.active_runs || 0)} maintenance run(s) active`)}
     </div>
 

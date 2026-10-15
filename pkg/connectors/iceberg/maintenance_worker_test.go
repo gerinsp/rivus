@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"reflect"
 	"testing"
 	"time"
 
@@ -12,6 +13,34 @@ import (
 	"github.com/gerinsp/rivus/pkg/config"
 	"github.com/gerinsp/rivus/pkg/meta"
 )
+
+func TestInventoryRecordsPartitioningEvenForEmptyTables(t *testing.T) {
+	identity := iceberg.PartitionField{SourceIDs: []int{1}, FieldID: 1000, Name: "id", Transform: iceberg.IdentityTransform{}}
+	bucket := iceberg.PartitionField{SourceIDs: []int{2}, FieldID: 1001, Name: "status_bucket", Transform: iceberg.BucketTransform{NumBuckets: 16}}
+	spec := func(fields ...iceberg.PartitionField) *iceberg.PartitionSpec {
+		value := iceberg.NewPartitionSpecID(1, fields...)
+		return &value
+	}
+	for _, tc := range []struct {
+		name string
+		spec *iceberg.PartitionSpec
+		want []string
+	}{
+		{"unpartitioned", iceberg.UnpartitionedSpec, []string{}},
+		{"identity", spec(identity), []string{"id"}},
+		{"bucket", spec(bucket), []string{"bucket[16](status)"}},
+		{"multiple", spec(identity, bucket), []string{"id", "bucket[16](status)"}},
+		{"void", spec(iceberg.PartitionField{SourceIDs: []int{1}, FieldID: 1000, Name: "old_id", Transform: iceberg.VoidTransform{}}), []string{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tbl, _ := newEqualityDeltaTestTableWithSpec(t, tc.spec)
+			inventory, err := scanActiveFileInventoryOnce(context.Background(), tbl, defaultNativeMaintenanceSettings())
+			if err != nil || !reflect.DeepEqual(inventory.PartitionFields, tc.want) {
+				t.Fatalf("partition fields=%v, want %v, error=%v", inventory.PartitionFields, tc.want, err)
+			}
+		})
+	}
+}
 
 type maintenanceWorkerJobStoreStub struct {
 	jobs []meta.PersistedJob

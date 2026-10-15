@@ -58,6 +58,12 @@ The historical `native_enabled` rollout flag is retired. Rivus removes it while 
 
 The CDC-side `tableMaintenanceMonitor` no longer schedules maintenance. Its compatibility layer only projects durable MySQL worker state into the existing job-details status shape so the UI can keep its inventory panel while MySQL remains the source of truth.
 
+The background inventory pass also revisits inventories older than one hour when no explicit refresh is queued. This includes tables updated by external writers, which do not send Rivus CDC commit signals. It uses the existing limit of one background scan per worker poll; manual and commit-triggered requests retain priority. With thousands of tables, an inventory can remain stale while awaiting its turn. Paused monitors, unmanaged/retired tables, active inventory leases and scheduled retry backoff are respected.
+
+Small-file totals span the whole table, while compaction eligibility is calculated within partitions. A date-partitioned table with one file per date can have hundreds of small files and zero legal compaction groups. Ordinary compaction cannot merge those files across dates; changing the partition layout is a separate table-design operation.
+
+The shared job/monitor inventory panel shows the current partition spec under each table name (`Partitioned · date` or `Unpartitioned`) and keeps the existing file counts and thresholds. The reason column reports planner eligibility separately. Partition information is collected during the inventory scan and stored with its counts; older inventory without that metadata shows `Partitioning pending scan` until refreshed. Table type is never inferred from its name, file count, or maintenance status.
+
 Recommended configuration:
 
 ```yaml

@@ -54,6 +54,7 @@ type IcebergMaintenanceState struct {
 	ActiveCompactableFiles        int        `json:"active_compactable_files"`
 	ActiveCompactableBytes        int64      `json:"active_compactable_bytes"`
 	ActiveCompactionGroups        int        `json:"active_compaction_groups"`
+	PartitionFields               []string   `json:"partition_fields"`
 	NextCompactionCheckAt         *time.Time `json:"next_compaction_check_at,omitempty"`
 	NextExpireCheckAt             *time.Time `json:"next_expire_check_at,omitempty"`
 	NextOrphanCheckAt             *time.Time `json:"next_orphan_check_at,omitempty"`
@@ -287,6 +288,7 @@ func (s *IcebergMaintenanceStore) Init(ctx context.Context) error {
 		  active_compactable_files INT NOT NULL DEFAULT 0,
 		  active_compactable_bytes BIGINT NOT NULL DEFAULT 0,
 		  active_compaction_groups INT NOT NULL DEFAULT 0,
+		  partition_fields_json LONGTEXT NULL,
 		  next_compaction_check_at DATETIME(6) NULL,
 		  next_expire_check_at DATETIME(6) NULL,
 		  next_orphan_check_at DATETIME(6) NULL,
@@ -425,6 +427,9 @@ func (s *IcebergMaintenanceStore) Init(ctx context.Context) error {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "iceberg_maintenance_state", "active_compaction_groups", "INT NOT NULL DEFAULT 0 AFTER active_compactable_bytes"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "iceberg_maintenance_state", "partition_fields_json", "LONGTEXT NULL AFTER active_compaction_groups"); err != nil {
 		return err
 	}
 	if err := s.ensureIndex(ctx, "iceberg_maintenance_tasks", "idx_maintenance_task_owner_status", "(owner_job_id, status, created_at, id)"); err != nil {
@@ -655,7 +660,7 @@ func (s *IcebergMaintenanceStore) DueStates(ctx context.Context, operation strin
 	 snapshot_complete, last_snapshot_id, inventory_snapshot_id, last_inventory_at, last_write_at, new_data_files, new_equality_delete_files,
 	 active_data_files, active_small_files, active_small_bytes, active_equality_delete_files,
 	 active_position_delete_files, applicable_equality_delete_files, applicable_position_delete_files,
-	 active_compactable_files, active_compactable_bytes, active_compaction_groups,
+	 active_compactable_files, active_compactable_bytes, active_compaction_groups, partition_fields_json,
 	 next_compaction_check_at, next_expire_check_at, next_orphan_check_at,
 	 last_compaction_at, last_expire_at, last_orphan_at, inventory_lease_owner, inventory_lease_until, lease_owner, lease_until,
 	 attempt_count, last_error, created_at, updated_at
@@ -687,7 +692,14 @@ func (s *IcebergMaintenanceStore) DueStates(ctx context.Context, operation strin
 // burst for large deployments. Explicit job-detail refresh requests receive a
 // higher priority than the slow first-scan sweep. Within a priority, retry
 // failed scans before an equally large bulk refresh keeps their errors stale.
+// The background pass also revisits expired inventories without an explicit
+// request: after a successful scan FinishInventoryClaim clears the request,
+// and external writers do not emit Rivus commit signals to schedule another.
 func (s *IcebergMaintenanceStore) ClaimPendingInventoryState(ctx context.Context, workerID string, now time.Time, lease time.Duration, minimumPriority int) (*IcebergMaintenanceState, error) {
+	return s.claimPendingInventoryState(ctx, workerID, now, lease, minimumPriority, false)
+}
+
+func (s *IcebergMaintenanceStore) claimPendingInventoryState(ctx context.Context, workerID string, now time.Time, lease time.Duration, minimumPriority int, requireIdleTable bool) (*IcebergMaintenanceState, error) {
 	if lease <= 0 {
 		lease = 15 * time.Minute
 	}
@@ -704,21 +716,26 @@ func (s *IcebergMaintenanceStore) ClaimPendingInventoryState(ctx context.Context
 	 snapshot_complete, last_snapshot_id, inventory_snapshot_id, last_inventory_at, last_write_at, new_data_files, new_equality_delete_files,
 	 active_data_files, active_small_files, active_small_bytes, active_equality_delete_files,
 	 active_position_delete_files, applicable_equality_delete_files, applicable_position_delete_files,
-	 active_compactable_files, active_compactable_bytes, active_compaction_groups,
+	 active_compactable_files, active_compactable_bytes, active_compaction_groups, partition_fields_json,
 	 next_compaction_check_at, next_expire_check_at, next_orphan_check_at,
 	 last_compaction_at, last_expire_at, last_orphan_at, inventory_lease_owner, inventory_lease_until, lease_owner, lease_until,
 	 attempt_count, last_error, created_at, updated_at
 	FROM iceberg_maintenance_state
-	WHERE snapshot_complete=1 AND next_inventory_check_at IS NOT NULL AND next_inventory_check_at <= ?
+	WHERE snapshot_complete=1
+	  AND ((next_inventory_check_at IS NOT NULL AND next_inventory_check_at <= ?)
+	    OR (?=0 AND next_inventory_check_at IS NULL
+	      AND owner_type IN ('job','monitor')
+	      AND (last_inventory_at IS NULL OR last_inventory_at < ?)))
 	  AND inventory_priority >= ?
 	  AND (inventory_lease_until IS NULL OR inventory_lease_until < ?)
+	  AND (?=0 OR lease_until IS NULL OR lease_until < ?)
 	  AND (owner_type <> 'monitor' OR EXISTS (
 	    SELECT 1 FROM iceberg_maintenance_monitors AS monitor
 	    WHERE monitor.monitor_id=SUBSTRING(iceberg_maintenance_state.owner_job_id, 9) AND monitor.status='ACTIVE'
 	  ))
 	ORDER BY inventory_priority DESC, (last_error IS NOT NULL AND last_error<>'') DESC,
-	 next_inventory_check_at ASC, table_key
-	LIMIT 1 FOR UPDATE SKIP LOCKED`, now.UTC(), minimumPriority, now.UTC())
+	 COALESCE(next_inventory_check_at, last_inventory_at, created_at) ASC, table_key
+	LIMIT 1 FOR UPDATE SKIP LOCKED`, now.UTC(), minimumPriority, now.UTC().Add(-MaintenanceInventoryMaxAge), minimumPriority, now.UTC(), requireIdleTable, now.UTC())
 	state, err := scanMaintenanceState(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -730,8 +747,9 @@ func (s *IcebergMaintenanceStore) ClaimPendingInventoryState(ctx context.Context
 	until := now.Add(lease).UTC()
 	res, err := tx.ExecContext(ctx, `UPDATE iceberg_maintenance_state
 	SET inventory_lease_owner=?, inventory_lease_until=?, next_inventory_check_at=?, updated_at=UTC_TIMESTAMP(6)
-	WHERE table_key=? AND next_inventory_check_at IS NOT NULL AND next_inventory_check_at <= ?
-	  AND (inventory_lease_until IS NULL OR inventory_lease_until < ?)`, workerID, until, until, state.TableKey, now.UTC(), now.UTC())
+	WHERE table_key=? AND (next_inventory_check_at IS NULL OR next_inventory_check_at <= ?)
+	  AND (inventory_lease_until IS NULL OR inventory_lease_until < ?)
+	  AND (?=0 OR lease_until IS NULL OR lease_until < ?)`, workerID, until, until, state.TableKey, now.UTC(), now.UTC(), requireIdleTable, now.UTC())
 	if err != nil {
 		return nil, err
 	}
@@ -930,15 +948,24 @@ func (s *IcebergMaintenanceStore) UpdateInventory(
 	equalityDeletes, positionDeletes, applicableEqualityDeletes, applicablePositionDeletes, compactableFiles int,
 	compactableBytes int64,
 	compactionGroups int,
+	partitionFields ...[]string,
 ) error {
+	var partitionJSON any
+	if len(partitionFields) > 0 && partitionFields[0] != nil {
+		encoded, err := json.Marshal(partitionFields[0])
+		if err != nil {
+			return err
+		}
+		partitionJSON = string(encoded)
+	}
 	_, err := s.db.ExecContext(ctx, `UPDATE iceberg_maintenance_state SET
 	 inventory_snapshot_id=?, last_inventory_at=UTC_TIMESTAMP(6), active_data_files=?, active_small_files=?, active_small_bytes=?,
 	 active_equality_delete_files=?, active_position_delete_files=?,
 	 applicable_equality_delete_files=?, applicable_position_delete_files=?, active_compactable_files=?,
-	 active_compactable_bytes=?, active_compaction_groups=?, last_error=NULL, updated_at=UTC_TIMESTAMP(6)
+	 active_compactable_bytes=?, active_compaction_groups=?, partition_fields_json=?, last_error=NULL, updated_at=UTC_TIMESTAMP(6)
 	WHERE table_key=?`, snapshotID, dataFiles, smallFiles, smallBytes, equalityDeletes, positionDeletes,
 		applicableEqualityDeletes, applicablePositionDeletes,
-		compactableFiles, compactableBytes, compactionGroups, tableKey)
+		compactableFiles, compactableBytes, compactionGroups, partitionJSON, tableKey)
 	return err
 }
 
@@ -981,7 +1008,7 @@ func (s *IcebergMaintenanceStore) MarkInventoryMissing(ctx context.Context, tabl
 	 active_small_files=0, active_small_bytes=0, active_equality_delete_files=0,
 	 active_position_delete_files=0, applicable_equality_delete_files=0, applicable_position_delete_files=0,
 	 active_compactable_files=0, active_compactable_bytes=0,
-	 active_compaction_groups=0, last_error=NULL, updated_at=UTC_TIMESTAMP(6)
+	 active_compaction_groups=0, partition_fields_json=NULL, last_error=NULL, updated_at=UTC_TIMESTAMP(6)
 	WHERE table_key=?`, tableKey)
 	return err
 }
@@ -1354,7 +1381,7 @@ func (s *IcebergMaintenanceStore) GetState(ctx context.Context, tableKey string)
 	 snapshot_complete, last_snapshot_id, inventory_snapshot_id, last_inventory_at, last_write_at, new_data_files, new_equality_delete_files,
 	 active_data_files, active_small_files, active_small_bytes, active_equality_delete_files,
 	 active_position_delete_files, applicable_equality_delete_files, applicable_position_delete_files,
-	 active_compactable_files, active_compactable_bytes, active_compaction_groups,
+	 active_compactable_files, active_compactable_bytes, active_compaction_groups, partition_fields_json,
 	 next_compaction_check_at, next_expire_check_at, next_orphan_check_at,
 	 last_compaction_at, last_expire_at, last_orphan_at, inventory_lease_owner, inventory_lease_until, lease_owner, lease_until,
 	 attempt_count, last_error, created_at, updated_at FROM iceberg_maintenance_state WHERE table_key=?`, tableKey)
@@ -1377,17 +1404,22 @@ func scanMaintenanceState(row rowScanner) (IcebergMaintenanceState, error) {
 	var snapshotComplete int
 	var applicableEqualityDeletes, applicablePositionDeletes sql.NullInt64
 	var lastInventory, lastWrite, nextCompaction, nextExpire, nextOrphan, lastCompaction, lastExpire, lastOrphan, inventoryLeaseUntil, leaseUntil sql.NullTime
-	var inventoryLeaseOwner, leaseOwner, lastError sql.NullString
+	var inventoryLeaseOwner, leaseOwner, lastError, partitionJSON sql.NullString
 	err := row.Scan(&state.TableKey, &state.Catalog, &state.Namespace, &state.Table, &state.OwnerType, &state.OwnerJobID,
 		&snapshotComplete, &state.LastSnapshotID, &state.InventorySnapshotID, &lastInventory, &lastWrite, &state.NewDataFiles, &state.NewEqualityDeleteFiles,
 		&state.ActiveDataFiles, &state.ActiveSmallFiles, &state.ActiveSmallBytes, &state.ActiveEqualityDeleteFiles,
 		&state.ActivePositionDeleteFiles, &applicableEqualityDeletes, &applicablePositionDeletes,
-		&state.ActiveCompactableFiles, &state.ActiveCompactableBytes, &state.ActiveCompactionGroups,
+		&state.ActiveCompactableFiles, &state.ActiveCompactableBytes, &state.ActiveCompactionGroups, &partitionJSON,
 		&nextCompaction, &nextExpire, &nextOrphan,
 		&lastCompaction, &lastExpire, &lastOrphan, &inventoryLeaseOwner, &inventoryLeaseUntil, &leaseOwner, &leaseUntil,
 		&state.AttemptCount, &lastError, &state.CreatedAt, &state.UpdatedAt)
 	if err != nil {
 		return state, err
+	}
+	if partitionJSON.Valid {
+		if err := json.Unmarshal([]byte(partitionJSON.String), &state.PartitionFields); err != nil {
+			return state, fmt.Errorf("decode partition fields for %s: %w", state.TableKey, err)
+		}
 	}
 	state.SnapshotComplete = snapshotComplete != 0
 	if applicableEqualityDeletes.Valid {

@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -55,64 +54,7 @@ func (s *IcebergMaintenanceStore) ClaimPendingInventoryStateForMaintenance(
 	lease time.Duration,
 	minimumPriority int,
 ) (*IcebergMaintenanceState, error) {
-	if lease <= 0 {
-		lease = 15 * time.Minute
-	}
-	if minimumPriority < 0 {
-		minimumPriority = 0
-	}
-
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
-	row := tx.QueryRowContext(ctx, `SELECT table_key, catalog, namespace_name, table_name, owner_type, owner_job_id,
-	 snapshot_complete, last_snapshot_id, inventory_snapshot_id, last_inventory_at, last_write_at, new_data_files, new_equality_delete_files,
-	 active_data_files, active_small_files, active_small_bytes, active_equality_delete_files,
-	 active_position_delete_files, applicable_equality_delete_files, applicable_position_delete_files,
-	 active_compactable_files, active_compactable_bytes, active_compaction_groups,
-	 next_compaction_check_at, next_expire_check_at, next_orphan_check_at,
-	 last_compaction_at, last_expire_at, last_orphan_at, inventory_lease_owner, inventory_lease_until, lease_owner, lease_until,
-	 attempt_count, last_error, created_at, updated_at
-	FROM iceberg_maintenance_state
-	WHERE snapshot_complete=1 AND next_inventory_check_at IS NOT NULL AND next_inventory_check_at <= ?
-	  AND inventory_priority >= ?
-	  AND (inventory_lease_until IS NULL OR inventory_lease_until < ?)
-	  AND (lease_until IS NULL OR lease_until < ?)
-	  AND (owner_type <> 'monitor' OR EXISTS (
-	    SELECT 1 FROM iceberg_maintenance_monitors AS monitor
-	    WHERE monitor.monitor_id=SUBSTRING(iceberg_maintenance_state.owner_job_id, 9) AND monitor.status='ACTIVE'
-	  ))
-	ORDER BY inventory_priority DESC, (last_error IS NOT NULL AND last_error<>'') DESC,
-	 next_inventory_check_at ASC, table_key
-	LIMIT 1 FOR UPDATE SKIP LOCKED`, now.UTC(), minimumPriority, now.UTC(), now.UTC())
-	state, err := scanMaintenanceState(row)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	until := now.Add(lease).UTC()
-	res, err := tx.ExecContext(ctx, `UPDATE iceberg_maintenance_state
-	SET inventory_lease_owner=?, inventory_lease_until=?, next_inventory_check_at=?, updated_at=UTC_TIMESTAMP(6)
-	WHERE table_key=? AND next_inventory_check_at IS NOT NULL AND next_inventory_check_at <= ?
-	  AND (inventory_lease_until IS NULL OR inventory_lease_until < ?)
-	  AND (lease_until IS NULL OR lease_until < ?)`,
-		workerID, until, until, state.TableKey, now.UTC(), now.UTC(), now.UTC())
-	if err != nil {
-		return nil, err
-	}
-	if n, _ := res.RowsAffected(); n != 1 {
-		return nil, fmt.Errorf("inventory state %s was lost while claiming", state.TableKey)
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	return &state, nil
+	return s.claimPendingInventoryState(ctx, workerID, now, lease, minimumPriority, true)
 }
 
 // ClaimTasksForOperation claims only one maintenance operation. It also takes

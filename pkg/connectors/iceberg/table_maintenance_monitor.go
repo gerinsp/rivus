@@ -258,6 +258,7 @@ func (m *tableMaintenanceMonitor) publishDurableStatus(parent context.Context, s
 			CompactableFiles:              state.ActiveCompactableFiles,
 			CompactableBytes:              state.ActiveCompactableBytes,
 			CompactionGroups:              state.ActiveCompactionGroups,
+			PartitionFields:               state.PartitionFields,
 			NewDataFiles:                  state.NewDataFiles,
 			NewEqualityDeleteFiles:        state.NewEqualityDeleteFiles,
 			CheckedAt:                     checkedAt,

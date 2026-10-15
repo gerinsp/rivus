@@ -129,6 +129,7 @@ type TableMaintenanceTableStatus struct {
 	CompactableFiles              int      `json:"compactable_files"`
 	CompactableBytes              int64    `json:"compactable_bytes"`
 	CompactionGroups              int      `json:"compaction_groups"`
+	PartitionFields               []string `json:"partition_fields"`
 	NewDataFiles                  int      `json:"new_data_files"`
 	NewEqualityDeleteFiles        int      `json:"new_equality_delete_files"`
 	CheckedAt                     string   `json:"checked_at,omitempty"`
