@@ -74,15 +74,13 @@ func (s *Sink) scopedSnapshotReplacementKeys(ctx context.Context, state *tableSt
 	if !filtered && !s.scopedLegacyMerges[state.sourceKey] {
 		return nil, nil
 	}
-	// Unpartitioned equality deletes apply globally. Write incoming keys directly
-	// with the append; no target scan is needed, including partial v1 recovery.
-	before := rows
-	if !state.table.Spec().IsUnpartitioned() {
-		var err error
-		before, err = s.scopedSnapshotBeforeImages(ctx, state, rows)
-		if err != nil {
-			return nil, err
-		}
+	// The confirmed scope DELETE already removed most incoming keys. Only
+	// replace keys still visible in the target (outside-scope rows or a partial
+	// legacy MERGE), including on unpartitioned tables. Writing every incoming
+	// key would leave redundant equality deletes for readers to apply.
+	before, err := s.scopedSnapshotBeforeImages(ctx, state, rows)
+	if err != nil {
+		return nil, err
 	}
 	if len(before) == 0 {
 		return nil, nil

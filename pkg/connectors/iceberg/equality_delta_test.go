@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/parquet/compress"
+	"github.com/apache/arrow-go/v18/parquet/file"
 	iceberglib "github.com/apache/iceberg-go"
 	iceio "github.com/apache/iceberg-go/io"
 	icetable "github.com/apache/iceberg-go/table"
@@ -27,6 +29,61 @@ type equalityDeltaTestCatalog struct {
 	failCommitAt              int
 	failResponseAfterCommitAt int
 	onConflict                func(*equalityDeltaTestCatalog)
+}
+
+func TestEqualityDeleteFilesHonorTableCompression(t *testing.T) {
+	keys := make([]map[string]interface{}, 50000)
+	for i := range keys {
+		keys[i] = map[string]interface{}{"id": int64(i)}
+	}
+	sizes := map[string]int64{}
+	for _, tc := range []struct {
+		name  string
+		codec compress.Compression
+	}{
+		{"default", compress.Codecs.Zstd},
+		{"snappy", compress.Codecs.Snappy},
+		{"gzip", compress.Codecs.Gzip},
+		{"lz4raw", compress.Codecs.Lz4Raw},
+		{"uncompressed", compress.Codecs.Uncompressed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			tbl, _ := newEqualityDeltaTestTable(t)
+			if tc.name != "default" {
+				tx := tbl.NewTransaction()
+				if err := tx.SetProperties(iceberglib.Properties{icetable.ParquetCompressionKey: tc.name}); err != nil {
+					t.Fatal(err)
+				}
+				var err error
+				tbl, err = tx.Commit(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			out, err := writeEqualityDeleteFile(ctx, tbl, iceio.LocalFS{}, keys, []string{"id"}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			reader, err := file.OpenParquetFile(out.FilePath(), false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reader.Close()
+			column, err := reader.MetaData().RowGroup(0).ColumnChunk(0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if column.Compression() != tc.codec || reader.NumRows() != int64(len(keys)) || out.Count() != int64(len(keys)) {
+				t.Fatalf("codec=%v rows=%d manifest rows=%d", column.Compression(), reader.NumRows(), out.Count())
+			}
+			sizes[tc.name] = out.FileSizeBytes()
+		})
+	}
+	if sizes["default"] >= sizes["uncompressed"] {
+		t.Fatalf("default compression did not reduce equality delete size: %v", sizes)
+	}
+	t.Logf("50,000 int64 keys, file bytes by codec: %v", sizes)
 }
 
 func (c *equalityDeltaTestCatalog) LoadTable(_ context.Context, ident icetable.Identifier) (*icetable.Table, error) {

@@ -2,11 +2,14 @@ package iceberg
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	icetable "github.com/apache/iceberg-go/table"
@@ -41,17 +44,20 @@ func TestScopedNativeBulkReleasesPayloadWithoutEarlyAcknowledgement(t *testing.T
 				s.cfg.SnapshotSpoolDirectory = t.TempDir()
 				if filtered {
 					s.cfg.SnapshotReplaceFilters = map[string]config.IcebergSnapshotReplaceFilterConfig{"app.orders": {Column: "id", Op: ">=", Value: "1"}}
+					s.cfg.TrinoDelete.Catalog = "fixture"
+					server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						io.WriteString(w, `{"id":"lookup","data":[]}`)
+					}))
+					defer server.Close()
+					s.cfg.TrinoDelete.URI = server.URL
 				}
 				state := s.states["app.orders"]
 				state.snapshotReplaceApplied, state.snapshotTruncateApplied = true, true
 				rows := []map[string]interface{}{{"id": int64(1), "status": strings.Repeat("payload", 10000)}, {"id": int64(2), "status": "second"}}
 				if filtered {
 					batch, err := s.scopedSnapshotReplacementKeys(ctx, state, rows)
-					if err != nil || batch == nil || len(batch.deleteKeys) != 2 {
-						t.Fatalf("replacement keys: %v", err)
-					}
-					if len(batch.deleteRows) != 0 {
-						t.Error("unpartitioned equality deletes retain full source rows")
+					if err != nil || batch != nil {
+						t.Fatalf("cleared target must append without equality deletes: batch=%+v error=%v", batch, err)
 					}
 				}
 				ack := make(chan error, 1)
@@ -265,18 +271,47 @@ func TestScopedNativeProtocolRemainsFencedAndNonRolling(t *testing.T) {
 	}
 }
 
-func TestScopedNativeUnpartitionedBulkAvoidsTargetReadsAndCommitsOnce(t *testing.T) {
+func TestScopedNativeUnpartitionedDeletesOnlySurvivingKeys(t *testing.T) {
+	for _, bulk := range []bool{false, true} {
+		for _, scenario := range []string{"cleared", "survivor", "legacy"} {
+			t.Run(fmt.Sprintf("bulk_%t_%s", bulk, scenario), func(t *testing.T) {
+				testScopedNativeUnpartitionedSurvivingKeys(t, bulk, scenario)
+			})
+		}
+	}
+}
+
+func testScopedNativeUnpartitionedSurvivingKeys(t *testing.T, bulk bool, scenario string) {
+	t.Helper()
 	ctx := context.Background()
 	cat := recoveryCatalog(t)
 	store := &automaticStore{guardTestStore: newGuardTestStore()}
 	s := automaticSink(t, cat, store)
 	s.scopedRebuildToken, s.scopedNativeWrites = "epoch", true
-	s.cfg.SnapshotBatchSize, s.cfg.MaxBatchBytes = 1, 1024
+	s.cfg.SnapshotBatchSize = 100
+	if bulk {
+		s.cfg.SnapshotBatchSize = 1
+	}
 	s.cfg.SnapshotSpoolDirectory = t.TempDir()
-	s.cfg.SnapshotReplaceFilters = map[string]config.IcebergSnapshotReplaceFilterConfig{"app.orders": {Column: "id", Op: ">=", Value: "1"}}
+	s.cfg.TrinoDelete.Catalog = "fixture"
+	if scenario == "legacy" {
+		s.scopedLegacyMerges = map[string]bool{"app.orders": true}
+	} else {
+		s.cfg.SnapshotReplaceFilters = map[string]config.IcebergSnapshotReplaceFilterConfig{"app.orders": {Column: "id", Op: ">=", Value: "1"}}
+	}
 	state := s.states["app.orders"]
 	state.snapshotReplaceApplied, state.snapshotTruncateApplied = true, true
-	seed, release, err := buildRecordReader(state.table.Schema(), []map[string]interface{}{{"id": int64(1), "status": "old"}})
+	// Key 9 is retained outside this source batch. Key 1 survives only in the
+	// replacement cases; all other incoming keys have already been cleared.
+	seedRows := []map[string]interface{}{{"id": int64(9), "status": "retained"}}
+	wantDeletes := int64(0)
+	lookupData := [][]int64{}
+	if scenario != "cleared" {
+		seedRows = append(seedRows, map[string]interface{}{"id": int64(1), "status": "old"})
+		lookupData = append(lookupData, []int64{1})
+		wantDeletes = 1
+	}
+	seed, release, err := buildRecordReader(state.table.Schema(), seedRows)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -285,9 +320,14 @@ func TestScopedNativeUnpartitionedBulkAvoidsTargetReadsAndCommitsOnce(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
+	var reads atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Error("unpartitioned bulk snapshot scanned target")
-		w.WriteHeader(500)
+		query, _ := io.ReadAll(r.Body)
+		if r.Method != http.MethodPost || string(query) != `SELECT "id" FROM "fixture"."bronze"."orders" WHERE "id" IN (CAST(1 AS BIGINT),CAST(2 AS BIGINT),CAST(3 AS BIGINT))` {
+			t.Errorf("unexpected key lookup: %s %s", r.Method, query)
+		}
+		reads.Add(1)
+		json.NewEncoder(w).Encode(map[string]interface{}{"id": "lookup", "data": lookupData})
 	}))
 	defer server.Close()
 	s.cfg.TrinoDelete.URI = server.URL
@@ -311,7 +351,48 @@ func TestScopedNativeUnpartitionedBulkAvoidsTargetReadsAndCommitsOnce(t *testing
 	if native != 1 || store.saveCount != 0 {
 		t.Fatalf("native commits=%d checkpoint saves=%d", native, store.saveCount)
 	}
-	assertAutomaticData(t, cat, 3, 2)
+	assertAutomaticData(t, cat, 4, 2)
+	if reads.Load() != 1 {
+		t.Fatalf("key lookups=%d, want one per source span", reads.Load())
+	}
+	tbl, err := cat.LoadTable(ctx, icetable.Identifier{"bronze", "orders"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tasks, err := tbl.Scan().PlanFiles(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleteRecords := int64(0)
+	seen := map[string]bool{}
+	for _, task := range tasks {
+		for _, file := range task.EqualityDeleteFiles {
+			if !seen[file.FilePath()] {
+				seen[file.FilePath()] = true
+				deleteRecords += file.Count()
+			}
+		}
+	}
+	if deleteRecords != wantDeletes {
+		t.Fatalf("equality delete records=%d, want only %d surviving keys", deleteRecords, wantDeletes)
+	}
+	_, records, err := tbl.Scan().ToArrowRecords(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	visible := map[int64]string{}
+	for record, err := range records {
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, row := range arrowRecordBatchRows(record) {
+			visible[row["id"].(int64)] = row["status"].(string)
+		}
+		record.Release()
+	}
+	if len(visible) != 4 || visible[1] != "updated" || visible[2] != "new" || visible[3] != "new" || visible[9] != "retained" {
+		t.Fatalf("replacement lost rows or kept stale payloads: %v", visible)
+	}
 	restarted := automaticSink(t, cat, store)
 	restarted.scopedRebuildToken, restarted.scopedNativeWrites = "epoch", true
 	restarted.states["app.orders"].snapshotReplaceApplied, restarted.states["app.orders"].snapshotTruncateApplied = true, true
@@ -321,5 +402,63 @@ func TestScopedNativeUnpartitionedBulkAvoidsTargetReadsAndCommitsOnce(t *testing
 	if err := restarted.handleSnapshotBatch(ctx, model.Event{Schema: "app", Table: "orders", Rows: replayRows}); err != nil {
 		t.Fatal(err)
 	}
-	assertAutomaticData(t, cat, 3, 2)
+	assertAutomaticData(t, cat, 4, 2)
+	if reads.Load() != 1 {
+		t.Fatal("replayed accepted range repeated target lookup")
+	}
+}
+
+func TestScopedNativeUnpartitionedLookupFailureDoesNotAppend(t *testing.T) {
+	store := &automaticStore{guardTestStore: newGuardTestStore()}
+	cat := recoveryCatalog(t)
+	s := automaticSink(t, cat, store)
+	s.scopedRebuildToken, s.scopedNativeWrites = "epoch", true
+	s.cfg.TrinoDelete.Catalog = "fixture"
+	s.cfg.SnapshotReplaceFilters = map[string]config.IcebergSnapshotReplaceFilterConfig{"app.orders": {Column: "id", Op: ">=", Value: "1"}}
+	state := s.states["app.orders"]
+	state.snapshotReplaceApplied, state.snapshotTruncateApplied = true, true
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	s.cfg.TrinoDelete.URI = server.URL
+	ack := make(chan error, 1)
+	if err := s.handleSnapshotBatch(context.Background(), model.Event{Schema: "app", Table: "orders", Rows: []map[string]interface{}{{"id": int64(1), "status": "new"}}, Ack: ack}); err == nil {
+		t.Fatal("failed target lookup admitted append")
+	}
+	if <-ack == nil || len(store.intents) != 0 || store.saveCount != 0 || store.snapshotProgress != nil {
+		t.Fatal("failed lookup acknowledged, committed or checkpointed source data")
+	}
+	assertAutomaticData(t, cat, 0, 0)
+}
+
+func TestSnapshotResetAppendPathsDoNotWriteEqualityDeletes(t *testing.T) {
+	for _, scenario := range []string{"regular-full-reset", "regular-date-reset", "scoped-full-reset"} {
+		t.Run(scenario, func(t *testing.T) {
+			ctx := context.Background()
+			cat := recoveryCatalog(t)
+			store := &automaticStore{guardTestStore: newGuardTestStore()}
+			s := automaticSink(t, cat, store)
+			s.cfg.SnapshotWriteMode = snapshotWriteModeAuto
+			s.cfg.SnapshotTruncateTables = []string{"app.*"}
+			s.cfg.SnapshotTruncateAllowPatterns = true
+			if scenario == "regular-date-reset" {
+				s.cfg.SnapshotReplaceFilters = map[string]config.IcebergSnapshotReplaceFilterConfig{"app.orders": {Column: "id", Op: ">=", Value: "1"}}
+			}
+			if scenario == "scoped-full-reset" {
+				s.scopedRebuildToken, s.scopedNativeWrites = "epoch", true
+			}
+			state := s.states["app.orders"]
+			// Simulate the confirmed reset, before its replacement rows arrive.
+			state.snapshotReplaceApplied, state.snapshotTruncateApplied = true, true
+			if err := s.handleSnapshotBatch(ctx, model.Event{Schema: "app", Table: "orders", Rows: []map[string]interface{}{{"id": int64(1), "status": "new"}, {"id": int64(2), "status": "new"}}}); err != nil {
+				t.Fatal(err)
+			}
+			assertAutomaticData(t, cat, 2, 1)
+			inventory, err := scanActiveFileInventory(ctx, state.table, defaultNativeMaintenanceSettings())
+			if err != nil || inventory.EqualityDeletes != 0 || inventory.PositionDeletes != 0 {
+				t.Fatalf("reset-then-append introduced delete files: %+v error=%v", inventory, err)
+			}
+		})
+	}
 }

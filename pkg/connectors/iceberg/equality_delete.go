@@ -15,6 +15,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/arrow-go/v18/parquet"
+	"github.com/apache/arrow-go/v18/parquet/compress"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	iceberglib "github.com/apache/iceberg-go"
 	iceio "github.com/apache/iceberg-go/io"
@@ -420,6 +421,23 @@ func stableStringMapKey(m map[string]interface{}) string {
 }
 
 func writeEqualityDeleteFile(ctx context.Context, tbl *icetable.Table, fs iceio.WriteFileIO, keys []map[string]interface{}, pkCols []string, partitionData map[int]any) (iceberglib.DataFile, error) {
+	props := tbl.Properties()
+	codecName := props.Get(icetable.ParquetCompressionKey, icetable.ParquetCompressionDefault)
+	codecText := strings.ToUpper(codecName)
+	if codecText == "LZ4RAW" {
+		codecText = "LZ4_RAW"
+	}
+	var codec compress.Compression
+	if err := codec.UnmarshalText([]byte(codecText)); err != nil {
+		return nil, fmt.Errorf("equality delete compression %q: %w", codecName, err)
+	}
+	if _, err := compress.GetCodec(codec); err != nil {
+		return nil, fmt.Errorf("equality delete compression %q: %w", codecName, err)
+	}
+	// Arrow defaults to uncompressed. Match the table's native data writer,
+	// including its ZSTD default, instead of silently ignoring compression.
+	writerProps := parquet.NewWriterProperties(parquet.WithStats(true), parquet.WithCompression(codec),
+		parquet.WithCompressionLevel(props.GetInt(icetable.ParquetCompressionLevelKey, icetable.ParquetCompressionLevelDefault)))
 	deleteSchema, equalityFieldIDs, err := equalityDeleteSchema(tbl.Schema(), pkCols)
 	if err != nil {
 		return nil, err
@@ -451,7 +469,7 @@ func writeEqualityDeleteFile(ctx context.Context, tbl *icetable.Table, fs iceio.
 		}
 	}()
 	counter := &countingWriteCloser{w: out}
-	if err := pqarrow.WriteTable(arrowTable, counter, arrowTable.NumRows(), parquet.NewWriterProperties(parquet.WithStats(true)), pqarrow.DefaultWriterProps()); err != nil {
+	if err := pqarrow.WriteTable(arrowTable, counter, arrowTable.NumRows(), writerProps, pqarrow.DefaultWriterProps()); err != nil {
 		_ = counter.Close()
 		return nil, err
 	}
