@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"time"
 
@@ -485,6 +486,10 @@ func addCompactableInventory(inventory *activeFileInventory, tasks []icetable.Fi
 	cfg.MaxFileSizeBytes = maxInt64(settings.TargetFileSizeBytes*9/5, settings.SmallFileSizeBytes+1)
 	cfg.MinInputFiles = uint(settings.MinSmallFiles)
 	cfg.DeleteFileThreshold = 1
+	tasks, err := wholeFileCompactionTasks(tasks)
+	if err != nil {
+		return err
+	}
 	plan, err := cfg.PlanCompaction(tasks)
 	if err != nil {
 		return fmt.Errorf("plan compactable inventory: %w", err)
@@ -656,7 +661,7 @@ func executeHybridCompaction(
 	cfg.DeleteFileThreshold = 1
 	cfg.PreserveDeadEqualityDeletes = false
 
-	plan, err := compaction.Analyze(nativeCtx, tbl, cfg)
+	plan, err := analyzeWholeFileCompaction(nativeCtx, tbl, cfg)
 	if err != nil {
 		result.Error = fmt.Sprintf("analyze compaction: %v", err)
 		return nativeTaskOutcome{Result: result, Retryable: true}
@@ -702,6 +707,16 @@ func executeHybridCompaction(
 	routeSpark, reason := shouldRouteCompactionToSpark(work, state, settings)
 	eligible := triggers.Any() || projectedGrowthTrigger
 	coordinateAfterConflict := shouldCoordinateSparkCompaction(task)
+	if eligible && settings.Executor != maintenanceExecutorNative && nativeParquetLimitError(task.LastError) {
+		nativeCancel()
+		result.Engine = "spark"
+		result.RoutingReason = "previous native rewrite exceeded Parquet reader page-size limit"
+		out := executeSparkCompactionFallback(ctx, jobID, jobCfg, iceCfg, state, task, result, settings, work, hasDeleteWork(work, state))
+		if out.Result.Error != "" {
+			out.Result.Error = "native Parquet reader page-size limit; " + out.Result.Error
+		}
+		return out
+	}
 	if eligible && coordinateAfterConflict && settings.Executor != maintenanceExecutorNative {
 		nativeCancel()
 		result.Engine = "spark"
@@ -799,6 +814,17 @@ func executeHybridCompaction(
 		},
 	})
 	if err != nil {
+		if settings.Executor == maintenanceExecutorHybrid && nativeParquetLimitError(err.Error()) {
+			nativeCancel()
+			result.Engine = "spark"
+			result.RoutingReason = "native Parquet reader page-size limit; delegating to Spark"
+			result.Details["native_fallback_error"] = err.Error()
+			out := executeSparkCompactionFallback(ctx, jobID, jobCfg, iceCfg, state, task, result, settings, work, hasDeleteWork(work, state))
+			if out.Result.Error != "" {
+				out.Result.Error = fmt.Sprintf("native rewrite: %v; %s", err, out.Result.Error)
+			}
+			return out
+		}
 		result.Error = fmt.Sprintf("rewrite data files: %v", err)
 		return nativeTaskOutcome{Result: result, Retryable: true}
 	}
@@ -830,6 +856,55 @@ func executeHybridCompaction(
 		result.Details["committed_snapshot_id"] = committed.CurrentSnapshot().SnapshotID
 	}
 	return nativeTaskOutcome{Result: result}
+}
+
+func nativeParquetLimitError(message string) bool {
+	message = strings.ToLower(message)
+	if strings.Contains(message, "native parquet reader page-size limit") {
+		return true
+	}
+	return strings.Contains(message, "parquet:") && strings.Contains(message, "exceeds configured limit") &&
+		(strings.Contains(message, "compressed page size") || strings.Contains(message, "uncompressed page size"))
+}
+
+func analyzeWholeFileCompaction(ctx context.Context, tbl *icetable.Table, cfg compaction.Config) (compaction.Plan, error) {
+	tasks, err := tbl.Scan().PlanFiles(ctx)
+	if err != nil {
+		return compaction.Plan{}, err
+	}
+	tasks, err = wholeFileCompactionTasks(tasks)
+	if err != nil {
+		return compaction.Plan{}, err
+	}
+	return cfg.PlanCompaction(tasks)
+}
+
+// Scan planning can return multiple row-group ranges for one file. A rewrite
+// replaces whole data files: passing ranges separately can duplicate removals,
+// inflate workload counts, or split a file's output across different commits.
+// This helper is only for unfiltered, whole-table maintenance planning.
+func wholeFileCompactionTasks(tasks []icetable.FileScanTask) ([]icetable.FileScanTask, error) {
+	result := make([]icetable.FileScanTask, 0, len(tasks))
+	seen := make(map[string]int, len(tasks))
+	for _, task := range tasks {
+		if task.File == nil || task.File.FilePath() == "" {
+			return nil, fmt.Errorf("compaction task has no data file path")
+		}
+		if task.Residual != nil && !task.Residual.Equals(iceberglib.AlwaysTrue{}) {
+			return nil, fmt.Errorf("whole-file compaction requires unfiltered scan tasks")
+		}
+		task.Start, task.Length = 0, task.File.FileSizeBytes()
+		path := task.File.FilePath()
+		if index, ok := seen[path]; ok {
+			if !reflect.DeepEqual(result[index], task) {
+				return nil, fmt.Errorf("inconsistent compaction scan tasks for data file %q", path)
+			}
+			continue
+		}
+		seen[path] = len(result)
+		result = append(result, task)
+	}
+	return result, nil
 }
 
 // A table-wide delete count can remain high even when none of those delete

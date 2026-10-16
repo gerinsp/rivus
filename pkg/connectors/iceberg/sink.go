@@ -23,6 +23,7 @@ import (
 	iceberglib "github.com/apache/iceberg-go"
 	icecatalog "github.com/apache/iceberg-go/catalog"
 	icerest "github.com/apache/iceberg-go/catalog/rest"
+	iceio "github.com/apache/iceberg-go/io"
 	_ "github.com/apache/iceberg-go/io/gocloud"
 	icetable "github.com/apache/iceberg-go/table"
 
@@ -830,6 +831,11 @@ func catalogS3Properties(cfg config.IcebergConfig) (iceberglib.Properties, error
 	if endpoint := firstNonEmpty(cfg.S3Endpoint, os.Getenv("ICEBERG_S3_ENDPOINT"), os.Getenv("AWS_S3_ENDPOINT"), os.Getenv("AWS_ENDPOINT_URL_S3")); endpoint != "" {
 		props["s3.endpoint"] = endpoint
 	}
+	compat, err := catalogS3CompatMode(cfg)
+	if err != nil {
+		return nil, err
+	}
+	props[iceio.S3CompatMode] = strconv.FormatBool(compat)
 
 	if pathStyle := firstNonEmpty(cfg.S3PathStyle, os.Getenv("ICEBERG_S3_PATH_STYLE"), os.Getenv("AWS_S3_PATH_STYLE")); pathStyle != "" {
 		enabled, err := parseBoolEnvValue("iceberg s3_path_style", pathStyle)
@@ -848,6 +854,29 @@ func catalogS3Properties(cfg config.IcebergConfig) (iceberglib.Properties, error
 	}
 
 	return props, nil
+}
+
+// Custom object stores may reject the AWS SDK's checksum trailers and
+// aws-chunked framing. Keep AWS defaults on AWS endpoints and allow an explicit
+// override for compatible stores or AWS endpoints behind a custom DNS name.
+func catalogS3CompatMode(cfg config.IcebergConfig) (bool, error) {
+	if raw := firstNonEmpty(cfg.S3CompatMode, os.Getenv("ICEBERG_S3_COMPAT_MODE")); raw != "" {
+		return parseBoolEnvValue("iceberg s3_compat_mode", raw)
+	}
+	endpoint := firstNonEmpty(cfg.S3Endpoint, os.Getenv("ICEBERG_S3_ENDPOINT"), os.Getenv("AWS_S3_ENDPOINT"), os.Getenv("AWS_ENDPOINT_URL_S3"))
+	if endpoint == "" {
+		return false, nil
+	}
+	if !strings.Contains(endpoint, "://") {
+		endpoint = "https://" + endpoint
+	}
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Hostname() == "" {
+		return false, fmt.Errorf("invalid iceberg S3 endpoint")
+	}
+	host := strings.TrimSuffix(strings.ToLower(parsed.Hostname()), ".")
+	return host != "amazonaws.com" && !strings.HasSuffix(host, ".amazonaws.com") &&
+		host != "amazonaws.com.cn" && !strings.HasSuffix(host, ".amazonaws.com.cn"), nil
 }
 
 func catalogRESTHeaders(cfg config.IcebergConfig) map[string]string {

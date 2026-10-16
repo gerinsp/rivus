@@ -203,7 +203,7 @@ Rivus runs the `iceberg-go` compaction planner and bases routing on selected rew
 - more than 250 selected input files (data plus delete files) are involved;
 - more than 100 equality-delete files are involved.
 
-Otherwise the rewrite runs natively. Position-delete files make a table
+Otherwise the rewrite runs natively. A recognized native Parquet compressed/uncompressed page-size limit delegates the rewrite to Spark in hybrid mode, including subsequent retries. Other native failures keep the normal retry policy. Position-delete files make a table
 eligible after `position_delete_files_threshold` is reached, but do not by
 themselves force a small rewrite to Spark. It also becomes eligible when the
 current snapshot has 200 active small files, 50 active equality-delete files,
@@ -225,6 +225,45 @@ sent to the configured Spark/runner backend. Snapshot expiration and orphan
 cleanup are still performed natively by the maintenance worker.
 
 Native compaction uses atomic `RewriteDataFiles`, applies equality deletes while reading, and uses Iceberg dead-equality-delete cleanup before removing equality-delete files. Sort/Z-order and other Spark-specific rewrite strategies remain Spark-only.
+
+## S3-compatible uploads and whole-file rewrites
+
+Rivus native FileIO defaults `s3.compat-mode=true` when the configured S3
+endpoint is outside `amazonaws.com` / `amazonaws.com.cn`. This avoids AWS
+checksum trailers and `aws-chunked` object-write framing that some compatible
+stores reject with `Chunk_Size_Exceeded_Max_Object_Size`. Native compatibility
+mode omits object-write checksum headers; use HTTPS for transport protection.
+Required checksums on operations such as bulk deletion remain handled by the SDK.
+Set sink `s3_compat_mode: "false"` or `ICEBERG_S3_COMPAT_MODE=false` to retain
+normal SDK behavior. An explicit sink value takes precedence over the environment.
+No endpoint / AWS endpoints retain the AWS defaults unless explicitly enabled.
+
+The runner-app compatibility patch and image upgrade are separate from this
+Rivus change. That patch uses the same `ICEBERG_S3_COMPAT_MODE` environment
+contract so its SQL and Python runners disable
+Iceberg chunked encoding and enable MD5-compatible checksums. `spark-submit`
+sets `aws.requestChecksumCalculation=WHEN_REQUIRED` for both the driver and
+executors before JVM startup. The direct Spark backend applies the same policy
+from Rivus configuration. Native and Spark clients are independent; upgrading
+only one image does not update the other upload path. A Rivus-only rollout
+continues to delegate Spark jobs to the existing runner-app version.
+
+Compaction planning collapses row-group scan ranges to one full-file task per
+physical path **before** grouping and resource sizing. Associated deletes and
+row-lineage metadata are preserved; conflicting task metadata fails closed.
+This prevents duplicate data-file removals at `ReplaceFiles` without dropping
+ranges or rewriting the same rows twice. Inventory uses the same normalization.
+
+The native Parquet page-size guard is unchanged. A recognized page-size limit
+routes hybrid compaction to Spark; `executor: native` retains the error and
+never delegates. A successful Spark retry still depends on readable source
+files and working storage. This fallback does not treat corrupt Parquet or
+arbitrary upload errors as successful maintenance.
+
+The separate runner-app patch retains up to eight exception/cause headers independently
+of the rolling stderr tail, so S3 error codes and request IDs can survive later
+stack frames and Spark shutdown logs. Full per-line logs remain available in
+the runner job log store.
 
 ## CDC priority and snapshot barrier
 

@@ -610,6 +610,18 @@ func sparkMaintenanceProperties(jobID, jobName string, iceCfg config.IcebergConf
 		properties[prefix+".io-impl"] = "org.apache.iceberg.aws.s3.S3FileIO"
 	}
 	setProperty(properties, prefix+".s3.endpoint", endpoint)
+	compat, err := catalogS3CompatMode(iceCfg)
+	if err != nil {
+		return nil, err
+	}
+	if compat {
+		properties[prefix+".s3.chunked-encoding-enabled"] = "false"
+		properties[prefix+".s3.checksum-enabled"] = "true"
+		properties[prefix+".client.legacy-md5-plugin-enabled"] = "true"
+		for _, key := range []string{"spark.driver.extraJavaOptions", "spark.executor.extraJavaOptions"} {
+			properties[key] = "-Daws.requestChecksumCalculation=WHEN_REQUIRED"
+		}
+	}
 	setProperty(properties, prefix+".s3.region", firstNonEmpty(iceCfg.S3Region, os.Getenv("ICEBERG_S3_REGION"), os.Getenv("AWS_REGION"), os.Getenv("AWS_DEFAULT_REGION")))
 	setProperty(properties, prefix+".s3.access-key-id", accessKey)
 	setProperty(properties, prefix+".s3.secret-access-key", secretKey)
@@ -625,6 +637,10 @@ func sparkMaintenanceProperties(jobID, jobName string, iceCfg config.IcebergConf
 	for key, value := range maintenanceCfg.SparkProperties {
 		key = strings.TrimSpace(key)
 		if key != "" {
+			if compat && (key == "spark.driver.extraJavaOptions" || key == "spark.executor.extraJavaOptions") &&
+				!strings.Contains(value, "-Daws.requestChecksumCalculation=") {
+				value = strings.TrimSpace(value + " " + properties[key])
+			}
 			properties[key] = value
 		}
 	}

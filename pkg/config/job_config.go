@@ -214,6 +214,7 @@ type IcebergConfig struct {
 	S3Endpoint                    string                                        `yaml:"s3_endpoint" json:"s3_endpoint"`
 	S3Region                      string                                        `yaml:"s3_region" json:"s3_region"`
 	S3PathStyle                   string                                        `yaml:"s3_path_style" json:"s3_path_style"`
+	S3CompatMode                  string                                        `yaml:"s3_compat_mode" json:"s3_compat_mode"`
 	TLSInsecureSkipVerify         bool                                          `yaml:"tls_insecure_skip_verify" json:"tls_insecure_skip_verify"`
 	DefaultNamespace              string                                        `yaml:"default_namespace" json:"default_namespace"`
 	Overrides                     map[string]IcebergTarget                      `yaml:"overrides" json:"overrides"`
