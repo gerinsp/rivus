@@ -3,6 +3,7 @@ package iceberg
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -168,10 +169,11 @@ func normalizeIcebergConfig(c config.IcebergConfig) config.IcebergConfig {
 			c.TableMaintenance.NativeIdleCheckIntervalSeconds = 7 * 24 * 60 * 60
 		}
 		if c.TableMaintenance.NativeOrphanIntervalSeconds <= 0 {
-			c.TableMaintenance.NativeOrphanIntervalSeconds = 30 * 24 * 60 * 60
+			c.TableMaintenance.NativeOrphanIntervalSeconds = int(durationEnv("RIVUS_MAINTENANCE_NATIVE_ORPHAN_INTERVAL_SECONDS", defaultNativeOrphanInterval).Seconds())
 		}
 		if c.TableMaintenance.NativeOrphanInactiveIntervalSeconds <= 0 {
-			c.TableMaintenance.NativeOrphanInactiveIntervalSeconds = 90 * 24 * 60 * 60
+			inactiveDefault := max(defaultNativeOrphanInactiveInterval, time.Duration(c.TableMaintenance.NativeOrphanIntervalSeconds)*time.Second)
+			c.TableMaintenance.NativeOrphanInactiveIntervalSeconds = int(durationEnv("RIVUS_MAINTENANCE_NATIVE_ORPHAN_INACTIVE_INTERVAL_SECONDS", inactiveDefault).Seconds())
 		}
 		if c.TableMaintenance.NativeMaxSelectedInputBytes <= 0 {
 			c.TableMaintenance.NativeMaxSelectedInputBytes = defaultNativeMaxInputBytes

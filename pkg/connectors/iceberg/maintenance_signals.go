@@ -173,7 +173,8 @@ func (s *nativeMaintenanceSignaler) persistSignal(ctx context.Context, signal na
 	tableIdentity := canonicalMaintenanceTableKey(catalogName, signal.target.Namespace, signal.target.Table)
 	now := time.Now().UTC()
 	due := now.Add(s.signalDelay()).Add(deterministicJitter(tableIdentity+"|signal", s.signalDelay()/5))
-	orphanDue := now.Add(s.orphanInterval()).Add(deterministicJitter(tableIdentity+"|orphan-write", s.orphanInterval()/10))
+	// Orphan cadence belongs to the maintenance worker. Its environment can
+	// differ from the streaming process; only report activity here.
 	updated, err := s.store.CoalesceSignal(
 		ctx,
 		tableIdentity,
@@ -183,7 +184,6 @@ func (s *nativeMaintenanceSignaler) persistSignal(ctx context.Context, signal na
 		signal.snapshotComplete,
 		s.cfg.TableMaintenance.EqualityDeleteFilesThreshold,
 		due,
-		orphanDue,
 	)
 	if err != nil {
 		log.Printf("[iceberg][job %s] native maintenance signal table=%s failed: %v", s.jobID, tableIdentity, err)
@@ -192,13 +192,6 @@ func (s *nativeMaintenanceSignaler) persistSignal(ctx context.Context, signal na
 	if !updated {
 		log.Printf("[iceberg][job %s] native maintenance state not seeded yet table=%s; worker will seed it", s.jobID, tableIdentity)
 	}
-}
-
-func (s *nativeMaintenanceSignaler) orphanInterval() time.Duration {
-	if s == nil || s.cfg.TableMaintenance.NativeOrphanIntervalSeconds <= 0 {
-		return 30 * 24 * time.Hour
-	}
-	return time.Duration(s.cfg.TableMaintenance.NativeOrphanIntervalSeconds) * time.Second
 }
 
 func (s *nativeMaintenanceSignaler) signalDelay() time.Duration {

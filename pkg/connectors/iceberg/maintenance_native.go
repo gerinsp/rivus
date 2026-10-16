@@ -39,7 +39,9 @@ const (
 	defaultPositionDeleteFilesThreshold = 25
 	defaultNativeTimeout                = 10 * time.Minute
 	defaultNativeOrphanAge              = 7 * 24 * time.Hour
-	defaultNativeOrphanInactiveInterval = 90 * 24 * time.Hour
+	defaultNativeOrphanInterval         = 24 * time.Hour
+	defaultNativeOrphanInactiveInterval = 7 * 24 * time.Hour
+	orphanActivityWindow                = 7 * 24 * time.Hour
 	sparkMediumInputBytes               = int64(512 * 1024 * 1024)
 	sparkLargeInputBytes                = int64(2 * 1024 * 1024 * 1024)
 	sparkXLargeInputBytes               = int64(8 * 1024 * 1024 * 1024)
@@ -89,6 +91,7 @@ type nativeTaskOutcome struct {
 
 type activeFileInventory struct {
 	SnapshotID                int64
+	LastWriteAt               *time.Time
 	PartitionFields           []string
 	DataFiles                 int
 	SmallFiles                int
@@ -129,6 +132,7 @@ func (t compactionTriggers) Any() bool {
 }
 
 func defaultNativeMaintenanceSettings() nativeMaintenanceSettings {
+	orphanInterval := durationEnv("RIVUS_MAINTENANCE_NATIVE_ORPHAN_INTERVAL_SECONDS", defaultNativeOrphanInterval)
 	return nativeMaintenanceSettings{
 		Executor:                maintenanceExecutorHybrid,
 		DataFilesThreshold:      intEnv("RIVUS_MAINTENANCE_DATA_FILES_THRESHOLD", defaultDataFilesThreshold),
@@ -147,8 +151,8 @@ func defaultNativeMaintenanceSettings() nativeMaintenanceSettings {
 		ExpireInterval:          durationEnv("RIVUS_MAINTENANCE_NATIVE_EXPIRE_INTERVAL_SECONDS", 24*time.Hour),
 		SnapshotMaxAge:          time.Duration(float64Env("RIVUS_MAINTENANCE_NATIVE_SNAPSHOT_MAX_AGE_HOURS", 168.0) * float64(time.Hour)),
 		SnapshotRetainLast:      intEnv("RIVUS_MAINTENANCE_NATIVE_SNAPSHOT_RETAIN_LAST", 10),
-		OrphanInterval:          durationEnv("RIVUS_MAINTENANCE_NATIVE_ORPHAN_INTERVAL_SECONDS", 30*24*time.Hour),
-		OrphanInactiveInterval:  durationEnv("RIVUS_MAINTENANCE_NATIVE_ORPHAN_INACTIVE_INTERVAL_SECONDS", defaultNativeOrphanInactiveInterval),
+		OrphanInterval:          orphanInterval,
+		OrphanInactiveInterval:  durationEnv("RIVUS_MAINTENANCE_NATIVE_ORPHAN_INACTIVE_INTERVAL_SECONDS", max(defaultNativeOrphanInactiveInterval, orphanInterval)),
 		OrphanMinAge:            time.Duration(float64Env("RIVUS_MAINTENANCE_NATIVE_ORPHAN_MIN_AGE_HOURS", defaultNativeOrphanAge.Hours()) * float64(time.Hour)),
 		OrphanDryRun:            boolEnv("RIVUS_MAINTENANCE_NATIVE_ORPHAN_DRY_RUN", false),
 		SparkPollInterval:       durationEnv("RIVUS_MAINTENANCE_SPARK_POLL_INTERVAL_SECONDS", 5*time.Second),
@@ -374,6 +378,7 @@ func scanActiveFileInventoryOnce(ctx context.Context, tbl *icetable.Table, setti
 		return inventory, nil
 	}
 	inventory.SnapshotID = tbl.CurrentSnapshot().SnapshotID
+	inventory.LastWriteAt = latestTableWriteAt(tbl.Metadata(), time.Now().UTC())
 	fsys, err := tbl.FS(ctx)
 	if err != nil {
 		return inventory, fmt.Errorf("open table filesystem: %w", err)
@@ -510,11 +515,43 @@ func accumulateActiveFile(inventory *activeFileInventory, file iceberglib.DataFi
 	}
 }
 
+// latestTableWriteAt follows the current snapshot's ancestry, so writes to an
+// unpublished branch do not mark the main table active. Use commit timestamps,
+// not scan time: repeatedly observing the same snapshot must not keep an idle
+// table active. Replace snapshots rewrite files without changing table data.
+func latestTableWriteAt(metadata icetable.Metadata, now time.Time) *time.Time {
+	seen := make(map[int64]struct{})
+	snapshot := metadata.CurrentSnapshot()
+	for snapshot != nil {
+		if _, visited := seen[snapshot.SnapshotID]; visited {
+			break
+		}
+		seen[snapshot.SnapshotID] = struct{}{}
+		if snapshot.Summary != nil && snapshot.Summary.Properties["rivus.maintenance"] == "" {
+			switch snapshot.Summary.Operation {
+			case icetable.OpAppend, icetable.OpOverwrite, icetable.OpDelete:
+				written := time.UnixMilli(snapshot.TimestampMs).UTC()
+				if snapshot.TimestampMs > 0 && !written.After(now) {
+					return &written
+				}
+			}
+		}
+		if snapshot.ParentSnapshotID == nil {
+			break
+		}
+		snapshot = metadata.SnapshotByID(*snapshot.ParentSnapshotID)
+	}
+	return nil
+}
+
 func saveActiveFileInventory(ctx context.Context, store *meta.IcebergMaintenanceStore, tableKey string, inventory activeFileInventory) error {
-	return store.UpdateInventory(ctx, tableKey, inventory.SnapshotID, inventory.DataFiles, inventory.SmallFiles,
+	if err := store.UpdateInventory(ctx, tableKey, inventory.SnapshotID, inventory.DataFiles, inventory.SmallFiles,
 		inventory.SmallBytes, inventory.EqualityDeletes, inventory.PositionDeletes,
 		inventory.ApplicableEqualityDeletes, inventory.ApplicablePositionDeletes,
-		inventory.CompactableFiles, inventory.CompactableBytes, inventory.CompactionGroups, inventory.PartitionFields)
+		inventory.CompactableFiles, inventory.CompactableBytes, inventory.CompactionGroups, inventory.PartitionFields); err != nil {
+		return err
+	}
+	return store.RecordTableWrite(ctx, tableKey, inventory.LastWriteAt)
 }
 
 func inventoryTriggersCompaction(inventory activeFileInventory, settings nativeMaintenanceSettings) bool {

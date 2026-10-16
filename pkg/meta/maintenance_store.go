@@ -544,7 +544,6 @@ func (s *IcebergMaintenanceStore) CoalesceSignal(
 	snapshotComplete bool,
 	equalityDeleteFilesThreshold int,
 	nextCompaction time.Time,
-	nextOrphan time.Time,
 ) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -583,11 +582,6 @@ func (s *IcebergMaintenanceStore) CoalesceSignal(
 	    inventory_priority = CASE
 	      WHEN ? = 1 AND GREATEST(snapshot_complete, ?) = 1
 	      THEN GREATEST(inventory_priority, 50) ELSE inventory_priority END,
-	    next_orphan_check_at = CASE
-	      WHEN ? = 1 AND (? > 0 OR ? > 0) THEN CASE
-	        WHEN next_orphan_check_at IS NULL OR next_orphan_check_at > ? THEN ?
-	        ELSE next_orphan_check_at END
-	      ELSE next_orphan_check_at END,
 	    snapshot_complete = GREATEST(snapshot_complete, ?),
 	    last_snapshot_id = CASE WHEN ? = 1 THEN ? ELSE last_snapshot_id END,
 	    updated_at = UTC_TIMESTAMP(6)
@@ -604,7 +598,6 @@ func (s *IcebergMaintenanceStore) CoalesceSignal(
 		boolInt(snapshotChanged),
 		boolInt(snapshotChanged), boolInt(snapshotComplete),
 		boolInt(snapshotChanged), boolInt(snapshotComplete),
-		boolInt(snapshotChanged), addedDataFiles, addedEqDeleteFiles, nextOrphan.UTC(), nextOrphan.UTC(),
 		boolInt(snapshotComplete), boolInt(snapshotChanged), snapshotID,
 		tableKey,
 	)
@@ -937,6 +930,37 @@ func (s *IcebergMaintenanceStore) FinishTask(ctx context.Context, taskID int64, 
 		return fmt.Errorf("maintenance task %d lease is no longer owned by %s", taskID, workerID)
 	}
 	return nil
+}
+
+// RecordTableWrite records data-changing Iceberg snapshot activity, including
+// external writers. Preserve newer CDC signals and never turn a repeated scan
+// into a new write. This deliberately does not change last_snapshot_id, which
+// is the CDC signal deduplication cursor.
+func (s *IcebergMaintenanceStore) RecordTableWrite(ctx context.Context, tableKey string, written *time.Time) error {
+	if written == nil || written.IsZero() {
+		return nil
+	}
+	at := written.UTC()
+	_, err := s.db.ExecContext(ctx, `UPDATE iceberg_maintenance_state
+	SET last_write_at=?, updated_at=UTC_TIMESTAMP(6)
+	WHERE table_key=? AND (last_write_at IS NULL OR last_write_at < ?)
+	  AND ? <= UTC_TIMESTAMP(6)`, at, tableKey, at, at)
+	return err
+}
+
+// ClampOrphanSchedules applies shorter intervals to existing durable schedules.
+// A recent write selects the active deadline; idle tables still get their own
+// periodic cleanup. Existing earlier deadlines (including overdue work) win.
+func (s *IcebergMaintenanceStore) ClampOrphanSchedules(ctx context.Context, ownerID string, now, activeSince, activeDeadline, idleDeadline time.Time) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE iceberg_maintenance_state AS state
+	SET next_orphan_check_at=LEAST(COALESCE(next_orphan_check_at, ?),
+	    CASE WHEN last_write_at > ? AND last_write_at <= ? THEN ? ELSE ? END)
+	WHERE owner_job_id=? AND snapshot_complete=1 AND owner_type IN ('job', 'monitor')
+	  AND (owner_type <> 'monitor' OR EXISTS (
+	    SELECT 1 FROM iceberg_maintenance_monitors AS monitor
+	    WHERE monitor.monitor_id=SUBSTRING(state.owner_job_id, 9) AND monitor.status='ACTIVE'
+	  ))`, idleDeadline.UTC(), activeSince.UTC(), now.UTC(), activeDeadline.UTC(), idleDeadline.UTC(), ownerID)
+	return err
 }
 
 func (s *IcebergMaintenanceStore) UpdateInventory(

@@ -106,8 +106,8 @@ sink:
       native_snapshot_retain_last: 10
 
       # native orphan cleanup
-      native_orphan_interval_seconds: 2592000
-      native_orphan_inactive_interval_seconds: 7776000
+      native_orphan_interval_seconds: 86400
+      native_orphan_inactive_interval_seconds: 604800
       native_orphan_min_age_hours: 168
       native_orphan_dry_run: false
       worker_temp_directory: /tmp/rivus-maintenance
@@ -164,7 +164,8 @@ RIVUS_MAINTENANCE_NATIVE_MAX_EQUALITY_DELETE_FILES=150         # Default: 100
 RIVUS_MAINTENANCE_NATIVE_EXPIRE_INTERVAL_SECONDS=86400         # Default: 86400 (24h)
 RIVUS_MAINTENANCE_NATIVE_SNAPSHOT_MAX_AGE_HOURS=168            # Default: 168 (7 days)
 RIVUS_MAINTENANCE_NATIVE_SNAPSHOT_RETAIN_LAST=10               # Default: 10
-RIVUS_MAINTENANCE_NATIVE_ORPHAN_INTERVAL_SECONDS=2592000       # Default: 2592000 (30 days)
+RIVUS_MAINTENANCE_NATIVE_ORPHAN_INTERVAL_SECONDS=86400         # Default: 86400 (24h)
+RIVUS_MAINTENANCE_NATIVE_ORPHAN_INACTIVE_INTERVAL_SECONDS=604800 # Default: 604800 (7 days)
 RIVUS_MAINTENANCE_NATIVE_ORPHAN_MIN_AGE_HOURS=168              # Default: 168 (7 days)
 RIVUS_MAINTENANCE_NATIVE_ORPHAN_DRY_RUN=false
 ```
@@ -249,6 +250,48 @@ Initial snapshots remain protected by a snapshot-complete barrier. Native compac
 ## Snapshot expiration
 
 Snapshot expiration uses the public Iceberg Go transaction API. Rivus stages expiration first, calculates eligible snapshots, records a no-op as `skipped`, and commits only when expiration is needed. Iceberg branch/tag references remain protected by Iceberg semantics.
+
+## Orphan cleanup activity and scheduling
+
+Managed tables receive orphan cleanup daily when active and weekly when idle,
+plus bounded scheduling jitter. A table is active when its latest known data
+write is less than seven days old. This activity window is independent of the
+cleanup interval. Idle tables are still cleaned, including empty tables and
+failed writes that leave files without committing a snapshot.
+
+Activity comes from Rivus commit signals and data-changing snapshots observed
+during inventory scans, including Spark and Trino writes. Inventory follows the
+current snapshot's retained ancestry and uses commit timestamps, not scan time.
+Append, overwrite, and delete snapshots count as writes; replace snapshots and
+snapshots marked `rivus.maintenance` do not. Compaction and repeated scans of an
+unchanged table therefore do not keep it active. Expired history does not erase
+a previously recorded write. A newly enrolled old table is not treated as
+recently written just because it was first scanned today.
+
+The maintenance worker alone chooses the orphan schedule from the owner's
+configuration and the worker's environment. CDC signals update activity and
+request inventory refresh; they do not change orphan deadlines. A streaming
+process with a different environment therefore cannot override the worker's
+configured cleanup cadence.
+Upgrade the streaming processes as well as the maintenance worker to enforce
+this ownership rule; an older streaming binary can still update orphan
+deadlines. Previously stored earlier deadlines are preserved, so an existing
+cleanup may run before a newly configured longer interval takes effect.
+
+External activity is detected on the existing paced inventory pass, so detection
+can lag with large table counts. On startup and each full state sync (five
+minutes by default), the worker pulls existing orphan deadlines within the
+configured active/idle interval without postponing earlier or overdue work.
+This also brings old 30/90-day schedules forward. Explicit YAML/environment
+interval overrides remain effective; update old explicit values to adopt the
+new cadence. An omitted inactive interval defaults to at least the active
+interval when a longer active interval is configured.
+
+The minimum orphan age remains seven days. Daily cleanup only removes eligible,
+unreferenced files; it does not remove recent files or data still referenced by
+retained snapshots. Snapshot expiration keeps its separate daily schedule and
+retention settings. Paused monitors and incomplete snapshots retain their
+existing scheduling protections.
 
 ## Bounded-memory orphan cleanup
 

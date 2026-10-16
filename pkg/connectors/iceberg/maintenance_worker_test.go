@@ -181,10 +181,10 @@ func TestNativeMaintenanceSettingsDefaults(t *testing.T) {
 	if settings.ExpireInterval != 24*time.Hour {
 		t.Fatalf("unexpected expire interval: %s", settings.ExpireInterval)
 	}
-	if settings.OrphanInterval != 30*24*time.Hour {
+	if settings.OrphanInterval != 24*time.Hour {
 		t.Fatalf("unexpected orphan interval: %s", settings.OrphanInterval)
 	}
-	if settings.OrphanInactiveInterval != 90*24*time.Hour {
+	if settings.OrphanInactiveInterval != 7*24*time.Hour {
 		t.Fatalf("unexpected inactive orphan interval: %s", settings.OrphanInactiveInterval)
 	}
 	if settings.IdleCompactionInterval != 7*24*time.Hour {
@@ -308,11 +308,11 @@ func TestRetryInventoryDNSDoesNotRetryNonDNSFailure(t *testing.T) {
 	}
 }
 
-func TestOrphanCleanupSkipsInactiveTables(t *testing.T) {
+func TestOrphanCleanupSchedulesActiveAndInactiveTables(t *testing.T) {
 	now := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
 	settings := defaultNativeMaintenanceSettings()
 	inactive := meta.IcebergMaintenanceState{TableKey: "rivus.ns.idle"}
-	if orphanCleanupActive(inactive, now, settings.OrphanInterval) {
+	if orphanCleanupActive(inactive, now) {
 		t.Fatal("table without a write signal must be inactive")
 	}
 	next := nextMaintenanceSchedule(inactive, "remove_orphan_files", now, settings)
@@ -322,7 +322,7 @@ func TestOrphanCleanupSkipsInactiveTables(t *testing.T) {
 
 	recent := now.Add(-24 * time.Hour)
 	active := meta.IcebergMaintenanceState{TableKey: "rivus.ns.hot", LastWriteAt: &recent}
-	if !orphanCleanupActive(active, now, settings.OrphanInterval) {
+	if !orphanCleanupActive(active, now) {
 		t.Fatal("recent write must keep orphan cleanup active")
 	}
 	next = nextMaintenanceSchedule(active, "remove_orphan_files", now, settings)

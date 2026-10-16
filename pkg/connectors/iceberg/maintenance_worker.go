@@ -247,6 +247,20 @@ func syncMaintenanceStates(ctx context.Context, store *meta.IcebergMaintenanceSt
 	}
 
 	jobs, err = syncMaintenanceMonitorStates(ctx, store, jobs, streamExclusions, now)
+	if err != nil {
+		return nil, nil, err
+	}
+	// Bring persisted schedules within the configured intervals after an upgrade
+	// or config change. Only pull deadlines forward; never postpone due work.
+	for ownerID, job := range jobs {
+		active := meta.IcebergMaintenanceState{TableKey: ownerID, LastWriteAt: &now}
+		idle := meta.IcebergMaintenanceState{TableKey: ownerID}
+		if err := store.ClampOrphanSchedules(ctx, ownerID, now, now.Add(-orphanActivityWindow),
+			nextMaintenanceSchedule(active, maintenanceOperationOrphan, now, job.Settings),
+			nextMaintenanceSchedule(idle, maintenanceOperationOrphan, now, job.Settings)); err != nil {
+			return nil, nil, fmt.Errorf("reconcile orphan schedules for %s: %w", ownerID, err)
+		}
+	}
 	return jobs, streamExclusions, err
 }
 
@@ -764,13 +778,6 @@ func enqueueDueMaintenance(ctx context.Context, store *meta.IcebergMaintenanceSt
 			if due == nil {
 				continue
 			}
-			if operation.name == "remove_orphan_files" && !orphanCleanupActive(state, now, job.Settings.OrphanInterval) {
-				next := nextMaintenanceSchedule(state, operation.name, now, job.Settings)
-				if err := store.AdvanceSchedule(ctx, state.TableKey, operation.name, next); err != nil {
-					return fmt.Errorf("defer inactive orphan cleanup for %s: %w", state.TableKey, err)
-				}
-				continue
-			}
 			window := due.UTC().Format(time.RFC3339Nano)
 			priority := operation.priority
 			if operation.name == maintenanceOperationCompact {
@@ -843,7 +850,10 @@ func nativeMaintenanceSettingsFromRaw(sinkCfg any) (nativeMaintenanceSettings, e
 	settings.SnapshotMaxAge = time.Duration(rawFloat64(maintenance, "native_snapshot_max_age_hours", settings.SnapshotMaxAge.Hours()) * float64(time.Hour))
 	settings.SnapshotRetainLast = rawInt(maintenance, "native_snapshot_retain_last", settings.SnapshotRetainLast)
 	settings.OrphanInterval = time.Duration(rawInt(maintenance, "native_orphan_interval_seconds", int(settings.OrphanInterval/time.Second))) * time.Second
-	settings.OrphanInactiveInterval = time.Duration(rawInt(maintenance, "native_orphan_inactive_interval_seconds", int(settings.OrphanInactiveInterval/time.Second))) * time.Second
+	// An explicitly longer active interval must remain valid when no inactive
+	// interval was supplied. Explicit inactive overrides still undergo validation.
+	inactiveDefault := durationEnv("RIVUS_MAINTENANCE_NATIVE_ORPHAN_INACTIVE_INTERVAL_SECONDS", max(defaultNativeOrphanInactiveInterval, settings.OrphanInterval))
+	settings.OrphanInactiveInterval = time.Duration(rawInt(maintenance, "native_orphan_inactive_interval_seconds", int(inactiveDefault/time.Second))) * time.Second
 	settings.OrphanMinAge = time.Duration(rawFloat64(maintenance, "native_orphan_min_age_hours", settings.OrphanMinAge.Hours()) * float64(time.Hour))
 	settings.OrphanDryRun = rawBool(maintenance, "native_orphan_dry_run", settings.OrphanDryRun)
 	settings.SparkPollInterval = time.Duration(rawInt(maintenance, "spark_poll_interval_seconds", int(settings.SparkPollInterval/time.Second))) * time.Second
@@ -1021,7 +1031,7 @@ func nextMaintenanceSchedule(state meta.IcebergMaintenanceState, operation strin
 		interval = settings.ExpireInterval
 	case "remove_orphan_files":
 		interval = settings.OrphanInterval
-		if !orphanCleanupActive(state, now, settings.OrphanInterval) {
+		if !orphanCleanupActive(state, now) {
 			interval = settings.OrphanInactiveInterval
 		}
 	}
@@ -1032,12 +1042,12 @@ func nextMaintenanceSchedule(state meta.IcebergMaintenanceState, operation strin
 	return now.Add(interval).Add(deterministicJitter(tableKey+"|"+operation+"|next", jitterWindow))
 }
 
-func orphanCleanupActive(state meta.IcebergMaintenanceState, now time.Time, activeInterval time.Duration) bool {
-	if state.LastWriteAt == nil || activeInterval <= 0 {
+func orphanCleanupActive(state meta.IcebergMaintenanceState, now time.Time) bool {
+	if state.LastWriteAt == nil {
 		return false
 	}
 	lastWrite := state.LastWriteAt.UTC()
-	return !lastWrite.After(now) && now.Sub(lastWrite) < activeInterval
+	return !lastWrite.After(now) && now.Sub(lastWrite) < orphanActivityWindow
 }
 
 func stateDueTime(state meta.IcebergMaintenanceState, operation string) *time.Time {
